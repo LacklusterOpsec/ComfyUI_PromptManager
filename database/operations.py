@@ -499,12 +499,18 @@ class PromptDatabase:
             )
             return [row["category"] for row in cursor.fetchall()]
 
-    def get_prompt_subfolders(self, root_dirs: Optional[List[str]] = None) -> List[str]:
+    def get_prompt_subfolders(
+        self,
+        root_dirs: Optional[List[str]] = None,
+        include_ancestors: bool = False,
+    ) -> List[str]:
         """
         Get distinct subfolder paths from generated_images.
 
         Extracts the directory portion of image_path, made relative to
-        root_dirs if provided. Returns sorted unique folder names.
+        root_dirs if provided. When include_ancestors is true, each folder's
+        parent path segments are also included so the full hierarchy shows up
+        in the folder filter. Returns sorted unique folder names.
         """
         with self.model.get_connection() as conn:
             cursor = conn.execute(
@@ -527,6 +533,8 @@ class PromptDatabase:
                             if not rel.startswith(".."):
                                 if rel != ".":
                                     folders.add(rel)
+                                    if include_ancestors:
+                                        self._add_ancestors(folders, rel)
                                 made_relative = True
                                 break
                         except ValueError:
@@ -536,8 +544,17 @@ class PromptDatabase:
                     basename = os.path.basename(parent)
                     if basename:
                         folders.add(basename)
+                        if include_ancestors:
+                            self._add_ancestors(folders, basename)
 
         return sorted(folders)
+
+    @staticmethod
+    def _add_ancestors(folders: set, folder: str) -> None:
+        """Add each parent path segment of a folder to the set."""
+        parts = folder.split(os.sep)
+        for i in range(1, len(parts)):
+            folders.add(os.sep.join(parts[:i]))
 
     def get_all_tags(self) -> List[str]:
         """
