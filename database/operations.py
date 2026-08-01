@@ -310,7 +310,7 @@ class PromptDatabase:
 
             # Get paginated results
             cursor = conn.execute(
-                f"SELECT prompts.*, {TAG_SUBQUERY} FROM prompts ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                f"SELECT prompts.*, {TAG_SUBQUERY} FROM prompts ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             )
             rows = cursor.fetchall()
@@ -499,22 +499,12 @@ class PromptDatabase:
             )
             return [row["category"] for row in cursor.fetchall()]
 
-    def get_prompt_subfolders(
-        self,
-        root_dirs: Optional[List[str]] = None,
-        include_ancestors: bool = False,
-    ) -> List[str]:
+    def get_prompt_subfolders(self, root_dirs: Optional[List[str]] = None) -> List[str]:
         """
         Get distinct subfolder paths from generated_images.
 
         Extracts the directory portion of image_path, made relative to
         root_dirs if provided. Returns sorted unique folder names.
-
-        Args:
-            root_dirs: Gallery root directories for computing relative paths
-            include_ancestors: If True, also include all ancestor path segments
-                so that hierarchical tree navigation works. For example, a path
-                ``2026/08-Aug/2026-08-06`` also adds ``2026`` and ``2026/08-Aug``.
         """
         with self.model.get_connection() as conn:
             cursor = conn.execute(
@@ -543,18 +533,9 @@ class PromptDatabase:
                             continue
 
                 if not made_relative:
-                    # Preserve full relative-style path instead of collapsing
-                    # to just the basename, which loses hierarchy and creates
-                    # ambiguity (e.g. foo/bar and baz/bar both become "bar").
-                    folders.add(parent)
-
-        if include_ancestors:
-            ancestors = set()
-            for folder in folders:
-                parts = folder.replace("\\", "/").split("/")
-                for i in range(1, len(parts)):
-                    ancestors.add("/".join(parts[:i]))
-            folders.update(ancestors)
+                    basename = os.path.basename(parent)
+                    if basename:
+                        folders.add(basename)
 
         return sorted(folders)
 
@@ -1107,10 +1088,10 @@ class PromptDatabase:
                 # Note: Removed ORDER BY from GROUP_CONCAT for SQLite compatibility
                 # We'll sort the IDs manually after fetching
                 cursor = conn.execute("""
-                    SELECT LOWER(TRIM(text)) as normalized_text, COUNT(*) as count,
+                    SELECT LOWER(TRIM(text)) as normalized_text, COUNT(*) as count, 
                            GROUP_CONCAT(id) as ids,
                            GROUP_CONCAT(created_at) as created_dates
-                    FROM prompts
+                    FROM prompts 
                     GROUP BY LOWER(TRIM(text))
                     HAVING COUNT(*) > 1
                 """)
@@ -1179,10 +1160,10 @@ class PromptDatabase:
                 # Note: Removed ORDER BY from GROUP_CONCAT for SQLite compatibility
                 # We'll sort the IDs manually after fetching
                 cursor = conn.execute("""
-                    SELECT LOWER(TRIM(text)) as normalized_text, COUNT(*) as count,
+                    SELECT LOWER(TRIM(text)) as normalized_text, COUNT(*) as count, 
                            GROUP_CONCAT(id) as ids,
                            GROUP_CONCAT(created_at) as created_dates
-                    FROM prompts
+                    FROM prompts 
                     GROUP BY LOWER(TRIM(text))
                     HAVING COUNT(*) > 1
                 """)
@@ -1261,7 +1242,11 @@ class PromptDatabase:
 
     # Gallery-related methods
     def link_image_to_prompt(
-        self, prompt_id: str, image_path: str, metadata: Optional[Dict[str, Any]] = None
+        self,
+        prompt_id: str,
+        image_path: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        generation_time: Optional[str] = None,
     ) -> int:
         """
         Link a generated image to a prompt.
@@ -1270,6 +1255,8 @@ class PromptDatabase:
             prompt_id: ID of the prompt that generated this image
             image_path: Full path to the image file
             metadata: Optional metadata about the image
+            generation_time: Optional generation time as 'YYYY-MM-DD HH:MM:SS'
+                (UTC). When omitted, defaults to the current timestamp.
 
         Returns:
             int: The ID of the created image record
@@ -1310,17 +1297,21 @@ class PromptDatabase:
                 file_info = metadata.get("file_info", {}) if metadata else {}
 
                 # Use INSERT OR IGNORE to skip duplicates (same prompt_id + filename)
+                now = datetime.datetime.now(datetime.timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO generated_images
-                    (prompt_id, image_path, filename, file_size, width, height, format,
-                     workflow_data, prompt_metadata, parameters)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (prompt_id, image_path, filename, generation_time, file_size,
+                     width, height, format, workflow_data, prompt_metadata, parameters)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         prompt_id_int,
                         image_path,
                         filename,
+                        generation_time or now,
                         file_info.get("size"),
                         (
                             file_info.get("dimensions", [None, None])[0]
@@ -1765,6 +1756,15 @@ class PromptDatabase:
         """Overwrite the tags list for a prompt via junction table."""
         with self.model.get_connection() as conn:
             self._sync_prompt_tags(conn, prompt_id, tags)
+            conn.execute(
+                "UPDATE prompts SET updated_at = ? WHERE id = ?",
+                (datetime.datetime.now(datetime.timezone.utc).isoformat(), prompt_id),
+            )
+            conn.commit()
+
+    def touch_prompt(self, prompt_id: int) -> None:
+        """Mark a prompt as recently used by bumping its updated_at timestamp."""
+        with self.model.get_connection() as conn:
             conn.execute(
                 "UPDATE prompts SET updated_at = ? WHERE id = ?",
                 (datetime.datetime.now(datetime.timezone.utc).isoformat(), prompt_id),

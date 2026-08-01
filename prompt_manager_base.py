@@ -82,6 +82,9 @@ class PromptManagerBase:
                         prompt_id=existing["id"], category=category, tags=tags
                     )
                     self.logger.debug("Updated metadata for existing prompt")
+                else:
+                    self.db.touch_prompt(existing["id"])
+                    self.logger.debug("Marked existing prompt as recently used")
                 return existing["id"]
 
             self.logger.debug(

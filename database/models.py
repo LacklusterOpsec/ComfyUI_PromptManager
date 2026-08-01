@@ -2,10 +2,12 @@
 Database schema and models for KikoTextEncode prompt storage.
 """
 
+from contextlib import contextmanager
+
 import sqlite3
 import os
 import threading
-from typing import Optional
+from typing import Iterator, Optional
 
 # Import logging system
 try:
@@ -160,16 +162,18 @@ class PromptModel:
         for index_sql in indexes:
             conn.execute(index_sql)
 
-    def get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def get_connection(self) -> Iterator[sqlite3.Connection]:
         """
         Get the persistent database connection.
 
         Returns a thread-safe, reusable connection protected by a lock.
         The connection is created on first call and reused thereafter.
         Callers use it as a context manager; the lock is held for the
-        duration of the ``with`` block.
+        duration of the ``with`` block so concurrent threads never share
+        the connection at the same time.
 
-        Returns:
+        Yields:
             sqlite3.Connection: Configured database connection
         """
         with self._conn_lock:
@@ -179,7 +183,12 @@ class PromptModel:
                 self._conn.execute("PRAGMA journal_mode = WAL")
                 self._conn.execute("PRAGMA foreign_keys = ON")
                 self._conn.execute("PRAGMA busy_timeout = 5000")
-        return self._conn
+            try:
+                yield self._conn
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _migrate_workflow_name_removal(self, conn: sqlite3.Connection) -> None:
         """

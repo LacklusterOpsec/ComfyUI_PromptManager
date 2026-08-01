@@ -924,7 +924,7 @@ class AdminRoutesMixin:
                     status=400,
                 )
 
-            MAX_RESTORE_SIZE = 100 * 1024 * 1024  # 100MB
+            MAX_RESTORE_SIZE = 1024 * 1024 * 1024  # 1GB
             file_data = await field.read()
 
             if not file_data:
@@ -1020,6 +1020,16 @@ class AdminRoutesMixin:
                 {"success": False, "error": f"Failed to restore database: {str(e)}"},
                 status=500,
             )
+
+    @staticmethod
+    def _file_generation_time(file_path) -> str:
+        """Return a file's modification time as a UTC 'YYYY-MM-DD HH:MM:SS' string."""
+        try:
+            return datetime.datetime.fromtimestamp(
+                Path(file_path).stat().st_mtime, datetime.timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
 
     async def scan_images(self, request):
         """Scan ComfyUI output images for prompt metadata and add them to the database."""
@@ -1139,6 +1149,8 @@ class AdminRoutesMixin:
                                         self.db.link_image_to_prompt,
                                         existing["id"],
                                         str(media_file),
+                                        None,
+                                        self._file_generation_time(media_file),
                                     )
                                     linked_count += 1
                                 except Exception as e:
@@ -1162,6 +1174,8 @@ class AdminRoutesMixin:
                                             self.db.link_image_to_prompt,
                                             prompt_id,
                                             str(media_file),
+                                            None,
+                                            self._file_generation_time(media_file),
                                         )
                                     except Exception as e:
                                         self.logger.error(
