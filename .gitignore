@@ -17,6 +17,12 @@ prompts.db
 prompts.db-shm
 prompts.db-wal
 prompts.db-journal
+prompts.db.backup_*
+prompts.db.prebackfill.bak
+
+# Local runtime state / secrets (may contain API keys)
+config.json
+.tracking
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
