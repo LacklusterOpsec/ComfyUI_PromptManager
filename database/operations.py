@@ -6,6 +6,7 @@ import sqlite3
 import json
 import datetime
 import os
+import threading
 from typing import Optional, List, Dict, Any, Union
 
 from .models import PromptModel
@@ -47,7 +48,7 @@ def _resolve_db_path(db_path: Optional[str] = None) -> str:
 
     if db_path is None:
         try:
-            from py.config import PromptManagerConfig
+            from promptmanager_core.config import PromptManagerConfig
 
             db_path = PromptManagerConfig.DEFAULT_DB_PATH
         except Exception:
@@ -80,6 +81,33 @@ class PromptDatabase:
         self.logger.debug(f"Initializing database operations with path: {db_path}")
         self.model = PromptModel(db_path)
         self.logger.debug("Database operations initialized successfully")
+
+    def reload(self) -> None:
+        """Close the current connection and rebuild the model on this instance.
+
+        Used after restoring the database file from a backup/upload. Because all
+        consumers share the same ``PromptDatabase`` singleton, mutating this
+        instance (rather than swapping it for a new object) lets every holder —
+        API, image monitor, prompt tracker, and nodes — see the restored schema
+        immediately instead of holding a stale handle to the old file.
+        """
+        old = self.model
+        if old is not None:
+            # Hold the connection lock so a concurrent writer on the shared
+            # connection cannot race the close. threading.Lock is not
+            # reentrant, so close() (which takes the same lock) must be
+            # inlined here instead of being called directly.
+            with old._conn_lock:
+                if old._conn is not None:
+                    try:
+                        old._conn.close()
+                    except Exception:
+                        pass
+                    old._conn = None
+        self.model = PromptModel(old.db_path if old is not None else self.model.db_path)
+        self.logger.debug(
+            f"Reloaded database connection for path: {self.model.db_path}"
+        )
 
     def save_prompt(
         self,
@@ -523,6 +551,14 @@ class PromptDatabase:
                 image_path = row["image_path"]
                 parent = os.path.dirname(image_path)
                 if not parent:
+                    continue
+
+                # Skip images inside hidden/cache/derivative directories
+                # (e.g. ComfyUI's own ".thumbnails_cache", or any "thumbnails"
+                # directory). These are not real output folders and should not
+                # appear in the prompt folder filter.
+                norm_parent = parent.lower()
+                if ".thumbnails_cache" in norm_parent or "/thumbnails" in norm_parent or "\\thumbnails" in norm_parent:
                     continue
 
                 made_relative = False
@@ -1993,3 +2029,29 @@ class PromptDatabase:
                 data[field] = {}
 
         return data
+
+
+# ---------------------------------------------------------------------------
+# Shared singleton access
+# ---------------------------------------------------------------------------
+#
+# All production components (API, image monitor, prompt tracker, nodes) share
+# ONE PromptDatabase instance. This is what makes restore/reload safe: there is
+# a single connection to the DB file, so closing it before a file swap releases
+# the file on all platforms, and reloading the shared instance makes every
+# consumer see the restored schema without holding a stale handle.
+#
+# Tests construct their own PromptDatabase(temp_db_path) instances directly and
+# are intentionally unaffected by this registry.
+_prompt_db_instance: Optional[PromptDatabase] = None
+_prompt_db_lock = threading.Lock()
+
+
+def get_prompt_database() -> PromptDatabase:
+    """Return the process-wide shared PromptDatabase instance."""
+    global _prompt_db_instance
+    if _prompt_db_instance is None:
+        with _prompt_db_lock:
+            if _prompt_db_instance is None:
+                _prompt_db_instance = PromptDatabase()
+    return _prompt_db_instance

@@ -76,7 +76,7 @@ class GalleryDiagnostics:
         """Resolve database path from config, matching PromptDatabase logic."""
         extension_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         try:
-            from py.config import PromptManagerConfig
+            from promptmanager_core.config import PromptManagerConfig
 
             db_path = PromptManagerConfig.DEFAULT_DB_PATH
         except Exception:
@@ -301,7 +301,7 @@ class GalleryDiagnostics:
 
         # Check user-configured gallery directories from config.json
         try:
-            from py.config import GalleryConfig
+            from promptmanager_core.config import GalleryConfig
 
             for cfg_dir in GalleryConfig.MONITORING_DIRECTORIES:
                 abs_path = os.path.abspath(cfg_dir)
@@ -419,9 +419,9 @@ class GalleryDiagnostics:
             sys.path.insert(
                 0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             )
-            from database.operations import PromptDatabase
+            from database.operations import get_prompt_database
 
-            db = PromptDatabase()
+            db = get_prompt_database()
 
             # Create a fake image path if none provided
             if not test_image_path:

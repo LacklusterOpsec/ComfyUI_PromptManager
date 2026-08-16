@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from py.lora_utils import (
+from promptmanager_core.lora_utils import (
     TriggerWordCache,
     get_civitai_image_urls,
     get_example_prompt_from_metadata,

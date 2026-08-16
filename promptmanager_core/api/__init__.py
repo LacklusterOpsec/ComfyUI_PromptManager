@@ -27,7 +27,7 @@ from .autotag_routes import AutotagRoutesMixin
 from .lora_integration import LoraIntegrationMixin
 
 try:
-    from ...database.operations import PromptDatabase
+    from ...database.operations import get_prompt_database
     from ...utils.logging_config import get_logger
 except ImportError:
     import sys
@@ -35,12 +35,12 @@ except ImportError:
     sys.path.insert(
         0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
-    from database.operations import PromptDatabase
+    from database.operations import get_prompt_database
     from utils.logging_config import get_logger
 
 
 def _get_project_root():
-    """Get the project root directory (3 levels up from py/api/__init__.py)."""
+    """Get the project root directory (3 levels up from promptmanager_core/api/__init__.py)."""
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -122,11 +122,14 @@ class PromptManagerAPI(
         self.logger = get_logger("prompt_manager.api")
         self.logger.info("Initializing PromptManager API")
 
-        self.db = PromptDatabase()
+        self.db = get_prompt_database()
         self._cached_output_dir = None  # Lazy-cached by _find_comfyui_output_dir()
         self._html_cache = {}  # Cached HTML file contents keyed by path
         self._gallery_cache = {}  # dict: path_str -> (files, timestamp)
         self._gallery_cache_ttl = 30  # Cache TTL in seconds
+        # Serializes DB restore/swap operations so two concurrent restores
+        # (or a restore racing another writer) cannot corrupt the live DB.
+        self._restore_lock = asyncio.Lock()
 
         # Run cleanup on initialization to remove any existing duplicates
         try:
@@ -146,7 +149,7 @@ class PromptManagerAPI(
         Prevents synchronous database calls, file I/O, and PIL operations
         from blocking the aiohttp event loop.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         if kwargs:
             call = functools.partial(func, *args, **kwargs)
             return await loop.run_in_executor(None, call)
@@ -409,10 +412,14 @@ class PromptManagerAPI(
             if image.get("id"):
                 image["url"] = f"/prompt_manager/images/{image['id']}/file"
 
-            # Try each root to compute relative path and thumbnail URL
+            # Try each root to compute relative path and thumbnail URL.
+            # Normalize with os.path.abspath (collapse "..", don't follow junctions)
+            # so subfolders that are junctions to other drives still match.
             for output_path in output_dirs:
                 try:
-                    rel_path = img_path.resolve().relative_to(output_path.resolve())
+                    rel_path = Path(os.path.abspath(str(img_path))).relative_to(
+                        Path(os.path.abspath(str(output_path)))
+                    )
                     image["relative_path"] = str(rel_path)
                     image["url"] = (
                         f"/prompt_manager/images/serve/{url_quote(rel_path.as_posix(), safe='/')}"

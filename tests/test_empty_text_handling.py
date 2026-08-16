@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 @patch("prompt_manager_base.get_image_monitor")
 @patch("prompt_manager_base.get_prompt_tracker")
 @patch("prompt_manager_base.get_comfyui_integration")
-@patch("prompt_manager_base.PromptDatabase")
+@patch("prompt_manager_base.get_prompt_database")
 class TestPromptManagerTextEmptyInput(unittest.TestCase):
     """Test PromptManagerText with empty/blank text inputs (issue #123)."""
 

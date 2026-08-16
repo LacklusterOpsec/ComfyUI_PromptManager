@@ -224,7 +224,7 @@ class PromptManagerText(PromptManagerBase, ComfyNodeABC):
         Returns a hash of input values that affect the text output.
         This enables proper branch execution - only re-execute when inputs change.
         """
-        import hashlib
-
-        combined = f"{text}|{prepend_text}|{append_text}"
-        return hashlib.sha256(combined.encode()).hexdigest()
+        # Always return NaN so the node re-executes on every run. This ensures
+        # that re-running the exact same prompt still bumps its updated_at
+        # timestamp and pushes it to the top of the recent prompts list.
+        return float("NaN")

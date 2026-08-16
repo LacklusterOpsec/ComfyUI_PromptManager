@@ -27,6 +27,7 @@ import os
 import time
 import threading
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Dict, Any, Callable
 from watchdog.observers import Observer
@@ -65,13 +66,25 @@ class ImageGenerationHandler(FileSystemEventHandler):
 
         # Read from GalleryConfig if available, otherwise use defaults
         try:
-            from ..py.config import GalleryConfig
+            from ..promptmanager_core.config import GalleryConfig
 
             self.processing_delay = GalleryConfig.PROCESSING_DELAY
             self.supported_extensions = tuple(GalleryConfig.SUPPORTED_EXTENSIONS)
+            self.max_concurrent = max(1, int(GalleryConfig.MAX_CONCURRENT_PROCESSING))
         except Exception:
             self.processing_delay = 2.0
             self.supported_extensions = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+            self.max_concurrent = 3
+
+        # Bound how many images are processed simultaneously. Previously each new
+        # image spawned an unbounded thread (threading.Timer), so bursty generation
+        # into large output folders opened thousands of file handles at once and
+        # hit the OS "Too many open files" limit (Errno 24). A fixed pool caps the
+        # number of concurrent file opens regardless of how many events arrive.
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.max_concurrent,
+            thread_name_prefix="pm-image",
+        )
 
     def on_created(self, event):
         """Handle filesystem creation events.
@@ -95,12 +108,32 @@ class ImageGenerationHandler(FileSystemEventHandler):
                 self.logger.debug(
                     f"Snapshot prompt {prompt_snapshot.get('id', '?')} for {os.path.basename(event.src_path)}"
                 )
-            threading.Timer(
-                self.processing_delay,
-                self.process_new_image,
-                args=[event.src_path],
-                kwargs={"prompt_snapshot": prompt_snapshot},
-            ).start()
+
+            # Preserve the write-settle delay, but run inside the bounded pool so
+            # events are processed at most max_concurrent at a time. Submitting is
+            # cheap and thread-safe, so bursts queue without spawning threads.
+            def _process_after_delay():
+                time.sleep(self.processing_delay)
+                self.process_new_image(event.src_path, prompt_snapshot=prompt_snapshot)
+
+            try:
+                self._executor.submit(_process_after_delay)
+            except RuntimeError:
+                # Executor was shut down (monitor stopping); drop the event.
+                self.logger.debug(
+                    f"Skipping image after monitor shutdown: {event.src_path}"
+                )
+
+    def shutdown(self):
+        """Stop accepting new work and release the bounded worker pool.
+
+        Pending tasks are cancelled so we never start opening file handles after
+        the monitor has been told to stop.
+        """
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:
+            self.logger.warning(f"Error shutting down image handler: {e}")
 
     def is_image_file(self, filepath: str) -> bool:
         """Check if file is a supported image format and not a thumbnail.
@@ -112,8 +145,14 @@ class ImageGenerationHandler(FileSystemEventHandler):
             True if the file has a supported image extension and is not
             inside a thumbnails directory, False otherwise
         """
-        # Skip files in thumbnails directory - those are derivatives, not generated images
-        if "/thumbnails/" in filepath or "\\thumbnails\\" in filepath:
+        # Skip files in thumbnails or hidden/cache directories - those are
+        # derivatives / internal caches (e.g. ComfyUI's .thumbnails_cache),
+        # not generated images we should link.
+        lowered = filepath.lower()
+        if any(
+            marker in lowered
+            for marker in ("/thumbnails/", "\\thumbnails\\", "/.thumbnails_cache/", "\\.thumbnails_cache\\")
+        ):
             return False
         return filepath.lower().endswith(self.supported_extensions)
 
@@ -425,7 +464,7 @@ class ImageMonitor:
 
         # Check config for monitoring settings
         try:
-            from ..py.config import GalleryConfig
+            from ..promptmanager_core.config import GalleryConfig
 
             if not GalleryConfig.MONITORING_ENABLED:
                 self.logger.info("Image monitoring disabled in config")
@@ -480,7 +519,9 @@ class ImageMonitor:
             self.observer.stop()
             self.observer.join()
             self.observer = None
-            self.handler = None
+            if self.handler is not None:
+                self.handler.shutdown()
+                self.handler = None
             self.monitored_directories = []
             self.logger.debug("Image monitoring stopped")
 

@@ -39,69 +39,43 @@ class TestOutputNode(unittest.TestCase):
 
 
 class TestIsChangedPromptManager(unittest.TestCase):
-    """IS_CHANGED for PromptManager should return a deterministic hash
-    based on text inputs, so the node re-runs only when inputs change."""
+    """IS_CHANGED for PromptManager should always return a changed value
+    so the node re-executes on every run. This ensures re-running the exact
+    same prompt still bumps its updated_at timestamp and pushes it to the
+    top of the recent prompts list."""
 
-    def test_same_inputs_return_same_hash(self):
-        result1 = PromptManager.IS_CHANGED(
-            clip=None, text="hello", prepend_text="pre", append_text="post"
-        )
-        result2 = PromptManager.IS_CHANGED(
-            clip=None, text="hello", prepend_text="pre", append_text="post"
-        )
-        self.assertEqual(result1, result2)
-
-    def test_different_text_returns_different_hash(self):
+    def test_returns_different_value_on_successive_calls(self):
         result1 = PromptManager.IS_CHANGED(clip=None, text="hello")
-        result2 = PromptManager.IS_CHANGED(clip=None, text="world")
+        time.sleep(0.01)
+        result2 = PromptManager.IS_CHANGED(clip=None, text="hello")
         self.assertNotEqual(result1, result2)
 
-    def test_different_prepend_returns_different_hash(self):
-        result1 = PromptManager.IS_CHANGED(clip=None, text="hello", prepend_text="a")
-        result2 = PromptManager.IS_CHANGED(clip=None, text="hello", prepend_text="b")
-        self.assertNotEqual(result1, result2)
+    def test_returns_nan(self):
+        import math
 
-    def test_different_append_returns_different_hash(self):
-        result1 = PromptManager.IS_CHANGED(clip=None, text="hello", append_text="a")
-        result2 = PromptManager.IS_CHANGED(clip=None, text="hello", append_text="b")
-        self.assertNotEqual(result1, result2)
-
-    def test_returns_string(self):
-        result = PromptManager.IS_CHANGED(clip=None, text="hello")
-        self.assertIsInstance(result, str)
+        result = PromptManager.IS_CHANGED(
+            clip=None, text="hello", prepend_text="pre", append_text="post"
+        )
+        self.assertTrue(math.isnan(result))
 
 
 class TestIsChangedPromptManagerText(unittest.TestCase):
-    """IS_CHANGED for PromptManagerText should behave identically to
-    PromptManager — deterministic hash based on text inputs."""
+    """IS_CHANGED for PromptManagerText should always return a changed value
+    so the node re-executes on every run, mirroring PromptManager."""
 
-    def test_same_inputs_return_same_hash(self):
-        result1 = PromptManagerText.IS_CHANGED(
-            text="hello", prepend_text="pre", append_text="post"
-        )
-        result2 = PromptManagerText.IS_CHANGED(
-            text="hello", prepend_text="pre", append_text="post"
-        )
-        self.assertEqual(result1, result2)
-
-    def test_different_text_returns_different_hash(self):
+    def test_returns_different_value_on_successive_calls(self):
         result1 = PromptManagerText.IS_CHANGED(text="hello")
-        result2 = PromptManagerText.IS_CHANGED(text="world")
+        time.sleep(0.01)
+        result2 = PromptManagerText.IS_CHANGED(text="hello")
         self.assertNotEqual(result1, result2)
 
-    def test_different_prepend_returns_different_hash(self):
-        result1 = PromptManagerText.IS_CHANGED(text="hello", prepend_text="a")
-        result2 = PromptManagerText.IS_CHANGED(text="hello", prepend_text="b")
-        self.assertNotEqual(result1, result2)
+    def test_returns_nan(self):
+        import math
 
-    def test_different_append_returns_different_hash(self):
-        result1 = PromptManagerText.IS_CHANGED(text="hello", append_text="a")
-        result2 = PromptManagerText.IS_CHANGED(text="hello", append_text="b")
-        self.assertNotEqual(result1, result2)
-
-    def test_returns_string(self):
-        result = PromptManagerText.IS_CHANGED(text="hello")
-        self.assertIsInstance(result, str)
+        result = PromptManagerText.IS_CHANGED(
+            text="hello", prepend_text="pre", append_text="post"
+        )
+        self.assertTrue(math.isnan(result))
 
 
 class TestIsChangedPromptSearchList(unittest.TestCase):

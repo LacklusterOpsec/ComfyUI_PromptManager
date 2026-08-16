@@ -83,7 +83,7 @@ class PromptTracker:
 
         # Read from GalleryConfig if available, otherwise use defaults
         try:
-            from ..py.config import GalleryConfig
+            from ..promptmanager_core.config import GalleryConfig
 
             self.cleanup_interval = GalleryConfig.CLEANUP_INTERVAL
             self.prompt_timeout = GalleryConfig.PROMPT_TIMEOUT

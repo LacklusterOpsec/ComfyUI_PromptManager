@@ -14,6 +14,7 @@
 # Required for gallery functionality:
 watchdog>=2.1.0              # For file system monitoring
 Pillow>=8.0.0                # For image metadata extraction (usually included with ComfyUI)
+opencv-python>=4.5.0         # For video thumbnail generation (optional but recommended)
 
 # Optional dependencies for enhanced search functionality:
 # fuzzywuzzy[speedup]>=0.18.0  # For fuzzy string matching (optional)

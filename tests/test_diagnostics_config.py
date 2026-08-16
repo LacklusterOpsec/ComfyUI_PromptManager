@@ -102,7 +102,7 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
         if "server" not in sys.modules:
             sys.modules["server"] = MagicMock()
 
-        from py.api.admin import AdminRoutesMixin
+        from promptmanager_core.api.admin import AdminRoutesMixin
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
             db_file = f.name
@@ -135,7 +135,7 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
         if "server" not in sys.modules:
             sys.modules["server"] = MagicMock()
 
-        from py.api.admin import AdminRoutesMixin
+        from promptmanager_core.api.admin import AdminRoutesMixin
 
         stub = self._make_api_stub("/nonexistent/custom/prompts.db")
 
@@ -153,7 +153,7 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
         if "server" not in sys.modules:
             sys.modules["server"] = MagicMock()
 
-        from py.api.admin import AdminRoutesMixin
+        from promptmanager_core.api.admin import AdminRoutesMixin
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
             db_file = f.name
@@ -175,7 +175,7 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
         if "server" not in sys.modules:
             sys.modules["server"] = MagicMock()
 
-        from py.api.admin import AdminRoutesMixin
+        from promptmanager_core.api.admin import AdminRoutesMixin
 
         stub = self._make_api_stub("/nonexistent/custom/prompts.db")
 

@@ -1998,7 +1998,7 @@
                     <div class="bg-pm-surface rounded-pm-md p-4 max-w-2xl w-full mx-4 border border-pm">
                         <h3 class="text-sm font-semibold text-pm mb-3">Copy Prompt Text</h3>
                         <p class="text-pm-secondary mb-4">Please manually copy the text below:</p>
-                        <textarea readonly class="w-full h-32 px-4 py-3 bg-pm-surface border border-pm rounded-pm-sm text-pm resize-none" style="font-family: monospace;">${text}</textarea>
+                        <textarea readonly id="fallbackCopyText" class="w-full h-32 px-4 py-3 bg-pm-surface border border-pm rounded-pm-sm text-pm resize-none" style="font-family: monospace;"></textarea>
                         <div class="flex justify-end mt-4">
                             <button class="px-4 py-1.5 bg-pm-accent hover:bg-pm-accent-hover text-pm font-medium rounded-pm-sm transition-colors" onclick="this.closest('[class*=fixed]').remove()">
                                 Close
@@ -2008,6 +2008,11 @@
                 `;
                 document.body.appendChild(modal);
                 document.body.style.overflow = "hidden";
+
+                // Set the prompt text via .value (never innerHTML) so prompt text
+                // containing markup cannot break out of the textarea.
+                const fallbackTextarea = modal.querySelector('#fallbackCopyText');
+                fallbackTextarea.value = text;
                 
                 // Auto-select the text in the textarea
                 const textarea = modal.querySelector('textarea');
@@ -2214,18 +2219,26 @@
                         container.innerHTML = data.files.map(file => `
                             <div class="bg-pm-surface rounded-pm-sm p-3">
                                 <div class="flex items-center justify-between mb-2">
-                                    <span class="text-sm font-medium text-pm">${file.filename}</span>
+                                    <span class="text-sm font-medium text-pm">${this.escapeHtml(file.filename)}</span>
                                     ${file.is_main ? '<span class="bg-pm-accent text-xs px-2 py-1 rounded">Active</span>' : ''}
                                 </div>
                                 <div class="text-xs text-pm-secondary mb-2">
                                     Size: ${this.formatBytes(file.size)} | Modified: ${new Date(file.modified).toLocaleString()}
                                 </div>
-                                <button onclick="window.admin.downloadLogFile('${file.filename}')"
+                                <button data-log-file="${this.escapeHtml(file.filename)}"
                                         class="w-full px-3 py-1 bg-pm-success hover:bg-pm-success text-pm text-xs rounded transition-colors">
                                     📥 Download
                                 </button>
                             </div>
                         `).join('');
+
+                        // Wire up download buttons (delegated listeners avoid building
+                        // inline handlers with untrusted filenames).
+                        container.querySelectorAll('button[data-log-file]').forEach(btn => {
+                            btn.addEventListener('click', () => {
+                                this.downloadLogFile(btn.dataset.logFile);
+                            });
+                        });
                     }
                 } catch (error) {
                     console.error("Failed to load log files:", error);
@@ -2281,11 +2294,11 @@
                             <div class="flex items-start space-x-2 text-sm">
                                 <span class="text-pm-muted text-xs font-mono w-24 flex-shrink-0">${timestamp.split(' ')[1]}</span>
                                 <span class="${levelColor} font-semibold w-16 flex-shrink-0">${log.level}</span>
-                                <span class="text-pm-accent text-xs w-32 flex-shrink-0">${log.logger}</span>
-                                <span class="text-pm-secondary flex-1">${log.message}</span>
+                                <span class="text-pm-accent text-xs w-32 flex-shrink-0">${this.escapeHtml(log.logger)}</span>
+                                <span class="text-pm-secondary flex-1">${this.escapeHtml(log.message)}</span>
                             </div>
                             <div class="text-xs text-pm-muted ml-44">
-                                ${log.filename}:${log.lineno}
+                                ${this.escapeHtml(log.filename)}:${log.lineno}
                             </div>
                         </div>
                     `;
@@ -2662,8 +2675,8 @@
                     <!-- File Path -->
                     <div>
                         <h2 class="text-sm font-medium text-pm-secondary mb-2">File Path</h2>
-                        <div class="text-sm text-pm-accent hover:text-pm-accent cursor-pointer bg-pm-surface p-2 rounded break-all" onclick="window.admin.copyToClipboard('${filePath}')">
-                            ${filePath}
+                        <div class="text-sm text-pm-accent hover:text-pm-accent cursor-pointer bg-pm-surface p-2 rounded break-all" data-copy-path="${this.escapeHtml(filePath)}">
+                            ${this.escapeHtml(filePath)}
                         </div>
                     </div>
 
@@ -2672,7 +2685,7 @@
                         <h2 class="text-sm font-medium text-pm-secondary mb-2">Resources used</h2>
                         <div class="flex items-center justify-between">
                             <div>
-                                <div class="text-pm-accent hover:text-pm-accent cursor-pointer">${checkpoint}</div>
+                                <div class="text-pm-accent hover:text-pm-accent cursor-pointer">${this.escapeHtml(checkpoint)}</div>
                                 <div class="text-xs text-pm-muted">ComfyUI Generated</div>
                             </div>
                             <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">CHECKPOINT</span>
@@ -2691,7 +2704,7 @@
                             </button>
                         </div>
                         <div class="text-sm text-pm-secondary bg-pm-surface p-3 rounded max-h-32 overflow-y-auto">
-                            ${positivePrompt.substring(0, 200)}${positivePrompt.length > 200 ? '...' : ''}
+                            ${this.escapeHtml(positivePrompt.substring(0, 200))}${positivePrompt.length > 200 ? '...' : ''}
                         </div>
                         ${positivePrompt.length > 200 ? '<button class="text-pm-accent hover:text-pm-accent text-sm mt-1" onclick="window.admin.showFullPrompt(\'positive\')">Show more</button>' : ''}
                     </div>
@@ -2707,7 +2720,7 @@
                             </button>
                         </div>
                         <div class="text-sm text-pm-secondary bg-pm-surface p-3 rounded max-h-32 overflow-y-auto">
-                            ${negativePrompt.substring(0, 200)}${negativePrompt.length > 200 ? '...' : ''}
+                            ${this.escapeHtml(negativePrompt.substring(0, 200))}${negativePrompt.length > 200 ? '...' : ''}
                         </div>
                         ${negativePrompt.length > 200 ? '<button class="text-pm-accent hover:text-pm-accent text-sm mt-1" onclick="window.admin.showFullPrompt(\'negative\')">Show more</button>' : ''}
                     </div>
@@ -2716,12 +2729,12 @@
                     <div>
                         <h2 class="text-sm font-medium text-pm-secondary mb-3">Other metadata</h2>
                         <div class="flex flex-wrap gap-2">
-                            <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">CFG SCALE: ${cfgScale}</span>
-                            <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">STEPS: ${steps}</span>
-                            <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">SAMPLER: ${sampler}</span>
+                            <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">CFG SCALE: ${this.escapeHtml(cfgScale)}</span>
+                            <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">STEPS: ${this.escapeHtml(steps)}</span>
+                            <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">SAMPLER: ${this.escapeHtml(sampler)}</span>
                         </div>
                         <div class="mt-2">
-                            <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">SEED: ${seed}</span>
+                            <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">SEED: ${this.escapeHtml(seed)}</span>
                         </div>
                     </div>
 
@@ -2738,6 +2751,13 @@
                         </div>
                     </div>
                 `;
+
+                const filePathEl = metadataContent.querySelector('[data-copy-path]');
+                if (filePathEl) {
+                    filePathEl.addEventListener('click', () => {
+                        this.copyToClipboard(filePathEl.dataset.copyPath || '');
+                    });
+                }
             }
 
             showMetadataError() {
@@ -2874,11 +2894,13 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                     <html>
                         <head><title>ComfyUI Workflow Data</title></head>
                         <body style="background: #111; color: #fff; font-family: monospace; padding: 20px;">
-                            <h2>ComfyUI Workflow JSON</h2>
-                            <pre style="background: #222; padding: 15px; border-radius: 5px; overflow: auto;">${JSON.stringify(this.currentMetadata.workflow, null, 2)}</pre>
+                            <h2>ComfyUI Workflow JSON                            </h2>
+                            <pre style="background: #222; padding: 15px; border-radius: 5px; overflow: auto;" id="workflow-json"></pre>
                         </body>
                     </html>
                 `);
+                newWindow.document.getElementById('workflow-json').textContent =
+                    JSON.stringify(this.currentMetadata.workflow, null, 2);
             }
 
             downloadWorkflowJSON() {
@@ -3362,7 +3384,7 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                 <div>
                     <h2 class="text-sm font-medium text-pm-secondary mb-2">File Path</h2>
                     <div class="text-sm text-pm-accent hover:text-pm-accent cursor-pointer bg-pm-surface p-2 rounded break-all" data-copy-path="">
-                        ${metadata.imagePath}
+                        ${this.escapeHtml(metadata.imagePath)}
                     </div>
                 </div>
 
@@ -3371,7 +3393,7 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                     <h2 class="text-sm font-medium text-pm-secondary mb-2">Resources used</h2>
                     <div class="flex items-center justify-between">
                         <div>
-                            <div class="text-pm-accent hover:text-pm-accent cursor-pointer">${metadata.checkpoint}</div>
+                            <div class="text-pm-accent hover:text-pm-accent cursor-pointer">${this.escapeHtml(metadata.checkpoint)}</div>
                             <div class="text-xs text-pm-muted">ComfyUI Generated</div>
                         </div>
                         <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">CHECKPOINT</span>
@@ -3390,7 +3412,7 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                         </button>
                     </div>
                     <div class="text-sm text-pm-secondary bg-pm-surface p-3 rounded max-h-32 overflow-y-auto">
-                        ${metadata.positivePrompt.substring(0, 200)}${metadata.positivePrompt.length > 200 ? '...' : ''}
+                        ${this.escapeHtml(metadata.positivePrompt.substring(0, 200))}${metadata.positivePrompt.length > 200 ? '...' : ''}
                     </div>
                     ${metadata.positivePrompt.length > 200 ? '<button class="text-pm-accent hover:text-pm-accent text-sm mt-1" data-show-type="positive">Show more</button>' : ''}
                 </div>
@@ -3406,7 +3428,7 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                         </button>
                     </div>
                     <div class="text-sm text-pm-secondary bg-pm-surface p-3 rounded max-h-32 overflow-y-auto">
-                        ${metadata.negativePrompt.substring(0, 200)}${metadata.negativePrompt.length > 200 ? '...' : ''}
+                        ${this.escapeHtml(metadata.negativePrompt.substring(0, 200))}${metadata.negativePrompt.length > 200 ? '...' : ''}
                     </div>
                     ${metadata.negativePrompt.length > 200 ? '<button class="text-pm-accent hover:text-pm-accent text-sm mt-1" data-show-type="negative">Show more</button>' : ''}
                 </div>
@@ -3415,12 +3437,12 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                 <div>
                     <h2 class="text-sm font-medium text-pm-secondary mb-3">Other metadata</h2>
                     <div class="flex flex-wrap gap-2">
-                        <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">CFG SCALE: ${metadata.cfgScale}</span>
-                        <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">STEPS: ${metadata.steps}</span>
-                        <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">SAMPLER: ${metadata.sampler}</span>
+                        <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">CFG SCALE: ${this.escapeHtml(metadata.cfgScale)}</span>
+                        <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">STEPS: ${this.escapeHtml(metadata.steps)}</span>
+                        <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">SAMPLER: ${this.escapeHtml(metadata.sampler)}</span>
                     </div>
                     <div class="mt-2">
-                        <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">SEED: ${metadata.seed}</span>
+                        <span class="px-2 py-1 text-xs bg-pm-surface text-pm-secondary rounded">SEED: ${this.escapeHtml(metadata.seed)}</span>
                     </div>
                 </div>
 
@@ -3531,11 +3553,13 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                         <html>
                             <head><title>ComfyUI Workflow Data</title></head>
                             <body style="background: #111; color: #fff; font-family: monospace; padding: 20px;">
-                                <h2>ComfyUI Workflow JSON</h2>
-                                <pre style="background: #222; padding: 15px; border-radius: 5px; overflow: auto;">${JSON.stringify(this.currentMetadata.workflow, null, 2)}</pre>
+                                <h2>ComfyUI Workflow JSON                                </h2>
+                                <pre style="background: #222; padding: 15px; border-radius: 5px; overflow: auto;" id="workflow-json"></pre>
                             </body>
                         </html>
                     `);
+                    newWindow.document.getElementById('workflow-json').textContent =
+                        JSON.stringify(this.currentMetadata.workflow, null, 2);
                 }
             }
 

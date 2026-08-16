@@ -190,6 +190,21 @@ class PromptModel:
                 self._conn.rollback()
                 raise
 
+    def close(self) -> None:
+        """Close the persistent connection, if open.
+
+        Safe to call from any thread. After closing, the next
+        ``get_connection()`` call transparently reopens a fresh connection,
+        so callers do not need to re-initialize the model.
+        """
+        with self._conn_lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
     def _migrate_workflow_name_removal(self, conn: sqlite3.Connection) -> None:
         """
         Remove workflow_name column if it exists in existing database.

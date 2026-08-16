@@ -257,9 +257,14 @@ class AdminRoutesMixin:
                     output_path = Path(output_dir)
                     file_path = Path(image_path)
 
-                    # Security check - ensure file is within output directory
+                    # Security check - ensure file is within output directory.
+                    # Normalize with os.path.abspath (collapse "..", don't follow
+                    # junctions) so junction subfolders that point to other drives
+                    # are still treated as part of the output tree.
                     try:
-                        file_path.resolve().relative_to(output_path.resolve())
+                        Path(os.path.abspath(str(file_path))).relative_to(
+                            Path(os.path.abspath(str(output_path)))
+                        )
                     except ValueError:
                         self.logger.warning(
                             f"Attempted to delete file outside output directory: {image_path}"
@@ -945,74 +950,91 @@ class AdminRoutesMixin:
                 temp_path = temp_file.name
                 temp_file.write(file_data)
 
-            try:
-                with sqlite3.connect(temp_path) as conn:
-                    conn.row_factory = sqlite3.Row
-
-                    cursor = conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='prompts'"
-                    )
-                    if not cursor.fetchone():
-                        raise ValueError("Database does not contain a 'prompts' table")
-
-                    cursor = conn.execute("PRAGMA table_info(prompts)")
-                    columns = [row["name"] for row in cursor.fetchall()]
-                    required_columns = ["id", "text", "created_at"]
-
-                    for col in required_columns:
-                        if col not in columns:
-                            raise ValueError(f"Database missing required column: {col}")
-
-                    cursor = conn.execute("SELECT COUNT(*) as count FROM prompts")
-                    prompt_count = cursor.fetchone()["count"]
-
-                db_path = self.db.model.db_path
-                backup_path = f"{db_path}.backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-                if os.path.exists(db_path):
-                    shutil.copy2(db_path, backup_path)
-                    self.logger.info(f"Current database backed up to: {backup_path}")
-
-                shutil.copy2(temp_path, db_path)
-
-                # Reinitialize the database connection
+            # Serialize restore with any other restore (and the live-DB swap) so a
+            # concurrent request cannot leave the live DB overwritten mid-way.
+            async with self._restore_lock:
                 try:
-                    from ...database.operations import PromptDatabase
-                except ImportError:
-                    import sys
+                    with sqlite3.connect(temp_path) as conn:
+                        conn.row_factory = sqlite3.Row
 
-                    sys.path.insert(
-                        0,
-                        os.path.dirname(
-                            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                        ),
+                        # Validate the schema the app actually depends on before we
+                        # ever touch the live database.
+                        cursor = conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        )
+                        tables = {row["name"] for row in cursor.fetchall()}
+                        required_tables = [
+                            "prompts",
+                            "generated_images",
+                            "tags",
+                            "prompt_tags",
+                        ]
+                        missing_tables = [
+                            t for t in required_tables if t not in tables
+                        ]
+                        if missing_tables:
+                            raise ValueError(
+                                "Database is missing required table(s): "
+                                + ", ".join(missing_tables)
+                            )
+
+                        cursor = conn.execute("PRAGMA table_info(prompts)")
+                        columns = [row["name"] for row in cursor.fetchall()]
+                        required_columns = ["id", "text", "created_at", "hash"]
+                        missing_columns = [
+                            col for col in required_columns if col not in columns
+                        ]
+                        if missing_columns:
+                            raise ValueError(
+                                "Database is missing required column(s): "
+                                + ", ".join(missing_columns)
+                            )
+
+                        cursor = conn.execute("SELECT COUNT(*) as count FROM prompts")
+                        prompt_count = cursor.fetchone()["count"]
+
+                    db_path = self.db.model.db_path
+                    backup_path = f"{db_path}.backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+                    if os.path.exists(db_path):
+                        shutil.copy2(db_path, backup_path)
+                        self.logger.info(f"Current database backed up to: {backup_path}")
+
+                    # Release our open handle to the live DB *before* overwriting it.
+                    # On Windows an open SQLite file cannot be replaced, and swapping
+                    # the file under a live connection leaves a stale/corrupt handle.
+                    self.db.model.close()
+
+                    shutil.copy2(temp_path, db_path)
+
+                    # Rebuild the shared singleton's model against the restored
+                    # file (runs migrations). Because every component shares this
+                    # one instance, no stale handle to the old file remains.
+                    self.db.reload()
+
+                    return web.json_response(
+                        {
+                            "success": True,
+                            "message": f"Database restored successfully. Found {prompt_count} prompts.",
+                            "prompt_count": prompt_count,
+                            "backup_created": (
+                                backup_path if os.path.exists(db_path) else None
+                            ),
+                        }
                     )
-                    from database.operations import PromptDatabase
-                self.db = PromptDatabase()
 
-                return web.json_response(
-                    {
-                        "success": True,
-                        "message": f"Database restored successfully. Found {prompt_count} prompts.",
-                        "prompt_count": prompt_count,
-                        "backup_created": (
-                            backup_path if os.path.exists(db_path) else None
-                        ),
-                    }
-                )
-
-            except sqlite3.Error as e:
-                return web.json_response(
-                    {"success": False, "error": f"Invalid SQLite database: {str(e)}"},
-                    status=400,
-                )
-            except ValueError as e:
-                return web.json_response(
-                    {"success": False, "error": str(e)}, status=400
-                )
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
+                except sqlite3.Error as e:
+                    return web.json_response(
+                        {"success": False, "error": f"Invalid SQLite database: {str(e)}"},
+                        status=400,
+                    )
+                except ValueError as e:
+                    return web.json_response(
+                        {"success": False, "error": str(e)}, status=400
+                    )
+                finally:
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
 
         except Exception as e:
             self.logger.error(f"Restore error: {e}", exc_info=True)

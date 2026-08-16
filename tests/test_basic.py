@@ -217,7 +217,7 @@ class TestNodeIntegration(unittest.TestCase):
         if os.path.exists(self.temp_db.name):
             os.unlink(self.temp_db.name)
 
-    @patch("prompt_manager_base.PromptDatabase")
+    @patch("prompt_manager_base.get_prompt_database")
     def test_node_encode_function(self, mock_db_class):
         """Test the node's encode function with mocked dependencies."""
         # Mock the database

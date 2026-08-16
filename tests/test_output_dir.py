@@ -18,8 +18,8 @@ _mock_server = MagicMock()
 _mock_server.PromptServer.instance.routes = MagicMock()
 sys.modules["server"] = _mock_server
 
-from py.api import PromptManagerAPI
-from py.config import GalleryConfig
+from promptmanager_core.api import PromptManagerAPI
+from promptmanager_core.config import GalleryConfig
 
 
 class TestFindComfyuiOutputDir(unittest.TestCase):

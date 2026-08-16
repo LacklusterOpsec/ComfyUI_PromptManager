@@ -20,7 +20,7 @@ except ImportError:
     from utils.logging_config import get_logger
 
 try:
-    from .database.operations import PromptDatabase
+    from .database.operations import get_prompt_database
     from .utils.comfyui_integration import get_comfyui_integration
     from .utils.image_monitor import get_image_monitor
     from .utils.prompt_tracker import get_prompt_tracker
@@ -28,7 +28,7 @@ except ImportError:
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from database.operations import PromptDatabase
+    from database.operations import get_prompt_database
     from utils.comfyui_integration import get_comfyui_integration
     from utils.image_monitor import get_image_monitor
     from utils.prompt_tracker import get_prompt_tracker
@@ -47,7 +47,7 @@ class PromptManagerBase:
         self.logger = get_logger(logger_name)
         self.logger.debug(f"Initializing {self.__class__.__name__} node")
 
-        self.db = PromptDatabase()
+        self.db = get_prompt_database()
         self.prompt_tracker = get_prompt_tracker(self.db)
         self.image_monitor = get_image_monitor(self.db, self.prompt_tracker)
         self.comfyui_integration = get_comfyui_integration()
@@ -112,10 +112,10 @@ class PromptManagerBase:
         LoraManager is not installed.
         """
         try:
-            from .py.config import IntegrationConfig
+            from .promptmanager_core.config import IntegrationConfig
         except ImportError:
             try:
-                from py.config import IntegrationConfig
+                from promptmanager_core.config import IntegrationConfig
             except ImportError:
                 return text
 
@@ -126,10 +126,10 @@ class PromptManagerBase:
             return text
 
         try:
-            from .py.lora_utils import get_trigger_cache, inject_trigger_words
+            from .promptmanager_core.lora_utils import get_trigger_cache, inject_trigger_words
         except ImportError:
             try:
-                from py.lora_utils import get_trigger_cache, inject_trigger_words
+                from promptmanager_core.lora_utils import get_trigger_cache, inject_trigger_words
             except ImportError:
                 return text
 
@@ -185,7 +185,7 @@ class PromptManagerBase:
                 return []
 
             try:
-                from .py.config import PromptManagerConfig
+                from .promptmanager_core.config import PromptManagerConfig
 
                 max_results = PromptManagerConfig.MAX_SEARCH_RESULTS
             except Exception:

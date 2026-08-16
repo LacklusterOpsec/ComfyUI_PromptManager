@@ -61,8 +61,8 @@ try:
     # Set extension URI
     import os
 
-    from .py import config
-    from .py.api import PromptManagerAPI
+    from .promptmanager_core import config
+    from .promptmanager_core.api import PromptManagerAPI
 
     extension_uri = os.path.dirname(__file__)
     config.extension_uri = extension_uri
@@ -85,7 +85,7 @@ except Exception as e:
 # Start image monitoring globally at module import time
 # This ensures images are linked regardless of which node is used in the workflow
 try:
-    from .database.operations import PromptDatabase
+    from .database.operations import get_prompt_database
     from .utils.image_monitor import get_image_monitor
     from .utils.prompt_tracker import get_prompt_tracker
     from .utils.logging_config import get_logger
@@ -94,7 +94,7 @@ try:
     _init_logger.info("Starting global image monitoring system...")
 
     # Initialize database and get singleton instances
-    _global_db = PromptDatabase()
+    _global_db = get_prompt_database()
     _global_prompt_tracker = get_prompt_tracker(_global_db)
     _global_image_monitor = get_image_monitor(_global_db, _global_prompt_tracker)
 

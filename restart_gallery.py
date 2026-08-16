@@ -29,14 +29,14 @@ sys.path.insert(0, current_dir)
 
 try:
     # Import and initialize the gallery system
-    from database.operations import PromptDatabase
+    from database.operations import get_prompt_database
     from utils.prompt_tracker import get_prompt_tracker
     from utils.image_monitor import get_image_monitor
 
     print("[RESTART] Restarting PromptManager Gallery System...")
 
     # Initialize components using singleton getters
-    db = PromptDatabase()
+    db = get_prompt_database()
     tracker = get_prompt_tracker(db)
     monitor = get_image_monitor(db, tracker)
 

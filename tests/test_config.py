@@ -19,7 +19,7 @@ sys.modules["server"] = _mock_server
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from py.config import GalleryConfig, IntegrationConfig, PromptManagerConfig
+from promptmanager_core.config import GalleryConfig, IntegrationConfig, PromptManagerConfig
 
 
 class TestGalleryConfig(unittest.TestCase):

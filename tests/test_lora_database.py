@@ -225,6 +225,28 @@ class TestGetPromptSubfolders(LoraDBTestCase):
         )
         self.assertEqual(folders, sorted(folders))
 
+    def test_hides_thumbnails_cache_folders(self):
+        pid1 = self._save("prompt 1")
+        self._link_image(pid1, "/output/.thumbnails_cache/img1.png")
+
+        pid2 = self._save("prompt 2")
+        self._link_image(pid2, "/output/thumbnails/img2.png")
+
+        pid3 = self._save("prompt 3")
+        self._link_image(pid3, "/output/real_folder/img3.png")
+
+        folders = self.db.get_prompt_subfolders()
+        self.assertNotIn(".thumbnails_cache", folders)
+        self.assertNotIn("thumbnails", folders)
+        self.assertIn("real_folder", folders)
+
+    def test_hides_thumbnails_cache_nested_file(self):
+        pid = self._save("prompt")
+        self._link_image(pid, "/output/.thumbnails_cache/sub/img.png")
+
+        folders = self.db.get_prompt_subfolders()
+        self.assertNotIn(".thumbnails_cache", folders)
+
 
 # ── LoRA prompt workflow ──────────────────────────────────────────────
 

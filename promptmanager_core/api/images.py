@@ -68,6 +68,10 @@ class ImageRoutesMixin:
         async def clear_thumbnails_route(request):
             return await self.clear_thumbnails(request)
 
+        @routes.get("/prompt_manager/images/thumbnail-status")
+        async def get_thumbnail_status_route(request):
+            return await self.get_thumbnail_status(request)
+
         @routes.get("/prompt_manager/gallery/subfolders")
         async def get_gallery_subfolders_route(request):
             return await self.get_gallery_subfolders(request)
@@ -154,26 +158,41 @@ class ImageRoutesMixin:
     def _scan_gallery_files_sync(self, output_path):
         """Scan output directory for media files (blocking I/O, run in executor).
 
+        Uses a single ``os.walk`` pass (instead of one ``rglob`` per extension),
+        so very large libraries are scanned far faster. The ``thumbnails``
+        directory is pruned so derivative files are never walked.
+
         Returns list of (path, mtime) tuples sorted by mtime descending.
         """
-        image_extensions = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
-        video_extensions = [".mp4", ".webm", ".avi", ".mov", ".mkv", ".m4v", ".wmv"]
-        media_extensions = image_extensions + video_extensions
-        all_images = []
+        image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+        video_extensions = {".mp4", ".webm", ".avi", ".mov", ".mkv", ".m4v", ".wmv"}
+        media_extensions = image_extensions | video_extensions
 
+        all_images = []
         seen_paths = set()
-        for ext in media_extensions:
-            for pattern in [f"*{ext}", f"*{ext.upper()}"]:
-                for media_path in output_path.rglob(pattern):
-                    if "thumbnails" not in media_path.parts:
-                        normalized_path = str(media_path).lower()
-                        if normalized_path not in seen_paths:
-                            seen_paths.add(normalized_path)
-                            try:
-                                mtime = media_path.stat().st_mtime
-                                all_images.append((media_path, mtime))
-                            except OSError:
-                                continue
+
+        for dirpath, dirnames, filenames in os.walk(output_path):
+            # Never descend into thumbnail or hidden/cache directories
+            # (e.g. ComfyUI's own ".thumbnails_cache" preview cache).
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if d.lower() != "thumbnails" and not d.startswith(".")
+            ]
+            for fname in filenames:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in media_extensions:
+                    continue
+                media_path = os.path.join(dirpath, fname)
+                normalized_path = media_path.lower()
+                if normalized_path in seen_paths:
+                    continue
+                seen_paths.add(normalized_path)
+                try:
+                    mtime = os.stat(media_path).st_mtime
+                    all_images.append((Path(media_path), mtime))
+                except OSError:
+                    continue
 
         all_images.sort(key=lambda x: x[1], reverse=True)
         return all_images
@@ -219,12 +238,16 @@ class ImageRoutesMixin:
             # Sort combined results by mtime (newest first) — no .stat() calls
             all_images.sort(key=lambda x: x[1], reverse=True)
 
-            # Apply subfolder filter if provided
+            # Apply subfolder filter if provided. The frontend builds subfolder
+            # paths with forward slashes, but on Windows rel_dir uses backslashes,
+            # so normalize to forward slashes before comparing — otherwise no
+            # subfolder ever matches on Windows.
             if subfolder:
+                subfolder = subfolder.replace("\\", "/")
                 filtered = []
                 for img_path, mtime, root, ridx in all_images:
-                    rel_dir = str(img_path.relative_to(root).parent)
-                    if rel_dir == subfolder or rel_dir.startswith(subfolder + os.sep):
+                    rel_dir = str(img_path.relative_to(root).parent).replace("\\", "/")
+                    if rel_dir == subfolder or rel_dir.startswith(subfolder + "/"):
                         filtered.append((img_path, mtime, root, ridx))
                 all_images = filtered
 
@@ -261,7 +284,7 @@ class ImageRoutesMixin:
                                 "relative_path": str(rel_path),
                                 "root_dir": str(output_path),
                                 "root_index": root_index,
-                                "url": f"/prompt_manager/images/serve/{rel_path.as_posix()}",
+                                "url": f"/prompt_manager/images/serve/{quote(rel_path.as_posix(), safe='/')}",
                                 "thumbnail_url": thumbnail_url,
                                 "size": stat.st_size,
                                 "modified_time": stat.st_mtime,
@@ -291,6 +314,76 @@ class ImageRoutesMixin:
             self.logger.error(f"Output images error: {e}")
             return web.json_response({"success": False, "error": str(e)}, status=500)
 
+    async def get_thumbnail_status(self, request):
+        """Return an exact count of media files missing thumbnails.
+
+        Unlike sampling the newest page (which is biased toward files created
+        since the last thumbnail run), this does a single full scan of every
+        output directory and reports the real number missing, so the gallery
+        can show the user an accurate figure.
+        """
+        try:
+            output_dirs = self._get_all_output_dirs()
+            if not output_dirs:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "error": "No output directories found",
+                        "total": 0,
+                        "missing": 0,
+                        "recent_excluded": 0,
+                    }
+                )
+
+            video_extensions = {".mp4", ".webm", ".avi", ".mov", ".mkv", ".m4v", ".wmv"}
+            recent_window = 60 * 60  # 1 hour: brand-new files may not be thumbnailed yet
+
+            def _count_sync():
+                now = _time.time()
+                total = 0
+                missing = 0
+                recent_excluded = 0
+                for output_path in output_dirs:
+                    thumbnails_dir = output_path / "thumbnails"
+                    has_thumb_dir = thumbnails_dir.exists()
+                    for media_path, mtime in self._scan_gallery_files_sync(output_path):
+                        total += 1
+                        thumbnail_abs_path = None
+                        if has_thumb_dir:
+                            extension = media_path.suffix.lower()
+                            is_video = extension in video_extensions
+                            thumbnail_ext = ".jpg" if is_video else extension
+                            rel_path = media_path.relative_to(output_path)
+                            rel_path_no_ext = rel_path.with_suffix("")
+                            thumbnail_abs_path = (
+                                output_path
+                                / f"thumbnails/{rel_path_no_ext.as_posix()}_thumb{thumbnail_ext}"
+                            )
+                            if thumbnail_abs_path.exists():
+                                continue
+                        if now - mtime >= recent_window:
+                            missing += 1
+                        else:
+                            recent_excluded += 1
+                return total, missing, recent_excluded
+
+            total, missing, recent_excluded = await self._run_in_executor(_count_sync)
+
+            return web.json_response(
+                {
+                    "success": True,
+                    "total": total,
+                    "missing": missing,
+                    "recent_excluded": recent_excluded,
+                }
+            )
+        except Exception as e:
+            self.logger.error(f"Thumbnail status error: {e}")
+            return web.json_response(
+                {"success": False, "error": str(e), "total": 0, "missing": 0},
+                status=500,
+            )
+
     async def serve_image(self, request):
         """Serve the actual image file using streamed FileResponse."""
         try:
@@ -302,7 +395,9 @@ class ImageRoutesMixin:
                     {"success": False, "error": "Image not found"}, status=404
                 )
 
-            image_path = Path(image["image_path"]).resolve()
+            # Normalize with os.path.abspath (collapse "..", don't follow junctions)
+            # so DB-referenced files under a junction subfolder still resolve.
+            image_path = Path(os.path.abspath(str(Path(image["image_path"]))))
 
             # Validate path is within any allowed directory
             allowed_dirs = list(self._get_all_output_dirs())
@@ -328,7 +423,8 @@ class ImageRoutesMixin:
 
             if allowed_dirs:
                 allowed = any(
-                    image_path.is_relative_to(d.resolve()) for d in allowed_dirs
+                    image_path.is_relative_to(Path(os.path.abspath(str(d))))
+                    for d in allowed_dirs
                 )
                 if not allowed:
                     return web.json_response(
@@ -376,12 +472,19 @@ class ImageRoutesMixin:
                 except (ValueError, IndexError):
                     pass
 
-            # Try each root directory until the file is found
+            # Try each root directory until the file is found.
+            # Normalize with os.path.abspath: it collapses ".." (traversal
+            # protection) but does NOT follow symlinks/junctions, so an output
+            # subfolder that is a junction to another drive (e.g. "Archive F"
+            # -> F:\...) stays part of the output tree and is served instead of
+            # 404ing. (.resolve() follows junctions; .absolute() does not
+            # collapse "..".)
             for output_path in output_dirs:
-                image_path = (output_path / filepath).resolve()
+                output_path_abs = Path(os.path.abspath(str(output_path)))
+                image_path = Path(os.path.abspath(str(output_path / filepath)))
 
                 # Security check: must be within this output directory
-                if not image_path.is_relative_to(output_path.resolve()):
+                if not image_path.is_relative_to(output_path_abs):
                     continue
 
                 if image_path.exists():
@@ -486,6 +589,13 @@ class ImageRoutesMixin:
         media_extensions = image_extensions + video_extensions
         media_files = []
         for root, dirs, files in os.walk(output_path):
+            # Never descend into thumbnail or hidden/cache directories
+            # (e.g. ComfyUI's own ".thumbnails_cache" preview cache).
+            dirs[:] = [
+                d
+                for d in dirs
+                if d.lower() != "thumbnails" and not d.startswith(".")
+            ]
             if "thumbnails" in Path(root).parts:
                 continue
             for file in files:
@@ -671,6 +781,13 @@ class ImageRoutesMixin:
                 scanned_dirs = 0
 
                 for root, dirs, files in os.walk(output_path):
+                    # Never descend into thumbnail or hidden/cache directories
+                    # (e.g. ComfyUI's own ".thumbnails_cache" preview cache).
+                    dirs[:] = [
+                        d
+                        for d in dirs
+                        if d.lower() != "thumbnails" and not d.startswith(".")
+                    ]
                     if "thumbnails" in Path(root).parts:
                         continue
 

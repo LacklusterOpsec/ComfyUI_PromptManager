@@ -398,14 +398,14 @@
                     return `
                     <div class="image-item bg-pm-surface rounded-pm-md overflow-hidden border border-pm hover:border-pm cursor-pointer group">
                         <div class="aspect-square bg-pm-primary overflow-hidden relative">
-                            <img src="${displayUrl}"
+                            <img src="${this.escapeHtml(displayUrl)}"
                                  alt="${this.escapeHtml(image.filename)}"
                                  class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                                  loading="lazy"
-                                 data-original="${image.url}"
-                                 data-thumbnail="${image.thumbnail_url || ''}"
+                                 data-original="${this.escapeHtml(image.url)}"
+                                 data-thumbnail="${this.escapeHtml(image.thumbnail_url || '')}"
                                  data-caption="${this.escapeHtml(this.formatImageCaption(image))}"
-                                 data-media-type="${mediaType}"
+                                 data-media-type="${this.escapeHtml(mediaType)}"
                                  data-is-video="${isVideo}"
                                  onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
                             <!-- Fallback for failed thumbnails -->
@@ -457,14 +457,14 @@
                     return `
                     <div class="image-item bg-pm-surface rounded-pm-md border border-pm hover:border-pm cursor-pointer group flex items-center p-4">
                         <div class="w-16 h-16 bg-pm-primary rounded-pm-md overflow-hidden flex-shrink-0 mr-4 relative">
-                            <img src="${displayUrl}"
+                            <img src="${this.escapeHtml(displayUrl)}"
                                  alt="${this.escapeHtml(image.filename)}"
                                  class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                                  loading="lazy"
-                                 data-original="${image.url}"
-                                 data-thumbnail="${image.thumbnail_url || ''}"
+                                 data-original="${this.escapeHtml(image.url)}"
+                                 data-thumbnail="${this.escapeHtml(image.thumbnail_url || '')}"
                                  data-caption="${this.escapeHtml(this.formatImageCaption(image))}"
-                                 data-media-type="${mediaType}"
+                                 data-media-type="${this.escapeHtml(mediaType)}"
                                  data-is-video="${isVideo}"
                                  onerror="this.style.display='none'">
                             ${hasThumb ? '<div class="absolute top-1 right-1 w-2 h-2 bg-pm-success rounded-full" title="Thumbnail available"></div>' : ''}
@@ -473,7 +473,7 @@
                         <div class="flex-1 min-w-0">
                             <div class="text-sm font-medium text-pm truncate">${this.escapeHtml(image.filename)}${isVideo ? ' 🎬' : ''}</div>
                             <div class="text-xs text-pm-secondary">${this.formatFileSize(image.size)} • ${new Date(image.modified_time * 1000).toLocaleDateString()}${hasThumb ? ' • Fast' : ''}${isVideo ? ' • Video' : ''}</div>
-                            <div class="text-xs text-pm-muted truncate">${image.relative_path}</div>
+                            <div class="text-xs text-pm-muted truncate">${this.escapeHtml(image.relative_path)}</div>
                         </div>
                         <div class="flex-shrink-0 ml-4">
                             ${isVideo ? `
@@ -806,7 +806,7 @@
                         
                         <!-- Main video -->
                         <video id="modalVideo" 
-                               src="${videoUrl}" 
+                               src="${this.escapeHtml(videoUrl)}" 
                                class="max-w-full max-h-full object-contain"
                                controls
                                ${settings.videoAutoplay ? 'autoplay' : ''}
@@ -833,7 +833,7 @@
                                 </svg>
                                 <h1 class="text-sm font-semibold text-pm">Video Info</h1>
                             </div>
-                            <button class="text-xs text-pm-accent hover:text-pm-accent transition-colors" onclick="navigator.clipboard.writeText('${videoUrl}').then(() => this.textContent = '✓ Copied!'); setTimeout(() => this.textContent = '📋 COPY URL', 1000)">
+                            <button class="text-xs text-pm-accent hover:text-pm-accent transition-colors" id="videoCopyUrlBtn" data-copy-url="${this.escapeHtml(videoUrl)}">
                                 📋 COPY URL
                             </button>
                         </div>
@@ -862,6 +862,20 @@
                 document.addEventListener('keydown', escapeHandler);
                 
                 document.body.appendChild(modal);
+
+                // Copy video URL button
+                const videoCopyBtn = modal.querySelector('#videoCopyUrlBtn');
+                if (videoCopyBtn) {
+                    videoCopyBtn.addEventListener('click', async () => {
+                        try {
+                            await navigator.clipboard.writeText(videoCopyBtn.dataset.copyUrl || '');
+                            videoCopyBtn.textContent = '✓ Copied!';
+                        } catch (e) {
+                            videoCopyBtn.textContent = 'Copy failed';
+                        }
+                        setTimeout(() => { videoCopyBtn.textContent = '📋 COPY URL'; }, 1000);
+                    });
+                }
                 
                 // Apply default collapsed state from settings
                 const sidebarInVideoModal = modal.querySelector('.metadata-sidebar');
@@ -986,12 +1000,12 @@
                         <div class="space-y-2">
                             <h2 class="text-sm font-medium text-pm-secondary">File Info</h2>
                             <div class="text-xs text-pm-secondary font-mono bg-pm-surface p-2 rounded break-all cursor-pointer hover:bg-pm-hover"
-                                 onclick="navigator.clipboard.writeText('${videoUrl}').then(() => this.textContent = 'Copied!'); setTimeout(() => this.textContent = '${fileName}', 1000)"
+                                 data-copy-path="${this.escapeHtml(videoUrl)}"
                                  title="Click to copy path">
-                                ${fileName}
+                                ${this.escapeHtml(fileName)}
                             </div>
                             <div class="text-xs text-pm-muted">
-                                Type: ${fileExt} Video
+                                Type: ${this.escapeHtml(fileExt)} Video
                             </div>
                         </div>
 
@@ -1031,6 +1045,14 @@
                         </div>
                     `;
                     
+                    // File path copy
+                    const videoPathEl = container.querySelector('[data-copy-path]');
+                    if (videoPathEl) {
+                        videoPathEl.addEventListener('click', () => {
+                            this.copyToClipboard(videoPathEl.dataset.copyPath || '');
+                        });
+                    }
+
                     // Try to get video metadata from the video element
                     const video = document.querySelector('#modalVideo');
                     if (video) {
@@ -1185,7 +1207,7 @@
                     <div class="space-y-2">
                         <h2 class="text-sm font-medium text-pm-secondary">File Path</h2>
                         <div class="text-xs text-pm-secondary font-mono bg-pm-surface p-2 rounded break-all cursor-pointer hover:bg-pm-hover" data-copy-path title="Click to copy">
-                            ${metadata.imagePath || 'Unknown'}
+                            ${this.escapeHtml(metadata.imagePath || 'Unknown')}
                         </div>
                     </div>
 
@@ -1195,7 +1217,7 @@
                         <div class="space-y-2 text-xs">
                             <div class="flex justify-between">
                                 <span class="text-pm-secondary">Model:</span>
-                                <span class="text-pm">${metadata.checkpoint || 'Unknown'}</span>
+                                <span class="text-pm">${this.escapeHtml(metadata.checkpoint || 'Unknown')}</span>
                             </div>
                         </div>
                     </div>
@@ -1237,19 +1259,19 @@
                         <div class="space-y-2 text-xs">
                             <div class="flex justify-between">
                                 <span class="text-pm-secondary">CFG SCALE:</span>
-                                <span class="text-pm px-2 py-1 bg-pm-surface rounded text-xs">${metadata.cfgScale || 'Unknown'}</span>
+                                <span class="text-pm px-2 py-1 bg-pm-surface rounded text-xs">${this.escapeHtml(metadata.cfgScale || 'Unknown')}</span>
                             </div>
                             <div class="flex justify-between">
                                 <span class="text-pm-secondary">STEPS:</span>
-                                <span class="text-pm px-2 py-1 bg-pm-surface rounded text-xs">${metadata.steps || 'Unknown'}</span>
+                                <span class="text-pm px-2 py-1 bg-pm-surface rounded text-xs">${this.escapeHtml(metadata.steps || 'Unknown')}</span>
                             </div>
                             <div class="flex justify-between">
                                 <span class="text-pm-secondary">SAMPLER:</span>
-                                <span class="text-pm px-2 py-1 bg-pm-surface rounded text-xs">${metadata.sampler || 'Unknown'}</span>
+                                <span class="text-pm px-2 py-1 bg-pm-surface rounded text-xs">${this.escapeHtml(metadata.sampler || 'Unknown')}</span>
                             </div>
                             <div class="flex justify-between">
                                 <span class="text-pm-secondary">SEED:</span>
-                                <span class="text-pm font-mono px-2 py-1 bg-pm-surface rounded text-xs">${metadata.seed || 'Unknown'}</span>
+                                <span class="text-pm font-mono px-2 py-1 bg-pm-surface rounded text-xs">${this.escapeHtml(metadata.seed || 'Unknown')}</span>
                             </div>
                         </div>
                     </div>
@@ -1436,10 +1458,14 @@
                             <head><title>ComfyUI Workflow Data</title></head>
                             <body style="background: #111; color: #fff; font-family: monospace; padding: 20px;">
                                 <h2>ComfyUI Workflow JSON</h2>
-                                <pre style="background: #222; padding: 15px; border-radius: 5px; overflow: auto;">${JSON.stringify(this.currentMetadata.workflow, null, 2)}</pre>
+                                <pre id="workflow-json" style="background: #222; padding: 15px; border-radius: 5px; overflow: auto;"></pre>
                             </body>
                         </html>
                     `);
+                    // Use textContent (not innerHTML) so attacker-controlled workflow
+                    // strings can never inject live markup into the popup.
+                    newWindow.document.getElementById('workflow-json').textContent =
+                        JSON.stringify(this.currentMetadata.workflow, null, 2);
                 }
             }
 
@@ -2186,14 +2212,23 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                     // Handle errors
                     eventSource.addEventListener('error', (event) => {
                         if (cancelled) return;
-                        const data = JSON.parse(event.data);
-                        
+
+                        let errorMsg = 'Thumbnail generation failed';
+                        try {
+                            const data = JSON.parse(event.data);
+                            errorMsg = data.error || errorMsg;
+                        } catch (e) {
+                            // Not JSON (e.g. a connection ErrorEvent with no data) —
+                            // fall through to the generic message.
+                            console.error('EventSource error:', e);
+                        }
+
                         // Clean up
                         eventSource.close();
                         cancelBtn.removeEventListener('click', cancelHandler);
                         cancelBtn.classList.add('hidden');
-                        
-                        reject(new Error(data.error || 'Thumbnail generation failed'));
+
+                        reject(new Error(errorMsg));
                     });
                     
                     // Handle EventSource errors
@@ -2364,7 +2399,7 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                     
                     groupEl.innerHTML = `
                         <div class="mb-3 text-sm font-medium text-pm-secondary">
-                            Duplicate Group ${groupIndex + 1} (${group.images.length} identical ${group.images[0].media_type}s)
+                            Duplicate Group ${groupIndex + 1} (${group.images.length} identical ${this.escapeHtml(group.images[0].media_type)}s)
                         </div>
                         <div class="mb-3 p-3 bg-pm-primary rounded text-sm text-pm-secondary">
                             <strong>Content Hash:</strong> ${group.hash.substring(0, 16)}...
@@ -2376,7 +2411,7 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                                         ${image.media_type === 'video' ? `
                                             <div class="w-20 h-20 bg-pm-input rounded flex items-center justify-center relative">
                                                 ${image.thumbnail_url ? `
-                                                    <img src="${image.thumbnail_url}" alt="Video thumbnail" class="w-full h-full object-cover rounded">
+                                                    <img src="${this.escapeHtml(image.thumbnail_url)}" alt="Video thumbnail" class="w-full h-full object-cover rounded">
                                                 ` : `
                                                     <svg class="w-8 h-8 text-pm-secondary" fill="currentColor" viewBox="0 0 20 20">
                                                         <path d="M2 6a2 2 0 012-2h6l2 2h6a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6zM14.553 7.106A1 1 0 0014 8v4a1 1 0 00.553.894l2 1A1 1 0 0018 13V7a1 1 0 00-1.447-.894l-2 1z"/>
@@ -2385,7 +2420,7 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                                                 <div class="absolute bottom-0 right-0 bg-black/75 text-pm text-xs px-1 rounded">VIDEO</div>
                                             </div>
                                         ` : `
-                                            <img src="${image.thumbnail_url || image.url}" alt="${this.escapeHtml(image.filename)}"
+                                            <img src="${this.escapeHtml(image.thumbnail_url || image.url)}" alt="${this.escapeHtml(image.filename)}"
                                                  class="w-20 h-20 object-cover rounded cursor-pointer hover:opacity-80"
                                                  onclick="this.parentElement.parentElement.querySelector('.image-preview').click()">
                                         `}
@@ -2397,14 +2432,14 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                                                 <span class="font-medium">Size:</span> ${this.formatFileSize(image.size)} •
                                                 <span class="font-medium">Modified:</span> ${new Date(image.modified_time * 1000).toLocaleDateString()}
                                             </div>
-                                            <div class="text-xs text-pm-muted mt-1 truncate" title="${image.relative_path}">
-                                                ${image.relative_path}
+                                            <div class="text-xs text-pm-muted mt-1 truncate" title="${this.escapeHtml(image.relative_path)}">
+                                                ${this.escapeHtml(image.relative_path)}
                                             </div>
                                         </div>
                                         <div class="flex items-center justify-between">
                                             <div class="flex items-center space-x-2">
                                                 <button class="image-preview text-xs bg-pm-accent hover:bg-pm-accent-hover text-pm px-2 py-1 rounded"
-                                                        onclick="window.open('${image.url}', '_blank')">
+                                                        data-url="${this.escapeHtml(image.url)}">
                                                     View Full
                                                 </button>
                                             </div>
@@ -2428,7 +2463,15 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                     
                     list.appendChild(groupEl);
                 });
-                
+
+                // Open the original image when "View Full" is clicked (delegated,
+                // avoids building inline handlers with untrusted URLs).
+                list.querySelectorAll('.image-preview[data-url]').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        window.open(btn.dataset.url, '_blank');
+                    });
+                });
+
                 content.classList.remove('hidden');
                 footer.classList.remove('hidden');
             }
@@ -2565,37 +2608,37 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                     }
                     
                     try {
-                        // Check a sample of images to see if any are missing thumbnails
-                        const response = await fetch('/prompt_manager/images/output?limit=50&offset=0');
+                        // Ask the server for an exact count of media files missing
+                        // thumbnails. The server scans the whole library (a single
+                        // fast os.walk pass) instead of sampling, so the number shown
+                        // to the user is real, not an extrapolation.
+                        const response = await fetch('/prompt_manager/images/thumbnail-status');
                         const data = await response.json();
-                        
-                        console.debug('Checking images for missing thumbnails:', data);
-                        
-                        if (data.success && data.images && data.images.length > 0) {
-                            // Count images missing thumbnails
-                            let missingThumbnails = 0;
-                            for (const image of data.images) {
-                                if (!image.thumbnail_url) {
-                                    missingThumbnails++;
-                                }
-                            }
-                            
-                            console.debug(`Found ${missingThumbnails} images without thumbnails in sample of ${data.images.length}`);
-                            
-                            // If more than 10% of sampled images are missing thumbnails, show prompt
-                            const missingPercentage = (missingThumbnails / data.images.length) * 100;
-                            if (missingThumbnails > 0 && missingPercentage > 10) {
-                                // Estimate total missing based on sample
-                                const estimatedMissing = Math.round((missingThumbnails / data.images.length) * data.total);
-                                console.debug(`Estimated ${estimatedMissing} total images missing thumbnails (${missingPercentage.toFixed(1)}% of sample)`);
-                                this.showThumbnailGenerationPrompt(data.total, estimatedMissing);
-                            } else if (missingThumbnails > 0) {
-                                console.debug(`Only ${missingPercentage.toFixed(1)}% of images missing thumbnails, not showing prompt`);
-                            } else {
-                                console.debug('All sampled images have thumbnails');
-                            }
+
+                        console.debug('Thumbnail status:', data);
+
+                        if (!data.success) {
+                            console.debug('Failed to get thumbnail status:', data.error || 'unknown error');
+                            return;
+                        }
+
+                        const total = data.total || 0;
+                        const missing = data.missing || 0;
+
+                        if (total === 0) {
+                            console.debug('No images found');
+                            return;
+                        }
+
+                        // Only prompt when a meaningful number are missing. A handful
+                        // of stragglers (e.g. videos that fail to decode) aren't worth
+                        // a full-library regeneration prompt.
+                        const missingFraction = missing / total;
+                        if (missing > 0 && (missing >= 50 || missingFraction >= 0.25)) {
+                            console.debug(`Found ${missing} of ${total} images missing thumbnails (${(missingFraction * 100).toFixed(1)}%)`);
+                            this.showThumbnailGenerationPrompt(total, missing);
                         } else {
-                            console.debug('No images found or failed to fetch images');
+                            console.debug(`Only ${missing} of ${total} images missing thumbnails, not showing prompt`);
                         }
                     } catch (error) {
                         console.debug('Could not check for missing thumbnails at startup:', error);
@@ -2661,7 +2704,7 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
                             Generating Thumbnails
                         </h3>
                         <p class="text-pm-secondary mb-4">
-                            Processing ${missingCount} images out of ${imageCount} total...
+                            Generating ${missingCount} thumbnails for ${imageCount} total images...
                         </p>
 
                         <!-- Progress Section -->

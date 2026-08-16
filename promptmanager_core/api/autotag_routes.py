@@ -84,7 +84,7 @@ class AutotagRoutesMixin:
                 def progress_callback(status: str, progress: float):
                     progress_data["last_progress"] = progress
 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 success = await loop.run_in_executor(
                     None, lambda: service.download_model(model_type, progress_callback)
                 )
@@ -155,7 +155,7 @@ class AutotagRoutesMixin:
 
                 yield f"data: {json.dumps({'type': 'progress', 'progress': 0, 'status': 'Loading model...'})}\n\n"
 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 try:
                     await loop.run_in_executor(
                         None, lambda: service.load_model(model_type, use_gpu)
@@ -363,7 +363,7 @@ class AutotagRoutesMixin:
                 not service.is_model_loaded()
                 or service.get_loaded_model_type() != model_type
             ):
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None, lambda: service.load_model(model_type, use_gpu)
                 )

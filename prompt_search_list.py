@@ -31,13 +31,13 @@ except ImportError:
     InputTypeDict = dict
 
 try:
-    from .database.operations import PromptDatabase
+    from .database.operations import get_prompt_database
 except ImportError:
     import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from database.operations import PromptDatabase
+    from database.operations import get_prompt_database
 
 
 class PromptSearchList(ComfyNodeABC):
@@ -55,7 +55,7 @@ class PromptSearchList(ComfyNodeABC):
     def __init__(self):
         self.logger = get_logger("prompt_search_list.node")
         self.logger.debug("Initializing PromptSearchList node")
-        self.db = PromptDatabase()
+        self.db = get_prompt_database()
 
     @classmethod
     def INPUT_TYPES(cls) -> InputTypeDict:
