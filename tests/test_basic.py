@@ -29,9 +29,14 @@ class TestBasicFunctionality(unittest.TestCase):
 
     def tearDown(self):
         """Clean up test fixtures."""
+        if hasattr(self, "db"):
+            self.db.close()
         # Remove temporary database
         if os.path.exists(self.temp_db.name):
-            os.unlink(self.temp_db.name)
+            try:
+                os.unlink(self.temp_db.name)
+            except Exception:
+                pass
 
     def test_prompt_hash_generation(self):
         """Test prompt hash generation."""

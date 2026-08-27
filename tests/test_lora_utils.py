@@ -217,7 +217,7 @@ class TestGetLoraImageCacheDir(unittest.TestCase):
     def test_returns_path(self):
         cache_dir = get_lora_image_cache_dir()
         self.assertIsInstance(cache_dir, Path)
-        self.assertTrue(str(cache_dir).endswith("data/lora_images"))
+        self.assertTrue(str(cache_dir).replace("\\", "/").endswith("data/lora_images"))
 
     def test_directory_exists(self):
         cache_dir = get_lora_image_cache_dir()
@@ -249,7 +249,10 @@ class TestTriggerWordCache(unittest.TestCase):
             meta_path.write_text(json.dumps(meta))
 
             # Patch find_lora_directories to return our temp dir
-            with patch("py.lora_utils.find_lora_directories", return_value=[tmpdir]):
+            with patch(
+                "promptmanager_core.lora_utils.find_lora_directories",
+                return_value=[tmpdir],
+            ):
                 count = self.cache.load(tmpdir)
 
             self.assertTrue(self.cache.is_loaded)
@@ -269,7 +272,10 @@ class TestTriggerWordCache(unittest.TestCase):
                 json.dumps(meta)
             )
 
-            with patch("py.lora_utils.find_lora_directories", return_value=[tmpdir]):
+            with patch(
+                "promptmanager_core.lora_utils.find_lora_directories",
+                return_value=[tmpdir],
+            ):
                 self.cache.load(tmpdir)
 
             self.assertEqual(self.cache.get_trigger_words("mylora"), ["word1"])

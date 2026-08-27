@@ -26,10 +26,15 @@ class LoraDBTestCase(unittest.TestCase):
         self.db = PromptDatabase(self.temp_db.name)
 
     def tearDown(self):
+        if hasattr(self, "db"):
+            self.db.close()
         for suffix in ("", "-wal", "-shm"):
             path = self.temp_db.name + suffix
             if os.path.exists(path):
-                os.unlink(path)
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 
     def _save(self, text, category=None, tags=None):
         """Save a prompt and return its ID."""

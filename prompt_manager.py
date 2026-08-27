@@ -84,19 +84,22 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
                 "prepend_text": (
                     IO.STRING,
                     {
-                        "tooltip": "Text to prepend to the main prompt (connected STRING nodes will be added before the main text)"
+                        "default": "",
+                        "tooltip": "Text to prepend to the main prompt (connected STRING nodes will be added before the main text)",
                     },
                 ),
                 "append_text": (
                     IO.STRING,
                     {
-                        "tooltip": "Text to append to the main prompt (connected STRING nodes will be added after the main text)"
+                        "default": "",
+                        "tooltip": "Text to append to the main prompt (connected STRING nodes will be added after the main text)",
                     },
                 ),
             },
         }
 
     RETURN_TYPES = (IO.CONDITIONING, IO.STRING)
+    RETURN_NAMES = ("CONDITIONING", "STRING")
     OUTPUT_TOOLTIPS = (
         "A conditioning containing the embedded text used to guide the diffusion model.",
         "The final combined text string (with prepend/append applied) that was encoded.",
@@ -119,6 +122,7 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
         search_text: str = "",
         prepend_text: str = "",
         append_text: str = "",
+        **kwargs,
     ) -> Tuple[Any]:
         """
         Encode the text prompt and save it to the database.

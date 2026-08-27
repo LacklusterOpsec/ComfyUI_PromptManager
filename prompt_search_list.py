@@ -138,6 +138,7 @@ class PromptSearchList(ComfyNodeABC):
         min_rating: int = 0,
         limit: int = 50,
         skip_multipart: bool = True,
+        **kwargs,
     ):
         """
         Search for prompts matching the given criteria.
@@ -219,7 +220,14 @@ class PromptSearchList(ComfyNodeABC):
 
     @classmethod
     def IS_CHANGED(
-        cls, text="", category="", tags="", min_rating=0, limit=50, skip_multipart=True
+        cls,
+        text="",
+        category="",
+        tags="",
+        min_rating=0,
+        limit=50,
+        skip_multipart=True,
+        **kwargs,
     ):
         """
         Always re-execute to get fresh results from the database.

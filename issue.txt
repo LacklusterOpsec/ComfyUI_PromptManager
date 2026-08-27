@@ -1,0 +1,292 @@
+================================================================================
+ComfyUI-PromptManager Code Review & Issue Tracker
+================================================================================
+Generated: 2026-08-27
+Repository: LacklusterOpsec/ComfyUI_PromptManager (c:\Tavern\ComfyUI\custom_nodes\ComfyUI-PromptManager)
+
+================================================================================
+Table of Contents
+================================================================================
+1. Correctness & Runtime Logic Bugs
+   1.1. KeyError: 0 Crash in Fallback Prompt Lookup
+   1.2. SaveImage Monkey-Patch Overwrites Both Positive & Negative Prompts
+   1.3. Batch Queue Desynchronization Across Multi-Node & Latent Batches
+   1.4. SHA256 Hash Mismatch on Metadata-Based Prompt Lookup
+   1.5. Missing **kwargs in Node Execution & Change-Detection Methods
+   1.6. WebP & Non-PNG Metadata Ingestion Failure
+   1.7. Windows SQLite Connection Lock in Unit Tests
+2. Optimization & Performance
+   2.1. Forced Downstream Graph Cache Invalidation (IS_CHANGED = NaN)
+   2.2. Unnecessary OUTPUT_NODE = True on Conditioning Nodes
+   2.3. Single Global Connection Lock Serializes DB Reads & Writes
+   2.4. Synchronous LoRA Trigger Word Cache Cold Start
+3. ComfyUI Conventions & Schema Compatibility
+   3.1. Missing Defaults for Optional Inputs in PromptManager.INPUT_TYPES
+   3.2. Missing RETURN_NAMES Declaration in PromptManager
+   3.3. Fragility of Monkey-Patching nodes.SaveImage.save_images
+
+
+================================================================================
+1. Correctness & Runtime Logic Bugs
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1. KeyError: 0 Crash in Fallback Prompt Lookup
+--------------------------------------------------------------------------------
+* Location: utils/image_monitor.py (lines 383-388)
+* Severity: High (Fatal runtime crash in fallback image linking)
+* Root Cause:
+    In `_get_fallback_prompt()`:
+        recent_prompts = self.db_manager.get_recent_prompts(limit=1)
+        if recent_prompts:
+            prompt = recent_prompts[0]  # <--- CRASHES with KeyError: 0
+    `db_manager.get_recent_prompts(limit=1)` returns a dictionary:
+        {"prompts": [prompt_dict], "total": 1, "limit": 1, "offset": 0, ...}
+    Indexing `recent_prompts[0]` treats the dictionary as a list, raising `KeyError: 0`.
+* Impact:
+    The error is caught by `except Exception`, logged, and returns `None`. Strategy 5
+    (fallback to the most recent prompt in DB when linking images) NEVER works.
+* Recommended Fix:
+    Change line 383-386 to:
+        recent = self.db_manager.get_recent_prompts(limit=1)
+        if recent and recent.get("prompts"):
+            prompt = recent["prompts"][0]
+            return {
+                "id": prompt["id"],
+                "text": prompt["text"],
+                "timestamp": prompt.get("created_at"),
+                "fallback": True,
+            }
+
+--------------------------------------------------------------------------------
+1.2. SaveImage Monkey-Patch Overwrites Both Positive & Negative Prompts
+--------------------------------------------------------------------------------
+* Location: utils/comfyui_integration.py (lines 245-256)
+* Severity: High (Data corruption in saved image metadata)
+* Root Cause:
+    In `patched_save_images()`:
+        current_prompt_text = integration.get_current_prompt_text()
+        ...
+        for node_id, node_data in prompt.items():
+            if isinstance(node_data, dict):
+                class_type = node_data.get("class_type", "")
+                if "promptmanager" in class_type.lower():
+                    node_data["inputs"]["text"] = current_prompt_text
+    `get_current_prompt_text()` returns the most recent prompt text executed on the
+    thread. The loop then updates EVERY node in the workflow matching `promptmanager`.
+* Impact:
+    In a standard workflow using two PromptManager nodes (one Positive, one Negative),
+    both node definitions inside the saved PNG metadata get their `text` field
+    overwritten with the same value (typically the negative prompt, as it executes
+    second). When reloading or inspecting image metadata, the positive prompt is lost.
+* Recommended Fix:
+    Register prompts by actual workflow node ID (graph node integer ID) instead of
+    generating dynamic `promptmanager_<timestamp>` IDs, and only update the matching
+    node ID in the `prompt` dictionary:
+        for node_id, node_data in prompt.items():
+            if node_id in integration._thread_local.prompts:
+                node_data["inputs"]["text"] = integration._thread_local.prompts[node_id]["text"]
+
+--------------------------------------------------------------------------------
+1.3. Batch Queue Desynchronization Across Multi-Node & Latent Batches
+--------------------------------------------------------------------------------
+* Location: utils/prompt_tracker.py (lines 168-172) & utils/image_monitor.py (lines 188-197)
+* Severity: High (Image-to-prompt association corruption in batches)
+* Root Cause:
+    `PromptTracker.set_current_prompt()` unconditionally appends to `_prompt_queue`:
+        with self._queue_lock:
+            self._prompt_queue.append(execution_context)
+    1. Multi-node workflows: If both Positive and Negative PromptManager nodes are in
+       the graph, 2 items are pushed (`[Positive, Negative]`). When 1 image is saved,
+       `pop_next_prompt()` pops item 0 (`Positive`). The leftover `Negative` prompt
+       remains in the queue and will be incorrectly popped for the next generation's
+       image.
+    2. Latent batching (`batch_size > 1`): One prompt execution produces N images.
+       Image 1 pops the single queued item. Images 2..N receive `None` from the queue
+       and must rely on fallback mechanisms.
+* Impact:
+    Queued prompt associations drift over time whenever workflows use multiple
+    PromptManager nodes or generate multiple images per run.
+* Recommended Fix:
+    - Associate queued prompt items with ComfyUI prompt execution IDs / batch indices.
+    - Avoid pushing negative prompts to the image association FIFO queue (e.g. check
+      for role or tags).
+    - Allow a single queued prompt entry to serve all images within the same batch
+      generation before popping.
+
+--------------------------------------------------------------------------------
+1.4. SHA256 Hash Mismatch on Metadata-Based Prompt Lookup
+--------------------------------------------------------------------------------
+* Location: prompt_manager.py (lines 149-188) vs utils/image_monitor.py (lines 320-324)
+* Severity: Medium (Failure of Strategy 2 image linking)
+* Root Cause:
+    - In `PromptManager.encode_prompt()`: The database record is stored with
+      `storage_text = text` (the core input without prepends/appends/LoRA triggers),
+      and indexed by `sha256(storage_text.lower())`.
+    - In `comfyui_integration.py`: The image metadata has `inputs["text"] = encoding_text`
+      (the combined `prepend + text + append + lora_triggers`).
+    - In `image_monitor._find_prompt_from_metadata()`: The hash is computed on
+      the metadata's `text` (`sha256(encoding_text.lower())`) and searched in the DB.
+* Impact:
+    Whenever `prepend_text`, `append_text`, or LoRA trigger words are used, the hash
+    lookup fails to find the prompt in the database.
+* Recommended Fix:
+    Store both the original prompt hash and the combined prompt hash in the DB, or
+    include the explicit `prompt_id` inside the embedded node metadata so lookups
+    are done by ID rather than raw text hashing.
+
+--------------------------------------------------------------------------------
+1.5. Missing **kwargs in Node Execution & Change-Detection Methods
+--------------------------------------------------------------------------------
+* Location:
+    - prompt_manager.py (line 113: `encode_prompt`)
+    - prompt_manager_text.py (line 112: `process_text`)
+    - prompt_search_list.py (line 221: `IS_CHANGED`)
+* Severity: Medium (Potential crash with custom executors / new ComfyUI parameters)
+* Root Cause:
+    Method signatures are strictly bound to declared parameters without `**kwargs`:
+        def encode_prompt(self, clip, text: str, category: str = "", tags: str = "",
+                          search_text: str = "", prepend_text: str = "",
+                          append_text: str = "") -> Tuple[Any]:
+* Impact:
+    If ComfyUI passes hidden inputs (e.g., `prompt`, `extra_pnginfo`, `unique_id`) or
+    if a frontend extension passes extra parameters, Python throws:
+        TypeError: encode_prompt() got an unexpected keyword argument '...'
+* Recommended Fix:
+    Add `**kwargs` to all node execution methods and `IS_CHANGED`:
+        def encode_prompt(self, clip, text: str, ..., **kwargs) -> Tuple[Any]:
+        def process_text(self, text: str, ..., **kwargs) -> Tuple[str]:
+        def IS_CHANGED(cls, text="", ..., **kwargs):
+
+--------------------------------------------------------------------------------
+1.6. WebP & Non-PNG Metadata Ingestion Failure
+--------------------------------------------------------------------------------
+* Location: utils/metadata_extractor.py (line 92)
+* Severity: Medium (Silent metadata loss on non-PNG formats)
+* Root Cause:
+    `metadata_extractor.py` checks:
+        if hasattr(image, "text") and image.text:
+    In PIL, the `text` attribute only exists on `PngImageFile` objects. For `.webp`,
+    `.jpg`, and `.gif` images (which are listed in `supported_extensions`), ComfyUI
+    writes workflow metadata into `image.info["workflow"]` / `image.info["prompt"]` or EXIF.
+* Impact:
+    Metadata extraction silently fails for all WebP, JPEG, and animated formats.
+* Recommended Fix:
+    Update `extract_metadata()` to inspect `image.info` when `image.text` is unavailable:
+        text_data = getattr(image, "text", None) or image.info
+
+--------------------------------------------------------------------------------
+1.7. Windows SQLite Connection Lock in Unit Tests
+--------------------------------------------------------------------------------
+* Location: database/models.py (line 193) & tests/test_basic.py (line 34)
+* Severity: Low (Test suite failure on Windows)
+* Root Cause:
+    `PromptDatabase` does not expose a `.close()` method that proxies to
+    `self.model.close()`. In `test_basic.py`, `tearDown()` calls `os.unlink(temp_db.name)`
+    while SQLite still holds open file handles, causing:
+        PermissionError: [WinError 32] The process cannot access the file because it is being used by another process
+* Recommended Fix:
+    Add a `close()` method to `PromptDatabase`:
+        def close(self) -> None:
+            if self.model is not None:
+                self.model.close()
+    And call `self.db.close()` in test `tearDown()`.
+
+
+================================================================================
+2. Optimization & Performance
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1. Forced Downstream Graph Cache Invalidation (IS_CHANGED = NaN)
+--------------------------------------------------------------------------------
+* Location: prompt_manager.py (lines 238-258) & prompt_manager_text.py (lines 211-230)
+* Impact: High latency penalty in iterative workflows
+* Description:
+    `IS_CHANGED` returns `float("NaN")`. Because `NaN != NaN` in Python and JavaScript,
+    ComfyUI treats the output conditioning as permanently dirty on every run.
+    This forces full re-execution of `PromptManager`, `KSampler`, `VAE Decode`, and
+    `SaveImage` on EVERY queue event, even when seed, prompt, and model are untouched.
+* Recommendation:
+    If graph caching is desired, compute a deterministic hash of inputs:
+        @classmethod
+        def IS_CHANGED(cls, clip, text="", category="", tags="", prepend_text="", append_text="", **kwargs):
+            return hashlib.sha256(f"{text}|{prepend_text}|{append_text}|{category}|{tags}".encode()).hexdigest()
+    If timestamp bumping is required, perform it asynchronously without forcing
+    downstream diffusion re-sampling.
+
+--------------------------------------------------------------------------------
+2.2. Unnecessary OUTPUT_NODE = True on Conditioning Nodes
+--------------------------------------------------------------------------------
+* Location: prompt_manager.py (line 105) & prompt_manager_text.py (line 104)
+* Description:
+    Setting `OUTPUT_NODE = True` flags `PromptManager` as a terminal execution node.
+    ComfyUI will always execute it even if its CONDITIONING or STRING outputs are
+    disconnected in the active graph.
+* Recommendation:
+    Remove `OUTPUT_NODE = True` from `PromptManager` and `PromptManagerText` (keep it
+    on `PromptSearchList` where UI result payloads are transmitted).
+
+--------------------------------------------------------------------------------
+2.3. Single Global Connection Lock Serializes DB Reads & Writes
+--------------------------------------------------------------------------------
+* Location: database/models.py (lines 179-192)
+* Description:
+    `PromptModel.get_connection()` uses a single `self._conn_lock` around a single
+    `sqlite3.Connection`. While SQLite WAL mode natively supports concurrent readers
+    across multiple connections, the Python `threading.Lock` serializes ALL operations
+    (node execution, image monitoring watcher, gallery tree API requests, and autotag).
+* Recommendation:
+    Allow separate read-only connections per thread, or use a connection pool in WAL
+    mode to prevent heavy gallery API scans from blocking prompt execution.
+
+--------------------------------------------------------------------------------
+2.4. Synchronous LoRA Trigger Word Cache Cold Start
+--------------------------------------------------------------------------------
+* Location: prompt_manager_base.py (lines 136-145) & promptmanager_core/lora_utils.py (lines 436-475)
+* Description:
+    `_inject_lora_trigger_words()` lazily triggers `cache.load()` on the first prompt
+    encoding. In setups with hundreds of LoRAs, the recursive filesystem scan and
+    parsing of `.metadata.json` files runs synchronously on the ComfyUI execution thread.
+* Recommendation:
+    Warm the LoRA trigger cache in a background thread at module import time in `__init__.py`.
+
+
+================================================================================
+3. ComfyUI Conventions & Schema Compatibility
+================================================================================
+
+--------------------------------------------------------------------------------
+3.1. Missing Defaults for Optional Inputs in PromptManager.INPUT_TYPES
+--------------------------------------------------------------------------------
+* Location: prompt_manager.py (lines 84-95)
+* Description:
+    In `PromptManager.INPUT_TYPES`, `prepend_text` and `append_text` omit `"default": ""`
+    (unlike `PromptManagerText.INPUT_TYPES` where `"default": ""` is present).
+* Recommendation:
+    Add `"default": ""` to both entries:
+        "prepend_text": (IO.STRING, {"default": "", "tooltip": "..."}),
+        "append_text": (IO.STRING, {"default": "", "tooltip": "..."}),
+
+--------------------------------------------------------------------------------
+3.2. Missing RETURN_NAMES Declaration in PromptManager
+--------------------------------------------------------------------------------
+* Location: prompt_manager.py (line 99)
+* Description:
+    `PromptManager` defines `RETURN_TYPES = (IO.CONDITIONING, IO.STRING)` but omits
+    `RETURN_NAMES`. ComfyUI defaults slot names to the type strings ("CONDITIONING", "STRING").
+* Recommendation:
+    Explicitly declare `RETURN_NAMES = ("CONDITIONING", "STRING")` or `("conditioning", "text")`.
+
+--------------------------------------------------------------------------------
+3.3. Fragility of Monkey-Patching nodes.SaveImage.save_images
+--------------------------------------------------------------------------------
+* Location: utils/comfyui_integration.py (lines 189-274)
+* Description:
+    Directly overwriting `nodes.SaveImage.save_images` at runtime:
+    - Breaks if upstream ComfyUI refactors or wraps `SaveImage`.
+    - Does not intercept third-party image saving nodes (e.g. SaveImageExtended, VHS_VideoCombine).
+    - Mutates the shared `prompt` dictionary in-place.
+* Recommendation:
+    Rely primarily on the filesystem watcher (`ImageMonitor`) or standard ComfyUI
+    execution hooks rather than monkey-patching core node methods.

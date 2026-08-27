@@ -316,10 +316,19 @@ class ImageGenerationHandler(FileSystemEventHandler):
         # Look up by hash in database
         try:
             import hashlib
+            import re
 
             normalized = prompt_text.strip().lower()
             prompt_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
             existing = self.db_manager.get_prompt_by_hash(prompt_hash)
+
+            # Fallback: if not found by direct hash, try stripped text without lora tags
+            if not existing and "<lora:" in normalized:
+                stripped = re.sub(r"<lora:[^>]+>", "", normalized).strip()
+                if stripped:
+                    stripped_hash = hashlib.sha256(stripped.encode("utf-8")).hexdigest()
+                    existing = self.db_manager.get_prompt_by_hash(stripped_hash)
+
             if existing:
                 self.logger.debug(
                     f"Found DB prompt {existing['id']} from metadata text"
@@ -380,7 +389,12 @@ class ImageGenerationHandler(FileSystemEventHandler):
             or None if no recent prompt is available
         """
         try:
-            recent_prompts = self.db_manager.get_recent_prompts(limit=1)
+            recent_data = self.db_manager.get_recent_prompts(limit=1)
+            recent_prompts = (
+                recent_data.get("prompts", [])
+                if isinstance(recent_data, dict)
+                else recent_data
+            )
             if recent_prompts:
                 prompt = recent_prompts[0]
                 return {

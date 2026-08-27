@@ -89,7 +89,7 @@ class TestPromptManagerTextEmptyInput(unittest.TestCase):
 @patch("prompt_manager_base.get_image_monitor")
 @patch("prompt_manager_base.get_prompt_tracker")
 @patch("prompt_manager_base.get_comfyui_integration")
-@patch("prompt_manager_base.PromptDatabase")
+@patch("prompt_manager_base.get_prompt_database")
 class TestPromptManagerEmptyInput(unittest.TestCase):
     """Test PromptManager (CLIP variant) with empty/blank text inputs (issue #123)."""
 
@@ -166,7 +166,7 @@ class TestPromptManagerEmptyInput(unittest.TestCase):
 @patch("prompt_manager_base.get_image_monitor")
 @patch("prompt_manager_base.get_prompt_tracker")
 @patch("prompt_manager_base.get_comfyui_integration")
-@patch("prompt_manager_base.PromptDatabase")
+@patch("prompt_manager_base.get_prompt_database")
 class TestConnectedTextInput(unittest.TestCase):
     """Test that externally connected text is preserved in output (issue #123).
 

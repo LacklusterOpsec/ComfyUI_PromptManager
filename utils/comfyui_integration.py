@@ -240,19 +240,38 @@ class ComfyUIMetadataIntegration:
                         prompt = {}
 
                     # Find PromptManager nodes and ensure prompt text is captured
-                    # NOTE: We do NOT change class_type anymore - that was corrupting saved workflows
-                    # when users reload them. PromptManager stays as PromptManager.
+                    # NOTE: Match prompts to their specific nodes so positive/negative prompts
+                    # are not cross-overwritten with the same text.
+                    thread_prompts = []
+                    if hasattr(integration._thread_local, "prompts") and integration._thread_local.prompts:
+                        thread_prompts = list(integration._thread_local.prompts.values())
+
                     for node_id, node_data in prompt.items():
                         if isinstance(node_data, dict):
                             class_type = node_data.get("class_type", "")
                             if "promptmanager" in class_type.lower():
-                                # Ensure the text input reflects the actual prompt used
                                 if "inputs" not in node_data:
                                     node_data["inputs"] = {}
-                                node_data["inputs"]["text"] = current_prompt_text
-                                integration.logger.debug(
-                                    f"Updated PromptManager node {node_id} with prompt text"
-                                )
+                                current_node_text = node_data["inputs"].get("text", "")
+
+                                matched_prompt = None
+                                if isinstance(current_node_text, str) and current_node_text.strip() and thread_prompts:
+                                    for p in thread_prompts:
+                                        p_text = p.get("text", "")
+                                        if current_node_text.strip() in p_text or p_text in current_node_text.strip():
+                                            matched_prompt = p_text
+                                            break
+
+                                if not matched_prompt and len(thread_prompts) == 1:
+                                    matched_prompt = thread_prompts[0].get("text")
+                                elif not matched_prompt and current_prompt_text:
+                                    matched_prompt = current_prompt_text
+
+                                if matched_prompt:
+                                    node_data["inputs"]["text"] = matched_prompt
+                                    integration.logger.debug(
+                                        f"Updated PromptManager node {node_id} with prompt text"
+                                    )
 
                 # Call original method with potentially modified prompt
                 return original_save_images(

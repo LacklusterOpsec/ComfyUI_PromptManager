@@ -97,6 +97,7 @@ class PromptManagerText(PromptManagerBase, ComfyNodeABC):
         }
 
     RETURN_TYPES = (IO.STRING,)
+    RETURN_NAMES = ("STRING",)
     OUTPUT_TOOLTIPS = (
         "The final combined text string (with prepend/append applied) ready for use in other nodes.",
     )
@@ -117,6 +118,7 @@ class PromptManagerText(PromptManagerBase, ComfyNodeABC):
         search_text: str = "",
         prepend_text: str = "",
         append_text: str = "",
+        **kwargs,
     ) -> Tuple[str]:
         """
         Process the text prompt and save it to the database.

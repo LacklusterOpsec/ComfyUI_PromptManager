@@ -88,12 +88,24 @@ class ComfyUIMetadataExtractor:
                 # Add basic file information
                 metadata["file_info"] = self.get_file_info(image_path, image)
 
-                # Extract ComfyUI-specific metadata from PNG text chunks
+                # Extract ComfyUI-specific metadata from PNG text chunks or image.info (WebP, JPEG, etc.)
+                text_chunks = {}
                 if hasattr(image, "text") and image.text:
+                    text_chunks.update(image.text)
+                if hasattr(image, "info") and image.info:
+                    for k, v in image.info.items():
+                        if isinstance(v, (str, bytes)):
+                            text_chunks[k] = v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
+
+                if text_chunks:
                     # Look for ComfyUI workflow data
-                    if "workflow" in image.text:
+                    if "workflow" in text_chunks:
                         try:
-                            workflow_data = json.loads(image.text["workflow"])
+                            workflow_data = (
+                                json.loads(text_chunks["workflow"])
+                                if isinstance(text_chunks["workflow"], str)
+                                else text_chunks["workflow"]
+                            )
                             metadata["workflow"] = workflow_data
 
                             # Extract text encoder nodes from workflow
@@ -103,15 +115,19 @@ class ComfyUIMetadataExtractor:
                             if text_encoder_nodes:
                                 metadata["text_encoder_nodes"] = text_encoder_nodes
 
-                        except json.JSONDecodeError as e:
+                        except (json.JSONDecodeError, TypeError) as e:
                             self.logger.warning(f"Failed to parse workflow JSON: {e}")
 
                     # Look for prompt data
-                    if "prompt" in image.text:
+                    if "prompt" in text_chunks:
                         try:
-                            prompt_data = json.loads(image.text["prompt"])
+                            prompt_data = (
+                                json.loads(text_chunks["prompt"])
+                                if isinstance(text_chunks["prompt"], str)
+                                else text_chunks["prompt"]
+                            )
                             metadata["prompt"] = prompt_data
-                        except json.JSONDecodeError as e:
+                        except (json.JSONDecodeError, TypeError) as e:
                             self.logger.warning(f"Failed to parse prompt JSON: {e}")
 
                     # Extract other common metadata fields
@@ -128,13 +144,17 @@ class ComfyUIMetadataExtractor:
                     ]
 
                     for field in metadata_fields:
-                        if field in image.text:
+                        if field in text_chunks:
                             try:
                                 # Try to parse as JSON first
-                                metadata[field] = json.loads(image.text[field])
+                                metadata[field] = (
+                                    json.loads(text_chunks[field])
+                                    if isinstance(text_chunks[field], str)
+                                    else text_chunks[field]
+                                )
                             except (json.JSONDecodeError, TypeError):
                                 # Store as string if not valid JSON
-                                metadata[field] = image.text[field]
+                                metadata[field] = text_chunks[field]
 
                 return (
                     metadata

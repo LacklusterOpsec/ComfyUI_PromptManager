@@ -57,6 +57,8 @@ def _resolve_db_path(db_path: Optional[str] = None) -> str:
     if not os.path.isabs(db_path):
         db_path = os.path.join(extension_root, db_path)
 
+    db_path = os.path.normpath(db_path)
+
     # Ensure parent directory exists for custom paths
     parent = os.path.dirname(db_path)
     if parent:
@@ -108,6 +110,11 @@ class PromptDatabase:
         self.logger.debug(
             f"Reloaded database connection for path: {self.model.db_path}"
         )
+
+    def close(self) -> None:
+        """Close the database connection if open."""
+        if self.model is not None:
+            self.model.close()
 
     def save_prompt(
         self,
@@ -568,9 +575,10 @@ class PromptDatabase:
                             rel = os.path.relpath(parent, root)
                             if not rel.startswith(".."):
                                 if rel != ".":
-                                    folders.add(rel)
+                                    rel_norm = rel.replace("\\", "/")
+                                    folders.add(rel_norm)
                                     if include_ancestors:
-                                        self._add_ancestors(folders, rel)
+                                        self._add_ancestors(folders, rel_norm)
                                 made_relative = True
                                 break
                         except ValueError:
@@ -579,18 +587,19 @@ class PromptDatabase:
                 if not made_relative:
                     basename = os.path.basename(parent)
                     if basename:
-                        folders.add(basename)
+                        basename_norm = basename.replace("\\", "/")
+                        folders.add(basename_norm)
                         if include_ancestors:
-                            self._add_ancestors(folders, basename)
+                            self._add_ancestors(folders, basename_norm)
 
         return sorted(folders)
 
     @staticmethod
     def _add_ancestors(folders: set, folder: str) -> None:
         """Add each parent path segment of a folder to the set."""
-        parts = folder.split(os.sep)
+        parts = folder.replace("\\", "/").split("/")
         for i in range(1, len(parts)):
-            folders.add(os.sep.join(parts[:i]))
+            folders.add("/".join(parts[:i]))
 
     def get_all_tags(self) -> List[str]:
         """

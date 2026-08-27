@@ -46,13 +46,18 @@ class APITestCase(AioHTTPTestCase):
         return app
 
     async def tearDownAsync(self):
+        if hasattr(self, "api") and hasattr(self.api, "db") and self.api.db:
+            self.api.db.close()
         for path in (
             self._temp_db.name,
             self._temp_db.name + "-wal",
             self._temp_db.name + "-shm",
         ):
             if os.path.exists(path):
-                os.unlink(path)
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
 
     # ── helpers ────────────────────────────────────────────────────────
 

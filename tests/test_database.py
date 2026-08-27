@@ -26,13 +26,14 @@ class DatabaseTestCase(unittest.TestCase):
         self.db = PromptDatabase(self.temp_db.name)
 
     def tearDown(self):
-        if os.path.exists(self.temp_db.name):
-            os.unlink(self.temp_db.name)
-        wal = self.temp_db.name + "-wal"
-        shm = self.temp_db.name + "-shm"
-        for f in (wal, shm):
+        if hasattr(self, "db"):
+            self.db.close()
+        for f in (self.temp_db.name, self.temp_db.name + "-wal", self.temp_db.name + "-shm"):
             if os.path.exists(f):
-                os.unlink(f)
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
 
     def _save(
         self, text="Test prompt", category=None, tags=None, rating=None, notes=None
@@ -320,7 +321,13 @@ class TestPagination(DatabaseTestCase):
             self.assertEqual(len(result["prompts"]), 0)
             self.assertFalse(result["has_more"])
         finally:
-            os.unlink(empty_db_file.name)
+            empty_db.close()
+            for f in (empty_db_file.name, empty_db_file.name + "-wal", empty_db_file.name + "-shm"):
+                if os.path.exists(f):
+                    try:
+                        os.unlink(f)
+                    except Exception:
+                        pass
 
     def test_total_count_is_integer(self):
         result = self.db.get_recent_prompts(limit=5)

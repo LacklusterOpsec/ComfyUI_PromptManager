@@ -33,13 +33,13 @@ class TestGalleryDiagnosticsDbPath(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             custom_path = os.path.join(tmpdir, "custom.db")
-            fake_config_mod = types.ModuleType("py.config")
+            fake_config_mod = types.ModuleType("promptmanager_core.config")
             fake_pm_config = type(
                 "PromptManagerConfig", (), {"DEFAULT_DB_PATH": custom_path}
             )
             fake_config_mod.PromptManagerConfig = fake_pm_config
 
-            with patch.dict(sys.modules, {"py.config": fake_config_mod}):
+            with patch.dict(sys.modules, {"promptmanager_core.config": fake_config_mod, "py.config": fake_config_mod}):
                 diag = GalleryDiagnostics()
 
             self.assertEqual(diag.db_path, custom_path)
@@ -63,13 +63,13 @@ class TestGalleryDiagnosticsDbPath(unittest.TestCase):
         """A relative path from config should resolve against extension root."""
         from utils.diagnostics import GalleryDiagnostics
 
-        fake_config_mod = types.ModuleType("py.config")
+        fake_config_mod = types.ModuleType("promptmanager_core.config")
         fake_pm_config = type(
             "PromptManagerConfig", (), {"DEFAULT_DB_PATH": "data/prompts.db"}
         )
         fake_config_mod.PromptManagerConfig = fake_pm_config
 
-        with patch.dict(sys.modules, {"py.config": fake_config_mod}):
+        with patch.dict(sys.modules, {"promptmanager_core.config": fake_config_mod, "py.config": fake_config_mod}):
             diag = GalleryDiagnostics()
 
         expected = os.path.join(EXTENSION_ROOT, "data", "prompts.db")
@@ -104,8 +104,9 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
 
         from promptmanager_core.api.admin import AdminRoutesMixin
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-            db_file = f.name
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        db_file = f.name
+        f.close()
 
         try:
             import sqlite3
@@ -128,7 +129,13 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
             self.assertEqual(body["diagnostics"]["database"]["status"], "ok")
             self.assertEqual(body["diagnostics"]["database"]["prompt_count"], 1)
         finally:
-            os.unlink(db_file)
+            for suffix in ("", "-wal", "-shm"):
+                p = db_file + suffix
+                if os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
 
     def test_run_diagnostics_reports_missing_custom_path(self):
         """If the configured db_path doesn't exist, diagnostics should report error."""
@@ -155,9 +162,10 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
 
         from promptmanager_core.api.admin import AdminRoutesMixin
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
-            db_file = f.name
-            f.write(b"SQLite format 3\x00test data for backup")
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        f.write(b"SQLite format 3\x00test data for backup")
+        db_file = f.name
+        f.close()
 
         try:
             stub = self._make_api_stub(db_file)
@@ -168,7 +176,13 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
             self.assertEqual(result.content_type, "application/octet-stream")
             self.assertGreater(len(result.body), 0)
         finally:
-            os.unlink(db_file)
+            for suffix in ("", "-wal", "-shm"):
+                p = db_file + suffix
+                if os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
 
     def test_backup_reports_missing_custom_path(self):
         """backup_database should return 404 when configured path doesn't exist."""
