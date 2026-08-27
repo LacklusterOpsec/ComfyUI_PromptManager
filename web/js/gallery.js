@@ -407,7 +407,7 @@
                                  data-caption="${this.escapeHtml(this.formatImageCaption(image))}"
                                  data-media-type="${this.escapeHtml(mediaType)}"
                                  data-is-video="${isVideo}"
-                                 onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
+                                 onerror="if (this.src !== this.dataset.original) { this.src = this.dataset.original; } else { this.style.display='none'; this.nextElementSibling.style.display='flex'; }">
                             <!-- Fallback for failed thumbnails -->
                             <div class="hidden absolute inset-0 bg-pm-surface text-pm-secondary flex items-center justify-center">
                                 <div class="text-center">
