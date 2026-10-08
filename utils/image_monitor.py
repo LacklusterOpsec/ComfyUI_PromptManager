@@ -35,6 +35,7 @@ from watchdog.events import FileSystemEventHandler
 
 from .metadata_extractor import ComfyUIMetadataExtractor
 from .logging_config import get_logger
+from .prompt_graph import resolve_text, run_prompt_nodes
 
 
 class ImageGenerationHandler(FileSystemEventHandler):
@@ -185,21 +186,26 @@ class ImageGenerationHandler(FileSystemEventHandler):
             except Exception as meta_error:
                 self.logger.warning(f"Metadata extraction failed: {meta_error}")
 
-            # Strategy 1: Pop from batch queue (most reliable for batch workflows).
-            # Prompts are queued during CLIP encoding in order; images save in
-            # the same order, so FIFO pop gives the correct prompt per image.
-            current_prompt = self.prompt_tracker.pop_next_prompt()
+            # Strategy 1: The image's own metadata. It records the positive prompt
+            # that produced this image, independent of node caching and of any
+            # negative-prompt PromptManager nodes in the workflow.
+            current_prompt = self._find_prompt_from_metadata(metadata)
             if current_prompt:
                 self.logger.info(
-                    f"Queue match: prompt {current_prompt['id']} for "
+                    f"Metadata match: prompt {current_prompt['id']} for "
                     f"{os.path.basename(image_path)}"
                 )
 
-            # Strategy 2: Find prompt from image metadata
+            # Strategy 2: Pop from batch queue. Batch items (text supplied by
+            # PromptSearchList) share one graph, so metadata can't tell them apart;
+            # they are queued in encoding order and images save in the same order.
             if not current_prompt:
-                current_prompt = self._find_prompt_from_metadata(metadata)
+                current_prompt = self.prompt_tracker.pop_next_prompt()
                 if current_prompt:
-                    self.logger.info(f"Metadata match: prompt {current_prompt['id']}")
+                    self.logger.info(
+                        f"Queue match: prompt {current_prompt['id']} for "
+                        f"{os.path.basename(image_path)}"
+                    )
 
             # Strategy 3: Use snapshot captured at file-creation time
             if not current_prompt and prompt_snapshot:
@@ -270,21 +276,19 @@ class ImageGenerationHandler(FileSystemEventHandler):
 
         prompt_text = None
 
-        # Try to find PromptManager node in the prompt execution data
+        # The executed graph: use the PromptManager node feeding the positive input
         prompt_data = metadata.get("prompt")
         if isinstance(prompt_data, dict):
-            for node_id, node_info in prompt_data.items():
-                if not isinstance(node_info, dict):
-                    continue
-                class_type = node_info.get("class_type", "")
-                if class_type in ("PromptManager", "PromptManagerText"):
-                    inputs = node_info.get("inputs", {})
-                    text = inputs.get("text", "")
-                    if text and isinstance(text, str) and text.strip():
-                        prompt_text = text.strip()
-                        break
+            for node_id in run_prompt_nodes(prompt_data):
+                prompt_text = resolve_text(prompt_data, node_id)
+                if prompt_text:
+                    break
+            if not prompt_text:
+                # Positive text can't be known from the graph (batch item or unknown
+                # node): leave it to the queue rather than guess from workflow widgets
+                return None
 
-        # Fallback: check text_encoder_nodes from workflow, but only if
+        # Fallback (no executed graph): check text_encoder_nodes from workflow, but only if
         # the text input is NOT connected (connected inputs override widget values,
         # so the widget value would be stale in batch workflows).
         if not prompt_text:
@@ -389,12 +393,7 @@ class ImageGenerationHandler(FileSystemEventHandler):
             or None if no recent prompt is available
         """
         try:
-            recent_data = self.db_manager.get_recent_prompts(limit=1)
-            recent_prompts = (
-                recent_data.get("prompts", [])
-                if isinstance(recent_data, dict)
-                else recent_data
-            )
+            recent_prompts = self.db_manager.get_recent_prompts(limit=1).get("prompts", [])
             if recent_prompts:
                 prompt = recent_prompts[0]
                 return {

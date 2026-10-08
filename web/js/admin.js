@@ -1,6 +1,7 @@
         class PromptAdmin {
             constructor() {
                 this.prompts = [];
+                this.listMode = "recent"; // "recent" or "search"; a sort change reloads it
                 this.selectedPrompts = new Set();
                 this.settings = {
                     resultTimeout: 5,
@@ -114,8 +115,13 @@
                     document.getElementById(id).addEventListener("change", () => this.search());
                 });
                 
-                // Sort dropdown change
-                document.getElementById("sortBy").addEventListener("change", () => this.renderPrompts());
+                // Sort dropdown: options come from PromptListSort; sorting runs on the server
+                const sortSelect = document.getElementById("sortBy");
+                sortSelect.innerHTML = PromptListSort.SORT_OPTIONS
+                    .map((o) => `<option value="${o.value}">${this.escapeHtml(o.label)}</option>`)
+                    .join("");
+                sortSelect.value = PromptListSort.DEFAULT_SORT;
+                sortSelect.addEventListener("change", () => this.reloadPrompts());
             }
 
             bindModalEvents() {
@@ -232,7 +238,7 @@
                     if (response.ok) {
                         const data = await response.json();
                         if (data.success && data.settings) {
-                            this.settings.resultTimeout = data.settings.result_timeout || 5;
+                            this.settings.resultTimeout = data.settings.result_timeout ?? 5;
                             this.settings.webuiDisplayMode = data.settings.webui_display_mode || 'popup';
                             this.settings.monitoredDirectories = data.settings.monitored_directories || [];
                             this.settings.galleryRootPaths = data.settings.gallery_root_paths || [];
@@ -355,9 +361,13 @@
 
             async loadRecentPrompts(page = 1) {
                 try {
+                    this.listMode = "recent";
                     this.pagination.currentPage = page;
-                    const offset = (page - 1) * this.pagination.limit;
-                    const response = await fetch(`/prompt_manager/recent?limit=${this.pagination.limit}&offset=${offset}&page=${page}`);
+                    const response = await fetch(PromptListSort.buildRecentUrl({
+                        page,
+                        limit: this.pagination.limit,
+                        sort: this.currentSort(),
+                    }));
                     if (response.ok) {
                         const data = await response.json();
                         if (data.success) {
@@ -424,7 +434,8 @@
                     if (folder) params.append("folder", folder);
                     params.append("limit", "100");
 
-                    const response = await fetch(`/prompt_manager/search?${params}`);
+                    this.listMode = "search";
+                    const response = await fetch(`/prompt_manager/search?${PromptListSort.withSort(params, this.currentSort())}`);
                     if (response.ok) {
                         const data = await response.json();
                         if (data.success) {
@@ -442,36 +453,13 @@
                 }
             }
 
-            sortPrompts(prompts) {
-                const sortBy = document.getElementById("sortBy")?.value || "created_desc";
-                const [field, direction] = sortBy.split("_");
-                
-                return [...prompts].sort((a, b) => {
-                    let aVal, bVal;
-                    
-                    switch (field) {
-                        case "rating":
-                            aVal = a.rating || 0;
-                            bVal = b.rating || 0;
-                            break;
-                        case "created":
-                            aVal = new Date(a.created_at);
-                            bVal = new Date(b.created_at);
-                            break;
-                        case "text":
-                            aVal = a.text.toLowerCase();
-                            bVal = b.text.toLowerCase();
-                            break;
-                        default:
-                            return 0;
-                    }
-                    
-                    if (direction === "asc") {
-                        return aVal > bVal ? 1 : aVal < bVal ? -1 : 0;
-                    } else {
-                        return aVal < bVal ? 1 : aVal > bVal ? -1 : 0;
-                    }
-                });
+            currentSort() {
+                return PromptListSort.normalizeSort(document.getElementById("sortBy")?.value);
+            }
+
+            /** Re-fetch the list currently shown, e.g. after the sort changes. */
+            reloadPrompts() {
+                return this.listMode === "search" ? this.search() : this.loadRecentPrompts(1);
             }
 
             renderPrompts() {
@@ -493,14 +481,13 @@
                     return;
                 }
 
-                // Sort prompts before rendering
-                const sortedPrompts = this.sortPrompts(this.prompts);
-                container.innerHTML = sortedPrompts.map((prompt) => this.renderPromptItem(prompt)).join("");
+                // Already in the selected order: the server sorts across all pages
+                container.innerHTML = this.prompts.map((prompt) => this.renderPromptItem(prompt)).join("");
                 this.selectedPrompts.clear();
                 this.updateBulkActionButtons();
 
                 // Add hover behavior to all star ratings
-                sortedPrompts.forEach(prompt => {
+                this.prompts.forEach(prompt => {
                     this.addStarHoverBehavior(prompt.id);
                 });
 
@@ -514,7 +501,7 @@
                 });
 
                 // Load film strips for each prompt (async, non-blocking)
-                this.loadAllFilmStrips(sortedPrompts);
+                this.loadAllFilmStrips(this.prompts);
             }
 
             async loadAllFilmStrips(prompts) {
@@ -550,6 +537,10 @@
                 const category = prompt.category || "No category";
                 const rating = prompt.rating || 0;
                 const created = new Date(prompt.created_at).toLocaleDateString();
+                const runLabel = PromptListSort.formatRunCount(prompt.run_count);
+                const lastUsedTitle = prompt.last_used_at
+                    ? `Last used ${new Date(prompt.last_used_at).toLocaleString()}`
+                    : "";
 
                 return `
                     <div class="bg-pm-surface rounded-pm-md border border-pm hover:border-pm transition-all duration-200" data-id="${prompt.id}">
@@ -574,6 +565,10 @@
                                             <span>📅</span>
                                             <span>${created}</span>
                                         </div>
+                                        ${runLabel ? `<div class="flex items-center space-x-1" title="${this.escapeHtml(lastUsedTitle)}">
+                                            <span>🔁</span>
+                                            <span>${this.escapeHtml(runLabel)}</span>
+                                        </div>` : ""}
                                         <div class="flex items-center space-x-1">
                                             <div class="rating flex space-x-1" data-id="${prompt.id}" data-rating="${rating}">
                                                 ${this.renderStars(rating, prompt.id)}
@@ -2595,67 +2590,10 @@
                     filePath = currentImage.image_path || currentImage.filename || imageSrc;
                 }
 
-                // Extract information from ComfyUI workflow
-                let checkpoint = 'Unknown';
-                let positivePrompt = 'No prompt found';
-                let negativePrompt = 'No negative prompt found';
-                let steps = 'Unknown';
-                let cfgScale = 'Unknown';
-                let sampler = 'Unknown';
-                let seed = 'Unknown';
-
-                // Parse prompt data first (more reliable for actual generation parameters)
-                if (comfyData.prompt) {
-                    console.log('Parsing prompt data...', Object.keys(comfyData.prompt).length, 'nodes');
-                    const promptNodes = comfyData.prompt;
-                    
-                    for (const nodeId in promptNodes) {
-                        const node = promptNodes[nodeId];
-                        console.log(`Node ${nodeId}:`, node.class_type, node);
-                        
-                        // Checkpoint
-                        if (node.class_type === 'CheckpointLoaderSimple' && node.inputs) {
-                            checkpoint = node.inputs.ckpt_name || checkpoint;
-                            console.log('Found checkpoint:', checkpoint);
-                        }
-                        
-                        // Prompts - need to identify which is positive vs negative
-                        if (node.class_type === 'PromptManager' && node.inputs && node.inputs.text) {
-                            // PromptManager typically contains the positive prompt
-                            const promptValue = typeof node.inputs.text === 'string' ? node.inputs.text : (Array.isArray(node.inputs.text) ? node.inputs.text[0] : String(node.inputs.text));
-                            positivePrompt = promptValue;
-                            console.log('Found PromptManager with text:', promptValue.substring(0, 100));
-                        }
-                        
-                        if (node.class_type === 'CLIPTextEncode' && node.inputs && node.inputs.text) {
-                            // Check if this looks like a negative prompt
-                            const textValue = typeof node.inputs.text === 'string' ? node.inputs.text : (Array.isArray(node.inputs.text) ? node.inputs.text[0] : String(node.inputs.text));
-                            console.log('Found CLIPTextEncode:', textValue.substring(0, 50));
-                            const text = textValue.toLowerCase();
-                            if (text.includes('bad anatomy') || text.includes('unfinished') || 
-                                text.includes('censored') || text.includes('weird anatomy') ||
-                                text.includes('negative') || text.includes('embedding:')) {
-                                negativePrompt = textValue;
-                                console.log('Found negative prompt:', textValue.substring(0, 100));
-                            } else if (positivePrompt === 'No prompt found') {
-                                // If we haven't found a positive prompt yet, this might be it
-                                positivePrompt = textValue;
-                                console.log('Found potential positive prompt:', textValue.substring(0, 100));
-                            }
-                        }
-                        
-                        // Sampling parameters
-                        if (node.class_type === 'KSampler' && node.inputs) {
-                            seed = node.inputs.seed || seed;
-                            steps = node.inputs.steps || steps;
-                            cfgScale = node.inputs.cfg || cfgScale;
-                            sampler = node.inputs.sampler_name || sampler;
-                            console.log('Found sampler params:', {seed, steps, cfgScale, sampler});
-                        }
-                    }
-                } else {
-                    console.log('No prompt data found, will try workflow fallback');
-                }
+                // Trace prompts, model and sampler settings through the node graph (#75)
+                const {
+                    checkpoint, positivePrompt, negativePrompt, steps, cfgScale, sampler, seed,
+                } = window.ComfyMetadata.extractGenerationParams(comfyData);
 
                 // Store the current metadata for copying
                 this.currentMetadata = {
@@ -3033,252 +2971,10 @@ Seed: ${this.currentMetadata.seed || 'Unknown'}`;
             }
 
             parseWorkflowData(comfyData, imagePath) {
-                // Extract information from ComfyUI workflow
-                let checkpoint = 'Unknown';
-                let positivePrompt = 'No prompt found';
-                let negativePrompt = 'No negative prompt found';
-                let steps = 'Unknown';
-                let cfgScale = 'Unknown';
-                let sampler = 'Unknown';
-                let seed = 'Unknown';
-
-                // Parse prompt data first (more reliable for actual generation parameters)
-                if (comfyData.prompt) {
-                    const promptNodes = comfyData.prompt;
-                    
-                    for (const nodeId in promptNodes) {
-                        const node = promptNodes[nodeId];
-                        
-                        // Checkpoint
-                        if (node.class_type === 'CheckpointLoaderSimple' && node.inputs) {
-                            checkpoint = node.inputs.ckpt_name || checkpoint;
-                        }
-                        
-                        // Prompts - need to identify which is positive vs negative
-                        if (node.class_type === 'PromptManager' && node.inputs && node.inputs.text) {
-                            // PromptManager typically contains the positive prompt
-                            const promptValue = typeof node.inputs.text === 'string' ? node.inputs.text : (Array.isArray(node.inputs.text) ? node.inputs.text[0] : String(node.inputs.text));
-                            positivePrompt = promptValue;
-                        }
-                        
-                        if (node.class_type === 'CLIPTextEncode' && node.inputs && node.inputs.text) {
-                            // Check if this looks like a negative prompt
-                            const textValue = typeof node.inputs.text === 'string' ? node.inputs.text : (Array.isArray(node.inputs.text) ? node.inputs.text[0] : String(node.inputs.text));
-                            const text = textValue.toLowerCase();
-                            if (text.includes('bad anatomy') || text.includes('unfinished') || 
-                                text.includes('censored') || text.includes('weird anatomy') ||
-                                text.includes('negative') || text.includes('embedding:')) {
-                                negativePrompt = textValue;
-                            } else if (positivePrompt === 'No prompt found') {
-                                // If we haven't found a positive prompt yet, this might be it
-                                positivePrompt = textValue;
-                            }
-                        }
-                        
-                        // Sampling parameters
-                        if (node.class_type === 'KSampler' && node.inputs) {
-                            seed = node.inputs.seed || seed;
-                            steps = node.inputs.steps || steps;
-                            cfgScale = node.inputs.cfg || cfgScale;
-                            sampler = node.inputs.sampler_name || sampler;
-                        }
-                    }
-                }
-
-                // Parse workflow data (this is what we actually have in your case)
-                if (comfyData.workflow && comfyData.workflow.nodes) {
-                    const nodes = comfyData.workflow.nodes;
-                    console.log('DEBUG: Total nodes found:', nodes.length);
-                    
-                    // Debug: Log all nodes to understand the structure
-                    nodes.forEach((node, index) => {
-                        console.log(`Node ${index} (ID: ${node.id}):`, {
-                            type: node.type,
-                            title: node.title,
-                            widgets_values: node.widgets_values
-                        });
-                    });
-                    
-                    // Look for checkpoint loader
-                    const checkpointNode = nodes.find(node => 
-                        node.type === 'CheckpointLoaderSimple' || 
-                        node.type === 'CheckpointLoader'
-                    );
-                    if (checkpointNode && checkpointNode.widgets_values && checkpointNode.widgets_values[0]) {
-                        checkpoint = checkpointNode.widgets_values[0];
-                    }
-
-                    // Look for prompts in workflow nodes
-                    const textEncodeNodes = nodes.filter(node => node.type === 'CLIPTextEncode');
-                    const promptManagerNodes = nodes.filter(node => node.type === 'PromptManager');
-                    
-                    // Check PromptManager first for positive prompt
-                    if (promptManagerNodes.length > 0 && promptManagerNodes[0].widgets_values && promptManagerNodes[0].widgets_values[0]) {
-                        positivePrompt = promptManagerNodes[0].widgets_values[0];
-                    }
-                    
-                    // For negative prompt, look for CLIPTextEncode that contains negative keywords
-                    for (const node of textEncodeNodes) {
-                        if (node.widgets_values && node.widgets_values[0]) {
-                            const text = node.widgets_values[0].toLowerCase();
-                            if (text.includes('bad anatomy') || text.includes('unfinished') || 
-                                text.includes('censored') || text.includes('weird anatomy') ||
-                                text.includes('negative') || text.includes('embedding:')) {
-                                negativePrompt = node.widgets_values[0];
-                                break;
-                            }
-                        }
-                    }
-
-                    // Extract generation parameters from their source nodes
-                    // Look for specific node types with better fallback logic
-                    
-                    // CFG Scale - prioritize Float nodes with title 'CFG', then other sources
-                    console.log('DEBUG: Looking for CFG scale...');
-                    
-                    // First priority: Float node with title 'CFG'
-                    const cfgFloatNode = nodes.find(node => node.type === 'Float' && node.title === 'CFG');
-                    if (cfgFloatNode && cfgFloatNode.widgets_values && cfgFloatNode.widgets_values[0]) {
-                        cfgScale = cfgFloatNode.widgets_values[0];
-                        console.log(`DEBUG: Found CFG in Float node: ${cfgScale}`);
-                    }
-                    
-                    // If not found, look for specific value of 7 (your target CFG)
-                    if (cfgScale === 'Unknown') {
-                        for (const node of nodes) {
-                            if (node.widgets_values && Array.isArray(node.widgets_values)) {
-                                for (let i = 0; i < node.widgets_values.length; i++) {
-                                    const value = node.widgets_values[i];
-                                    if (value === 7) {  // Target the specific value you mentioned
-                                        cfgScale = value;
-                                        console.log(`DEBUG: Found target CFG value 7 in node ${node.id} (${node.type}) at index ${i}`);
-                                        break;
-                                    }
-                                }
-                                if (cfgScale !== 'Unknown') break;
-                            }
-                        }
-                    }
-                    
-                    // Fallback: any reasonable CFG value
-                    if (cfgScale === 'Unknown') {
-                        for (const node of nodes) {
-                            if (node.widgets_values && Array.isArray(node.widgets_values)) {
-                                for (let i = 0; i < node.widgets_values.length; i++) {
-                                    const value = node.widgets_values[i];
-                                    if (typeof value === 'number' && value > 1 && value <= 30) {
-                                        console.log(`DEBUG: Found potential CFG ${value} in node ${node.id} (${node.type}) at index ${i}`);
-                                        cfgScale = value;
-                                        console.log(`DEBUG: Set CFG scale to ${value}`);
-                                        break;
-                                    }
-                                }
-                                if (cfgScale !== 'Unknown') break;
-                            }
-                        }
-                    }
-                    
-                    // Steps - prioritize Int nodes with title 'Steps', then target value 30
-                    console.log('DEBUG: Looking for steps...');
-                    
-                    // First priority: Int node with title 'Steps'
-                    const stepsIntNode = nodes.find(node => node.type === 'Int' && node.title === 'Steps');
-                    if (stepsIntNode && stepsIntNode.widgets_values && stepsIntNode.widgets_values[0]) {
-                        steps = stepsIntNode.widgets_values[0];
-                        console.log(`DEBUG: Found steps in Int node: ${steps}`);
-                    }
-                    
-                    // If not found, look for specific value of 30 (your target steps)
-                    if (steps === 'Unknown') {
-                        for (const node of nodes) {
-                            if (node.widgets_values && Array.isArray(node.widgets_values)) {
-                                for (let i = 0; i < node.widgets_values.length; i++) {
-                                    const value = node.widgets_values[i];
-                                    if (value === 30) {  // Target the specific value you mentioned
-                                        steps = value;
-                                        console.log(`DEBUG: Found target steps value 30 in node ${node.id} (${node.type}) at index ${i}`);
-                                        break;
-                                    }
-                                }
-                                if (steps !== 'Unknown') break;
-                            }
-                        }
-                    }
-                    
-                    // Fallback: reasonable step values, prefer 10-150 range
-                    if (steps === 'Unknown') {
-                        for (const node of nodes) {
-                            if (node.widgets_values && Array.isArray(node.widgets_values)) {
-                                for (let i = 0; i < node.widgets_values.length; i++) {
-                                    const value = node.widgets_values[i];
-                                    if (typeof value === 'number' && value >= 10 && value <= 150) {
-                                        console.log(`DEBUG: Found good steps value ${value} in node ${node.id} (${node.type}) at index ${i}`);
-                                        steps = value;
-                                        console.log(`DEBUG: Set steps to ${value}`);
-                                        break;
-                                    }
-                                }
-                                if (steps !== 'Unknown') break;
-                            }
-                        }
-                    }
-                    
-                    // Sampler - look for valid ComfyUI samplers
-                    console.log('DEBUG: Looking for sampler...');
-                    const validSamplers = [
-                        'euler', 'euler_ancestral', 'heun', 'dpm_2', 'dpm_2_ancestral', 'lms', 
-                        'dpm_fast', 'dpm_adaptive', 'dpmpp_2s_ancestral', 'dpmpp_sde', 'dpmpp_sde_gpu',
-                        'dpmpp_2m', 'dpmpp_2m_sde', 'dpmpp_2m_sde_gpu', 'dpmpp_3m_sde', 'dpmpp_3m_sde_gpu',
-                        'ddim', 'uni_pc', 'uni_pc_bh2'
-                    ];
-                    for (const node of nodes) {
-                        if (node.widgets_values && Array.isArray(node.widgets_values)) {
-                            for (let i = 0; i < node.widgets_values.length; i++) {
-                                const value = node.widgets_values[i];
-                                if (typeof value === 'string') {
-                                    const samplerValue = value.toLowerCase();
-                                    if (validSamplers.some(validSampler => samplerValue.includes(validSampler))) {
-                                        console.log(`DEBUG: Found sampler ${value} in node ${node.id} (${node.type}) at index ${i}`);
-                                        if (sampler === 'Unknown') {
-                                            sampler = value;
-                                            console.log(`DEBUG: Set sampler to ${value}`);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Seed - look for large numbers that could be seeds
-                    console.log('DEBUG: Looking for seed...');
-                    for (const node of nodes) {
-                        if (node.widgets_values && Array.isArray(node.widgets_values)) {
-                            for (let i = 0; i < node.widgets_values.length; i++) {
-                                const value = node.widgets_values[i];
-                                if (typeof value === 'number' && value > 100000) {
-                                    console.log(`DEBUG: Found potential seed ${value} in node ${node.id} (${node.type}) at index ${i}`);
-                                    if (seed === 'Unknown') {
-                                        seed = value;
-                                        console.log(`DEBUG: Set seed to ${value}`);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    // If we still don't have sampling params, look at KSampler widgets_values directly
-                    const ksamplerNode = nodes.find(node => 
-                        node.type === 'KSampler' || node.type === 'KSamplerAdvanced'
-                    );
-                    if (ksamplerNode && ksamplerNode.widgets_values) {
-                        const widgets = ksamplerNode.widgets_values;
-                        // KSampler widgets_values order: [seed, control_mode, steps, cfg, sampler_name, scheduler, denoise, ...]
-                        if (seed === 'Unknown' && widgets[0]) seed = widgets[0];
-                        if (steps === 'Unknown' && widgets[2]) steps = widgets[2];
-                        if (cfgScale === 'Unknown' && widgets[3]) cfgScale = widgets[3];
-                        if (sampler === 'Unknown' && widgets[4]) sampler = widgets[4];
-                    }
-                }
+                // Trace prompts, model and sampler settings through the node graph (#75)
+                const {
+                    checkpoint, positivePrompt, negativePrompt, steps, cfgScale, sampler, seed,
+                } = window.ComfyMetadata.extractGenerationParams(comfyData);
 
                 return {
                     positivePrompt,
