@@ -20,9 +20,14 @@ class UsageTestCase(unittest.TestCase):
         self.db = PromptDatabase(self.path)
 
     def tearDown(self):
+        self.db.close()
         for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(self.path + suffix):
-                os.unlink(self.path + suffix)
+            path = self.path + suffix
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _save(self, text, **kwargs):
         return self.db.save_prompt(
@@ -161,8 +166,12 @@ class TestUsageMigration(unittest.TestCase):
 
     def tearDown(self):
         for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(self.path + suffix):
-                os.unlink(self.path + suffix)
+            path = self.path + suffix
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def test_backfill_estimates_usage_from_linked_images(self):
         db = PromptDatabase(self.path)

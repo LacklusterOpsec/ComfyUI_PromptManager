@@ -49,9 +49,14 @@ class DbTestCase(unittest.TestCase):
         self.pending = PendingFirstUse()
 
     def tearDown(self):
+        self.db.close()
         for suffix in ("", "-wal", "-shm"):
-            if os.path.exists(self.path + suffix):
-                os.unlink(self.path + suffix)
+            path = self.path + suffix
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _save(self, text):
         return self.db.save_prompt(text=text, prompt_hash=generate_prompt_hash(text))

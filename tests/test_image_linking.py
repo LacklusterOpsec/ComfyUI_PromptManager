@@ -51,6 +51,7 @@ class LinkingTestCase(unittest.TestCase):
         )
 
     def tearDown(self):
+        self.db.close()
         for path in (
             self.image,
             self.db_path,
@@ -58,7 +59,10 @@ class LinkingTestCase(unittest.TestCase):
             self.db_path + "-shm",
         ):
             if os.path.exists(path):
-                os.unlink(path)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _save(self, text):
         return self.db.save_prompt(text=text, prompt_hash=generate_prompt_hash(text))
