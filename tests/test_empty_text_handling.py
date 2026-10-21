@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 @patch("prompt_manager_base.get_image_monitor")
 @patch("prompt_manager_base.get_prompt_tracker")
 @patch("prompt_manager_base.get_comfyui_integration")
-@patch("prompt_manager_base.get_prompt_database")
+@patch("prompt_manager_base.PromptDatabase")
 class TestPromptManagerTextEmptyInput(unittest.TestCase):
     """Test PromptManagerText with empty/blank text inputs (issue #123)."""
 
@@ -53,7 +53,8 @@ class TestPromptManagerTextEmptyInput(unittest.TestCase):
     def test_empty_text_with_prepend_append(
         self, mock_db, mock_integ, mock_tracker, mock_monitor
     ):
-        """Empty main text with prepend/append should produce single space, not double."""
+        """Empty main text with prepend/append should produce single space, not
+        double."""
         node = self._make_node(mock_db, mock_integ, mock_tracker, mock_monitor)
         result = node.process_text(text="", prepend_text="before", append_text="after")
         self.assertIsInstance(result, tuple)
@@ -89,7 +90,7 @@ class TestPromptManagerTextEmptyInput(unittest.TestCase):
 @patch("prompt_manager_base.get_image_monitor")
 @patch("prompt_manager_base.get_prompt_tracker")
 @patch("prompt_manager_base.get_comfyui_integration")
-@patch("prompt_manager_base.get_prompt_database")
+@patch("prompt_manager_base.PromptDatabase")
 class TestPromptManagerEmptyInput(unittest.TestCase):
     """Test PromptManager (CLIP variant) with empty/blank text inputs (issue #123)."""
 
@@ -128,7 +129,8 @@ class TestPromptManagerEmptyInput(unittest.TestCase):
     def test_empty_text_with_prepend_append(
         self, mock_db, mock_integ, mock_tracker, mock_monitor
     ):
-        """Empty main text with prepend/append should produce single space, not double."""
+        """Empty main text with prepend/append should produce single space, not
+        double."""
         node, clip = self._make_node_and_clip(
             mock_db, mock_integ, mock_tracker, mock_monitor
         )
@@ -166,7 +168,7 @@ class TestPromptManagerEmptyInput(unittest.TestCase):
 @patch("prompt_manager_base.get_image_monitor")
 @patch("prompt_manager_base.get_prompt_tracker")
 @patch("prompt_manager_base.get_comfyui_integration")
-@patch("prompt_manager_base.get_prompt_database")
+@patch("prompt_manager_base.PromptDatabase")
 class TestConnectedTextInput(unittest.TestCase):
     """Test that externally connected text is preserved in output (issue #123).
 

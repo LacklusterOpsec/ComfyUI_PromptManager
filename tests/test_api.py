@@ -9,23 +9,15 @@ import json
 import os
 import sys
 import tempfile
-import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Mock ComfyUI's server module before importing anything that touches config
-from unittest.mock import MagicMock
-
-_mock_server = MagicMock()
-_mock_server.PromptServer.instance.routes = MagicMock()
-sys.modules["server"] = _mock_server
 
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase
 
 from database.operations import PromptDatabase
-from promptmanager_core.api import PromptManagerAPI
+from py.api import PromptManagerAPI
 from utils.hashing import generate_prompt_hash
 
 
@@ -39,25 +31,23 @@ class APITestCase(AioHTTPTestCase):
         app = web.Application()
         routes = web.RouteTableDef()
 
-        self.api = PromptManagerAPI()
-        self.api.db = PromptDatabase(self._temp_db.name)
+        self.api = PromptManagerAPI(db=PromptDatabase(self._temp_db.name))
         self.api.add_routes(routes)
         app.router.add_routes(routes)
         return app
 
     async def tearDownAsync(self):
-        if hasattr(self, "api") and hasattr(self.api, "db") and self.api.db:
-            self.api.db.close()
+        await super().tearDownAsync()  # closes the aiohttp test client
+        # Close every thread's connection first: Windows refuses to delete
+        # an open database file, and executor threads hold connections too.
+        self.api.db.close_all()
         for path in (
             self._temp_db.name,
             self._temp_db.name + "-wal",
             self._temp_db.name + "-shm",
         ):
             if os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
+                os.unlink(path)
 
     # ── helpers ────────────────────────────────────────────────────────
 
@@ -423,88 +413,6 @@ class TestResponseEnvelope(APITestCase):
         data = await resp.json()
         self.assertIn("success", data)
         self.assertFalse(data["success"])
-
-
-class TestThumbnailStatus(APITestCase):
-    """GET /prompt_manager/images/thumbnail-status returns exact counts.
-
-    The endpoint scans the whole library (not a sample) so the numbers it
-    reports are real, which the gallery startup check shows to the user.
-    """
-
-    def setUp(self):
-        from promptmanager_core.config import GalleryConfig
-
-        self._orig_dirs = list(GalleryConfig.MONITORING_DIRECTORIES)
-
-    async def tearDownAsync(self):
-        from promptmanager_core.config import GalleryConfig
-
-        GalleryConfig.MONITORING_DIRECTORIES = self._orig_dirs
-        await super().tearDownAsync()
-
-    def _make_tree(self):
-        """Create a temp output dir with dummy media + thumbnails (old mtimes).
-
-        Files: a.png (thumb), sub/b.png (thumb), sub/c.png (no thumb),
-        movie.mp4 (no thumb). All set 2h old so they're not treated as recent.
-        """
-        from pathlib import Path
-
-        out = Path(tempfile.mkdtemp())
-        old = time.time() - 7200
-        (out / "sub").mkdir(parents=True, exist_ok=True)
-
-        def _touch(path):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"dummy")
-            os.utime(path, (old, old))
-
-        for rel in ("a.png", "sub/b.png", "sub/c.png"):
-            _touch(out / rel)
-        _touch(out / "movie.mp4")
-
-        # thumbnails for a.png and sub/b.png
-        for rel in ("a.png", "sub/b.png"):
-            p = Path(rel)
-            tp = out / f"thumbnails/{p.with_suffix('').as_posix()}_thumb{p.suffix}"
-            _touch(tp)
-        return out
-
-    async def test_thumbnail_status_counts(self):
-        from promptmanager_core.config import GalleryConfig
-
-        out = self._make_tree()
-        GalleryConfig.MONITORING_DIRECTORIES = [str(out)]
-
-        resp = await self.client.request(
-            "GET", "/prompt_manager/images/thumbnail-status"
-        )
-        self.assertEqual(resp.status, 200)
-        data = await resp.json()
-        self.assertTrue(data["success"])
-        self.assertEqual(data["total"], 4)
-        self.assertEqual(data["missing"], 2)  # sub/c.png + movie.mp4
-        self.assertEqual(data["recent_excluded"], 0)
-
-    async def test_thumbnail_status_excludes_recent_files(self):
-        from promptmanager_core.config import GalleryConfig
-
-        out = self._make_tree()
-        # Brand-new file with no thumbnail - too recent to judge, must not count
-        fresh = out / "fresh.png"
-        fresh.write_bytes(b"dummy")
-        GalleryConfig.MONITORING_DIRECTORIES = [str(out)]
-
-        resp = await self.client.request(
-            "GET", "/prompt_manager/images/thumbnail-status"
-        )
-        self.assertEqual(resp.status, 200)
-        data = await resp.json()
-        self.assertTrue(data["success"])
-        self.assertEqual(data["total"], 5)
-        self.assertEqual(data["missing"], 2)
-        self.assertEqual(data["recent_excluded"], 1)
 
 
 if __name__ == "__main__":

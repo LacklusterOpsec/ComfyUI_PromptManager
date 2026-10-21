@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import database.operations as operations
 from database.operations import _resolve_db_path
 
 EXTENSION_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +22,37 @@ EXTENSION_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class TestResolveDbPath(unittest.TestCase):
     """Test _resolve_db_path() database path resolution."""
+
+    def test_package_qualified_config_precedes_unrelated_standalone_config(
+        self,
+    ) -> None:
+        """A custom-node package must use its own configured disposable database."""
+        with tempfile.TemporaryDirectory() as directory:
+            configured = os.path.join(directory, "owned", "prompts.db")
+            package_config = types.ModuleType("owned_promptmanager.py.config")
+            package_config.PromptManagerConfig = types.SimpleNamespace(
+                DEFAULT_DB_PATH=configured
+            )
+            standalone_config = types.ModuleType("py.config")
+            standalone_config.PromptManagerConfig = types.SimpleNamespace(
+                DEFAULT_DB_PATH=os.path.join(directory, "unrelated.db")
+            )
+            with (
+                patch.dict(
+                    operations.__dict__,
+                    {"__package__": "owned_promptmanager.database", "__spec__": None},
+                ),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "owned_promptmanager.py.config": package_config,
+                        "py.config": standalone_config,
+                    },
+                ),
+            ):
+                resolved = _resolve_db_path(None)
+            self.assertEqual(resolved, configured)
+            self.assertTrue(os.path.isdir(os.path.dirname(configured)))
 
     def test_explicit_absolute_path_used_as_is(self):
         """An explicit absolute path should be returned unchanged."""
@@ -46,26 +78,26 @@ class TestResolveDbPath(unittest.TestCase):
         """None should read DEFAULT_DB_PATH from config when importable."""
         with tempfile.TemporaryDirectory() as tmpdir:
             custom_path = os.path.join(tmpdir, "prompts.db")
-            fake_config_mod = types.ModuleType("promptmanager_core.config")
+            fake_config_mod = types.ModuleType("py.config")
             fake_pm_config = type(
                 "PromptManagerConfig", (), {"DEFAULT_DB_PATH": custom_path}
             )
             fake_config_mod.PromptManagerConfig = fake_pm_config
 
-            with patch.dict(sys.modules, {"promptmanager_core.config": fake_config_mod, "py.config": fake_config_mod}):
+            with patch.dict(sys.modules, {"py.config": fake_config_mod}):
                 result = _resolve_db_path(None)
 
             self.assertEqual(result, custom_path)
 
     def test_config_relative_path_resolved_to_extension_root(self):
         """A relative path from config should resolve against extension root."""
-        fake_config_mod = types.ModuleType("promptmanager_core.config")
+        fake_config_mod = types.ModuleType("py.config")
         fake_pm_config = type(
             "PromptManagerConfig", (), {"DEFAULT_DB_PATH": "custom_data/prompts.db"}
         )
         fake_config_mod.PromptManagerConfig = fake_pm_config
 
-        with patch.dict(sys.modules, {"promptmanager_core.config": fake_config_mod, "py.config": fake_config_mod}):
+        with patch.dict(sys.modules, {"py.config": fake_config_mod}):
             result = _resolve_db_path(None)
 
         expected = os.path.join(EXTENSION_ROOT, "custom_data", "prompts.db")
@@ -94,22 +126,13 @@ class TestPromptDatabaseUsesConfig(unittest.TestCase):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
             mock_resolve.return_value = f.name
 
-        db = None
         try:
             from database.operations import PromptDatabase
 
-            db = PromptDatabase()
+            PromptDatabase()
             mock_resolve.assert_called_once_with(None)
         finally:
-            if db:
-                db.close()
-            for suffix in ("", "-wal", "-shm"):
-                p = f.name + suffix
-                if os.path.exists(p):
-                    try:
-                        os.unlink(p)
-                    except Exception:
-                        pass
+            os.unlink(f.name)
 
     @patch("database.operations._resolve_db_path")
     def test_constructor_passes_explicit_path(self, mock_resolve):
@@ -117,22 +140,13 @@ class TestPromptDatabaseUsesConfig(unittest.TestCase):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
             mock_resolve.return_value = f.name
 
-        db = None
         try:
             from database.operations import PromptDatabase
 
-            db = PromptDatabase("/explicit/path.db")
+            PromptDatabase("/explicit/path.db")
             mock_resolve.assert_called_once_with("/explicit/path.db")
         finally:
-            if db:
-                db.close()
-            for suffix in ("", "-wal", "-shm"):
-                p = f.name + suffix
-                if os.path.exists(p):
-                    try:
-                        os.unlink(p)
-                    except Exception:
-                        pass
+            os.unlink(f.name)
 
 
 if __name__ == "__main__":

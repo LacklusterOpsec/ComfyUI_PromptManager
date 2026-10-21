@@ -139,6 +139,35 @@ The comprehensive gallery system provides complete management of all ComfyUI out
 
 _Powered by [ViewerJS](https://github.com/fengyuanchen/viewerjs) for professional image viewing capabilities._
 
+Viewer.js is vendored locally. See [Viewer.js maintenance](tools/vendor/README.md)
+for reproducible updates, verification, and automated update PRs.
+
+Prompt Manager appears as **Prompt Manager (Classic)** in the Add Node menu.
+It keeps the existing layout and behavior while using shared
+[ComfyAssets Toolkit](https://github.com/ComfyAssets/ComfyAssets-Toolkit) controls
+that follow ComfyUI's light/dark theme. Existing workflows keep the same internal
+node identifier and sockets. The reusable architecture is inspired by
+[Pixaroma](https://github.com/pixaroma/ComfyUI-Pixaroma); no implementation or assets
+were copied. See the [toolkit maintenance notes](tools/vendor/README.md#shared-comfyassets-browser-controls).
+
+**Prompt Manager (Focused)** adds an editor-first layout with collapsible
+composition and metadata fields. Open **Browse library** to search saved prompts,
+filter by saved category and comma-separated tags, preview a selection, then choose
+**Use prompt**; **Load metadata** controls whether
+category and tags come with it. Metadata fields suggest saved categories and tags;
+choose with the mouse or arrow keys and Enter. Tag selections append `, ` for the
+next tag; category remains a single value. New values can still be typed freely.
+Prepend and append STRING sockets remain visible
+when the fields are collapsed, so LoRA trigger outputs can connect directly.
+Encoding, storage, and CONDITIONING/text outputs match Classic. Both layouts
+support ComfyUI Classic and Nodes 2.0.
+
+**Prompt Manager (Split)** keeps the same editor and library visible together.
+Wide nodes place the library beside the editor; narrow nodes stack the panels.
+It shares Focused's category/tag autocomplete, search filters, preview-before-use,
+workflow persistence, and connectable prepend/append inputs. Encoding and storage
+match Classic and Focused.
+
 ### 🔬 ComfyUI Workflow Analysis
 
 - **PNG Metadata Parsing**: Advanced PNG chunk analysis to extract embedded ComfyUI data
@@ -164,7 +193,7 @@ _Powered by [ViewerJS](https://github.com/fengyuanchen/viewerjs) for professiona
 
 - **Full-text search** across all stored prompts
 - **Category filtering** for organized prompt collections
-- **Tag-based search** with support for multiple tags
+- **Tag-based search** with support for multiple tags, with autocomplete that narrows to tags seen together with the ones already typed
 - **Rating filters** to find your best prompts
 - **Date range filtering** for temporal searches
 - **Recent prompts** quick access
@@ -306,9 +335,12 @@ The comprehensive gallery system provides complete access to all your ComfyUI ou
 
 Configure your viewing experience in the settings panel:
 
-- **Performance Settings**: Grid columns, image quality, lazy loading
+- **Display Settings**: Default view, items per page, grid columns, media info, infinite scrolling
+- **Performance Settings**: Image quality, lazy loading
 - **Video Settings**: Autoplay, mute by default, loop videos
-- **Thumbnail Management**: Generate optimized thumbnails for faster loading
+- **Thumbnail Management**: Generate optimized thumbnails for faster loading (runs on the configured worker threads; a run that stops at the per-run cap tells you how many remain)
+- **Find Duplicate Images**: Hashes every file on the worker threads with a progress bar; close the window and it keeps running, results wait in a pill
+- **Rescan Output Folder**: Drops the server-side listing cache and rewalks the folders
 
 #### **🖼️ Image Viewing Experience**
 
@@ -358,13 +390,15 @@ Use the standalone metadata viewer to analyze any ComfyUI-generated PNG:
 Import existing ComfyUI images into your database:
 
 1. **Open admin dashboard** and click **"📸 Scan Images"**
-2. **Start scan** to analyze your entire output directory
-3. **Monitor progress** with real-time status updates
+2. **Start scan** to analyze every configured output directory
+3. **Monitor progress** with real-time status updates. The scan runs on the server: closing the window only minimizes it to a progress pill, and reloading the page re-attaches to a running scan
 4. **Review results** showing:
    - Images found and processed
    - Prompts extracted and linked
    - Any errors or issues encountered
 5. **Access imported data** through the normal gallery interface
+
+The scan reads PNG text chunks and A1111-style parameters, and, when `ffprobe` is installed, the prompt ComfyUI's video savers embed in MP4/MOV/WebM files. Files are read on the number of **worker threads** set in Settings → Performance (default: half your cores), which makes a large library several times faster.
 
 ### 🏷️ AI AutoTag
 
@@ -497,7 +531,7 @@ Keep your database optimized with built-in maintenance tools:
 
 ### Database Location
 
-By default, the database is saved as `example_prompts.db` in the node directory. This file contains all your prompts and linked images and can be backed up or shared.
+By default, the database is saved as `prompts.db` in the extension directory. It contains your prompt library and image links. See the [database path compatibility note](#database-path-compatibility-211) before upgrading a deployment with a custom path.
 
 ### Searching Prompts
 
@@ -664,7 +698,8 @@ CREATE TABLE generated_images (
 - **`utils/diagnostics.py`** - System diagnostics and health checks
 - **`web/admin.html`** - Advanced admin dashboard with metadata panel
 - **`web/index.html`** - Simple web interface
-- **`web/js/prompt_manager.js`** - Dashboard JavaScript
+- **`web/comfy/prompt_manager.js`** - ComfyUI canvas extension (the only file ComfyUI loads)
+- **`web/js/admin.js`**, **`web/js/gallery.js`** - Dashboard and gallery JavaScript
 - **`web/js/tags-page.js`** - Tag management JavaScript
 - **`web/metadata.html`** - Standalone PNG metadata viewer
 
@@ -699,8 +734,11 @@ ComfyUI_PromptManager/
 │   ├── gallery.html             # Image gallery
 │   ├── index.html               # Simple web interface
 │   ├── metadata.html            # Standalone metadata viewer
+│   ├── comfy/
+│   │   └── prompt_manager.js    # ComfyUI canvas extension (WEB_DIRECTORY)
 │   └── js/
-│       ├── prompt_manager.js    # Dashboard JavaScript
+│       ├── admin.js             # Dashboard JavaScript
+│       ├── gallery.js           # Gallery JavaScript
 │       └── tags-page.js         # Tag management JavaScript
 ├── tests/
 │   ├── __init__.py
@@ -735,6 +773,32 @@ Relative paths are resolved against the extension directory. Absolute paths are 
 }
 ```
 
+### Database Path Compatibility (#211)
+
+PromptManager now honors the `database.default_path` setting in `config.json`
+when loaded as a ComfyUI custom node. Relative paths resolve against the extension
+directory, not ComfyUI's working directory; absolute paths are used as-is. Earlier
+versions could ignore this setting and use `<extension>/prompts.db` instead.
+Honoring a different configured path can therefore show an empty or different
+library. PromptManager does not automatically move or merge database files.
+
+Before upgrading or changing this setting:
+
+1. Identify the database your current installation actually uses and confirm its
+   library contents. Check both the configured path and the prior fallback
+   `<extension>/prompts.db`; keep track of which existing file you intend to use.
+2. Preserve a consistent backup of the active database with the dashboard's
+   Backup/Restore backup action or SQLite's online backup API. Do not copy only
+   the main file of a live SQLite database: committed data may still be in its
+   `-wal` file. For a filesystem copy, stop ComfyUI cleanly first and preserve any
+   remaining `-wal` file together with the main database.
+3. Set `database.default_path` to the existing intended database file. An absolute
+   path makes the selection explicit; do not move or overwrite either database
+   while choosing the path.
+4. Restart ComfyUI, then verify that the expected library appears and the active
+   database path resolves to the file you selected. Keep the backup until both
+   checks succeed.
+
 ### Gallery & Monitoring Settings
 
 Configure the automatic image detection and gallery system:
@@ -763,11 +827,15 @@ Configure the web interface behavior:
 # Web UI settings (PromptManagerConfig class)
 RESULT_TIMEOUT = 5  # Seconds to auto-hide results in ComfyUI node
 WEBUI_DISPLAY_MODE = 'newtab'  # 'popup' or 'newtab' for Web UI button
+INFINITE_SCROLL = False  # Dashboard list loads the next page on scroll by default
 SHOW_TEST_BUTTON = False  # Show API test button in node UI
 ```
 
+All of these are editable in the dashboard Settings modal and saved to `config.json` (which is private to the installation and holds the CivitAI key, so it is never committed).
+
 ### Performance Tuning
 
+- **Worker threads** (Settings → Performance): threads used by the image rescan, thumbnail generation and duplicate detection. Default is half the detected cores, maximum is the core count. Pillow releases the GIL while decoding, so the scan and thumbnails scale almost linearly; keep a few cores free while ComfyUI is generating.
 - The database automatically creates indexes for optimal search performance
 - Regular `VACUUM` operations keep the database optimized
 - Consider backing up the database periodically
@@ -802,7 +870,7 @@ print(f"Average rating: {info['average_rating']}")
 # Create backup
 db.model.backup_database("backup_prompts.db")
 
-# The database file can be copied directly for backup
+# The online backup includes committed data still in the WAL.
 ```
 
 ## Development
@@ -811,8 +879,13 @@ db.model.backup_database("backup_prompts.db")
 
 ```bash
 cd ComfyUI_PromptManager
-python -m pytest tests/ -v
+pip install -r requirements-dev.txt
+python -m unittest discover -s tests          # Python (what CI runs)
+node --test tests/js/*.test.js                 # frontend pure modules
+python -m coverage run -m unittest discover -s tests && python -m coverage combine && python -m coverage report
 ```
+
+CI runs the suite on Linux, Windows and macOS for Python 3.10 to 3.12 with an 85% coverage gate. Tests that delete a database file first check that nothing in the process still holds it open (`tests/open_handles.py`), so a connection leak fails on Linux the way it would on Windows.
 
 ### Code Style
 
@@ -874,6 +947,10 @@ MIT License - see LICENSE file for details.
 
 ### Recently Completed
 
+- **✅ Security & Reliability Hardening (3.3.0)**: validated gallery roots, contained file serving, safe backups and restores, background scans, 85%+ test coverage on all three operating systems
+- **✅ Worker Threads**: scan, thumbnails and duplicate detection run on a configurable thread pool
+- **✅ Tag Autocomplete & Infinite Scrolling**: faster browsing in the dashboard and gallery
+- **✅ Queue-Time Run Counting (3.2.4)**: run counts and image linking follow the ComfyUI queue
 - **✅ LoRA Manager Integration**: Import LoRA metadata, trigger words, and preview images
 - **✅ Folder Filter**: Browse and filter prompts by output subdirectory
 - **✅ Multi-Directory Gallery**: Scan multiple output directories simultaneously
@@ -892,6 +969,31 @@ MIT License - see LICENSE file for details.
 - **📊 Visual Analytics**: Charts and graphs for prompt effectiveness analysis
 
 ## Changelog
+
+### v3.3.1 (Proxy Routing Fix)
+
+- **🌐 Proxy support**: the dashboard, gallery, tag page and metadata viewer now work when ComfyUI is reached through a proxy mount such as SwarmUI's `/ComfyBackendDirect/`. Scripts, images, API calls, progress streams and gallery folder filters stay under the mount, and the canvas node's buttons use ComfyUI's `fileURL()`. Direct ComfyUI URLs are unchanged. Thanks to @ghosttigerllc-bit ([#164](https://github.com/ComfyAssets/ComfyUI_PromptManager/pull/164))
+- **📦 Dependencies**: the runtime minimums stay at `Pillow>=8.0.0` and `watchdog>=2.1.0`, so updating Prompt Manager never forces upgrades in the shared ComfyUI environment
+
+### v3.3.0 (Hardening, Background Jobs & Worker Threads)
+
+- **🔒 Security**: gallery roots restricted to ComfyUI directories and validated wherever they are read; media-only, fail-closed image serving; Windows path escape in static routes closed; quote-safe HTML escaping with inline handlers moved to data attributes; the CivitAI key is never returned and only sent to HTTPS CivitAI hosts; auto-tag paths contained; side-effect routes are POST-only; backups include the WAL and restores are size-capped, integrity-checked and applied through SQLite's online backup API
+- **🧵 Worker Threads**: a Settings slider (default half the cores) used by the image rescan, thumbnail generation and duplicate detection. Measured: a 1 GB sample scanned in 2.5 s instead of 18 s at 8 threads
+- **🔁 Background Jobs**: the image rescan and the duplicate scan run on the server, stream progress, survive a closed tab, minimize to a progress pill and re-attach after a reload
+- **🎬 Video Prompts**: the scan reads the prompt ComfyUI's video savers embed in MP4/MOV/WebM containers (needs `ffprobe`)
+- **🖼️ Thumbnails**: written atomically and served under versioned URLs so a regenerated thumbnail never shows a stale cached copy; the per-run cap applies only to thumbnails that still need generating and the gallery says how many remain
+- **🏷️ Tag Autocomplete**: the dashboard tag box suggests tags, narrowed to those that co-occur with the tags already typed
+- **♾️ Infinite Scrolling**: optional in the gallery and the dashboard list (saved default plus a session toggle)
+- **⚙️ Gallery Settings** now apply at load; grid columns, media info and the Rescan button work as labelled
+- **🐛 Correctness**: run counts increment when ComfyUI dequeues a prompt; negative prompts are never traced; per-thread SQLite connections and idempotent migrations (an old rebuild could delete every image row); `truncate_logs` no longer rolls the log over; the ComfyUI canvas loads only the canvas extension; Windows console banners are ASCII-safe; subfolders use `/` on every platform
+- **🧪 Tests & CI**: 1,460 Python and 142 JavaScript tests (from 510 and 26), coverage 96% with an 85% gate, CI on Linux, Windows and macOS for Python 3.10–3.12, flake8 clean
+- **⚠️ API changes**: image paths in responses are relative to the ComfyUI tree (use `url`); `autotag/download`, `autotag/start` and the thumbnail progress stream are POST-only; `lora/status` returns `has_civitai_api_key` instead of the key; `/search` is paginated
+
+### v3.2.4 (Recently Used Sorting & Queue-Time Run Counts)
+
+- **🕒 Recently Used Sort**: sort the dashboard by last use, most used or rating, server-side across pages
+- **🔢 Run Counts**: `run_count` and `last_used_at` are recorded through the ComfyUI queue hook, so cached nodes still count
+- **🔗 Positive-Prompt Image Linking**: generated images link to the positive prompt traced through the queued graph
 
 ### v3.2.1 (LoRA Manager Integration)
 

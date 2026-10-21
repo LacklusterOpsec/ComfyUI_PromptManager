@@ -583,8 +583,12 @@ class TagsPageManager {
     // ── Prompts Display ───────────────────────────────────────
 
     async loadTagPrompts() {
-        if (this.isLoadingPrompts) return;
-        if (this.selectedTags.length === 0) return;
+        if (this.selectedTags.length === 0) {
+            this.clearPrompts();
+            return;
+        }
+        const request = {};
+        this.promptRequest = request;
 
         this.isLoadingPrompts = true;
         this.promptOffset = 0;
@@ -622,6 +626,7 @@ class TagsPageManager {
             }
 
             const data = await this.fetchJson(url);
+            if (this.promptRequest !== request) return;
 
             if (data.success) {
                 this.prompts = data.prompts;
@@ -634,6 +639,7 @@ class TagsPageManager {
                 requestAnimationFrame(() => this.refreshPromptObserver());
             }
         } catch (err) {
+            if (this.promptRequest !== request) return;
             console.error('Failed to load tag prompts:', err);
             if (grid) {
                 grid.replaceChildren();
@@ -643,12 +649,14 @@ class TagsPageManager {
                 grid.appendChild(errDiv);
             }
         } finally {
-            this.isLoadingPrompts = false;
+            if (this.promptRequest === request) this.isLoadingPrompts = false;
         }
     }
 
     async loadMoreTagPrompts() {
         if (this.isLoadingPrompts || !this.hasMorePrompts) return;
+        const request = {};
+        this.promptRequest = request;
         this.isLoadingPrompts = true;
 
         const spinner = document.querySelector('#tagPromptsLoader .prompts-loader-spinner');
@@ -675,6 +683,7 @@ class TagsPageManager {
             }
 
             const data = await this.fetchJson(url);
+            if (this.promptRequest !== request) return;
 
             if (data.success) {
                 const startIndex = this.prompts.length;
@@ -685,13 +694,16 @@ class TagsPageManager {
                 this.updatePromptCountBadge();
             }
         } catch (err) {
+            if (this.promptRequest !== request) return;
             console.error('Failed to load more prompts:', err);
             this.hasMorePrompts = false;
         } finally {
-            this.isLoadingPrompts = false;
-            if (spinner) spinner.classList.add('hidden');
-            this.updateLoadMoreButton();
-            requestAnimationFrame(() => this.refreshPromptObserver());
+            if (this.promptRequest === request) {
+                this.isLoadingPrompts = false;
+                if (spinner) spinner.classList.add('hidden');
+                this.updateLoadMoreButton();
+                requestAnimationFrame(() => this.refreshPromptObserver());
+            }
         }
     }
 
@@ -987,6 +999,9 @@ class TagsPageManager {
     }
 
     clearPrompts() {
+        this.promptRequest = null;
+        this.isLoadingPrompts = false;
+        this.promptOffset = 0;
         this.prompts = [];
         this.promptTotal = 0;
         this.hasMorePrompts = false;
@@ -1091,6 +1106,7 @@ class TagsPageManager {
     }
 
     destroy() {
+        this.promptRequest = null;
         this.destroyInfiniteScroll();
         this.hideContextMenu();
         clearTimeout(this.searchTimer);
@@ -1107,7 +1123,7 @@ class TagsPageManager {
     // ── Helpers ───────────────────────────────────────────────
 
     async fetchJson(url, options = {}) {
-        const resp = await fetch(url, options);
+        const resp = await ApiClient.fetchUrl(url, options);
         if (!resp.ok) {
             let errorMsg;
             try { errorMsg = (await resp.json()).error; } catch { errorMsg = resp.statusText; }
@@ -1117,9 +1133,9 @@ class TagsPageManager {
     }
 
     getThumbnailUrl(image) {
-        if (image.thumbnail_url) return image.thumbnail_url;
-        if (image.url) return image.url;
-        if (image.id) return `/prompt_manager/images/${image.id}/file`;
+        if (image.thumbnail_url) return ApiClient.resolveUrl(image.thumbnail_url);
+        if (image.url) return ApiClient.resolveUrl(image.url);
+        if (image.id) return ApiClient.resolveUrl(`/prompt_manager/images/${image.id}/file`);
         return '';
     }
 }

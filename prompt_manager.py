@@ -6,6 +6,11 @@ with persistent prompt storage and search capabilities.
 import time
 from typing import Any, Dict, Optional, Tuple
 
+if __package__:
+    from .utils.execution_context_capture import record_runtime_context
+else:
+    from utils.execution_context_capture import record_runtime_context
+
 try:
     from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict
 except ImportError:
@@ -51,7 +56,9 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
                     {
                         "multiline": True,
                         "dynamicPrompts": True,
-                        "tooltip": "The text prompt to be encoded and saved to database.",
+                        "tooltip": (
+                            "The text prompt to be encoded and saved to database."
+                        ),
                     },
                 ),
                 "clip": (
@@ -64,35 +71,50 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
                     IO.STRING,
                     {
                         "default": "",
-                        "tooltip": "Optional category for organizing prompts (e.g., 'landscapes', 'portraits')",
+                        "tooltip": (
+                            "Optional category for organizing prompts "
+                            "(e.g., 'landscapes', 'portraits')"
+                        ),
                     },
                 ),
                 "tags": (
                     IO.STRING,
                     {
                         "default": "",
-                        "tooltip": "Comma-separated tags for the prompt (e.g., 'anime, detailed, sunset')",
+                        "tooltip": (
+                            "Comma-separated tags for the prompt "
+                            "(e.g., 'anime, detailed, sunset')"
+                        ),
                     },
                 ),
                 "search_text": (
                     IO.STRING,
                     {
                         "default": "",
-                        "tooltip": 'Search past prompts by text; add tag:name (or tag:"two words") to filter by tag',
+                        "tooltip": (
+                            "Search past prompts by text; add tag:name "
+                            '(or tag:"two words") to filter by tag'
+                        ),
                     },
                 ),
                 "prepend_text": (
                     IO.STRING,
                     {
                         "default": "",
-                        "tooltip": "Text to prepend to the main prompt (connected STRING nodes will be added before the main text)",
+                        "tooltip": (
+                            "Text to prepend to the main prompt (connected STRING "
+                            "nodes will be added before the main text)"
+                        )
                     },
                 ),
                 "append_text": (
                     IO.STRING,
                     {
                         "default": "",
-                        "tooltip": "Text to append to the main prompt (connected STRING nodes will be added after the main text)",
+                        "tooltip": (
+                            "Text to append to the main prompt (connected STRING "
+                            "nodes will be added after the main text)"
+                        )
                     },
                 ),
             },
@@ -105,17 +127,19 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
         }
 
     RETURN_TYPES = (IO.CONDITIONING, IO.STRING)
-    RETURN_NAMES = ("CONDITIONING", "STRING")
     OUTPUT_TOOLTIPS = (
-        "A conditioning containing the embedded text used to guide the diffusion model.",
-        "The final combined text string (with prepend/append applied) that was encoded.",
+        "A conditioning containing the embedded text used to guide the diffusion "
+        "model.",
+        "The final combined text string (with prepend/append applied) that was "
+        "encoded.",
     )
     FUNCTION = "encode_prompt"
     OUTPUT_NODE = True
     CATEGORY = "🫶 ComfyAssets/🧠 Prompts"
     DESCRIPTION = (
-        "Encodes a text prompt using a CLIP model into an embedding that can be used to guide "
-        "the diffusion model towards generating specific images. Additionally saves all prompts "
+        "Encodes a text prompt using a CLIP model into an embedding that can be used "
+        "to guide the diffusion model towards generating specific images. "
+        "Additionally saves all prompts "
         "to a local SQLite database with optional metadata for search and retrieval."
     )
 
@@ -144,7 +168,8 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
             append_text: Text to append to the main prompt
 
         Returns:
-            Tuple containing the conditioning for the diffusion model and the final text string
+            Tuple containing the conditioning for the diffusion model and the final
+            text string
 
         Raises:
             RuntimeError: If clip input is invalid
@@ -165,7 +190,8 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
         # Use the combined text for encoding
         encoding_text = final_text
 
-        # For database storage, save the original main text with metadata about prepend/append
+        # For database storage, save the original main text with metadata
+        # about prepend/append
         storage_text = text
 
         # Validate CLIP model
@@ -237,7 +263,11 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
         )
 
         self.logger.info(f"CLIP encoding completed, text: {repr(encoding_text)[:80]}")
-        return (conditioning, encoding_text)
+        result = (conditioning, encoding_text)
+        record_runtime_context(
+            type(self).__name__, text, prepend_text, append_text, encoding_text
+        )
+        return result
 
     @classmethod
     def IS_CHANGED(
@@ -254,10 +284,30 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
         """
         ComfyUI method to determine if node needs re-execution.
 
-        Returns a hash of input values that affect the conditioning output.
-        This enables proper branch execution - only re-execute when inputs change.
+        Returns a hash of input values that affect the conditioning output or
+        the saved prompt's metadata. This enables proper branch execution -
+        only re-execute when inputs change.
         """
-        # Always return NaN so the node re-executes on every run. This ensures
-        # that re-running the exact same prompt still bumps its updated_at
-        # timestamp and pushes it to the top of the recent prompts list.
-        return float("NaN")
+        import hashlib
+
+        combined = f"{text}|{prepend_text}|{append_text}|{category}|{tags}"
+        return hashlib.sha256(combined.encode()).hexdigest()
+
+
+class PromptManagerFocused(PromptManager):
+    """The editor-first UI uses the existing encoding and storage contract."""
+
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        inputs = super().INPUT_TYPES()
+        for name in ("prepend_text", "append_text"):
+            kind, options = inputs["optional"][name]
+            inputs["optional"][name] = (
+                kind,
+                {**options, "default": "", "forceInput": True},
+            )
+        return inputs
+
+
+class PromptManagerSplit(PromptManagerFocused):
+    """The persistent library layout shares Focused encoding and storage."""

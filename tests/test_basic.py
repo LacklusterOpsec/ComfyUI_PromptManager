@@ -12,6 +12,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+try:
+    from tests.open_handles import assert_closed  # noqa: E402
+except ImportError:  # discovered with tests/ as the top-level directory
+    from open_handles import assert_closed  # noqa: E402
+
 from database.operations import PromptDatabase
 from utils.hashing import generate_prompt_hash
 from utils.validators import validate_prompt_text, validate_rating, validate_tags
@@ -29,14 +34,13 @@ class TestBasicFunctionality(unittest.TestCase):
 
     def tearDown(self):
         """Clean up test fixtures."""
-        if hasattr(self, "db"):
-            self.db.close()
         # Remove temporary database
-        if os.path.exists(self.temp_db.name):
-            try:
-                os.unlink(self.temp_db.name)
-            except Exception:
-                pass
+        if getattr(self, "db", None) is not None:
+            self.db.close_all()
+        assert_closed(self, self.temp_db.name)
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.temp_db.name + suffix):
+                os.unlink(self.temp_db.name + suffix)
 
     def test_prompt_hash_generation(self):
         """Test prompt hash generation."""
@@ -219,10 +223,14 @@ class TestNodeIntegration(unittest.TestCase):
     def tearDown(self):
         """Clean up test fixtures."""
         # Remove temporary database
-        if os.path.exists(self.temp_db.name):
-            os.unlink(self.temp_db.name)
+        if getattr(self, "db", None) is not None:
+            self.db.close_all()
+        assert_closed(self, self.temp_db.name)
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.temp_db.name + suffix):
+                os.unlink(self.temp_db.name + suffix)
 
-    @patch("prompt_manager_base.get_prompt_database")
+    @patch("prompt_manager_base.PromptDatabase")
     def test_node_encode_function(self, mock_db_class):
         """Test the node's encode function with mocked dependencies."""
         # Mock the database
@@ -239,7 +247,8 @@ class TestNodeIntegration(unittest.TestCase):
         # Import and test the node
         from prompt_manager import PromptManager
 
-        node = PromptManager()
+        with patch("prompt_manager_base.get_image_monitor"):
+            node = PromptManager()
 
         # Test encoding
         result = node.encode_prompt(clip=mock_clip, text="Test prompt", search_text="")

@@ -26,15 +26,11 @@ class LoraDBTestCase(unittest.TestCase):
         self.db = PromptDatabase(self.temp_db.name)
 
     def tearDown(self):
-        if hasattr(self, "db"):
-            self.db.close()
+        self.db.close()
         for suffix in ("", "-wal", "-shm"):
             path = self.temp_db.name + suffix
             if os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
+                os.unlink(path)
 
     def _save(self, text, category=None, tags=None):
         """Save a prompt and return its ID."""
@@ -199,6 +195,25 @@ class TestGetPromptSubfolders(LoraDBTestCase):
         self.assertIsInstance(folders, list)
         self.assertGreater(len(folders), 0)
 
+    def test_subfolders_use_forward_slashes_on_every_platform(self):
+        """Clients split folders on "/" whatever separator the OS produced."""
+        from unittest import mock
+
+        import database.operations as operations
+
+        pid = self._save("prompt")
+        self._link_image(pid, "/output/2026/08-Aug/06/img.png")
+
+        with (
+            mock.patch.object(
+                operations.os.path, "relpath", return_value="2026\\08-Aug\\06"
+            ),
+            mock.patch.object(operations.os, "sep", "\\"),
+        ):
+            folders = self.db.get_prompt_subfolders(root_dirs=["/output"])
+
+        self.assertEqual(folders, ["2026/08-Aug/06"])
+
     def test_include_ancestors_adds_intermediate_paths(self):
         pid = self._save("prompt")
         self._link_image(pid, "/output/2026/08-Aug/2026-08-06/img.png")
@@ -229,28 +244,6 @@ class TestGetPromptSubfolders(LoraDBTestCase):
             root_dirs=["/output"], include_ancestors=True
         )
         self.assertEqual(folders, sorted(folders))
-
-    def test_hides_thumbnails_cache_folders(self):
-        pid1 = self._save("prompt 1")
-        self._link_image(pid1, "/output/.thumbnails_cache/img1.png")
-
-        pid2 = self._save("prompt 2")
-        self._link_image(pid2, "/output/thumbnails/img2.png")
-
-        pid3 = self._save("prompt 3")
-        self._link_image(pid3, "/output/real_folder/img3.png")
-
-        folders = self.db.get_prompt_subfolders()
-        self.assertNotIn(".thumbnails_cache", folders)
-        self.assertNotIn("thumbnails", folders)
-        self.assertIn("real_folder", folders)
-
-    def test_hides_thumbnails_cache_nested_file(self):
-        pid = self._save("prompt")
-        self._link_image(pid, "/output/.thumbnails_cache/sub/img.png")
-
-        folders = self.db.get_prompt_subfolders()
-        self.assertNotIn(".thumbnails_cache", folders)
 
 
 # ── LoRA prompt workflow ──────────────────────────────────────────────

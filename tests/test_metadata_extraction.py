@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -142,6 +143,27 @@ class TestExtractMetadata(MetadataTestCase):
     def test_nonexistent_file_returns_none(self):
         result = self.extractor.extract_metadata("/nonexistent/path/image.png")
         self.assertIsNone(result)
+
+    def test_extracts_metadata_from_image_info(self):
+        workflow = {"nodes": [{"type": "CLIPTextEncode", "inputs": {"text": "hi"}}]}
+        prompt = {"1": {"class_type": "KSampler", "inputs": {}}}
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".webp")
+        tmp.close()
+        self.temp_files.append(tmp.name)
+        image = MagicMock()
+        image.text = {}
+        image.info = {
+            "workflow": json.dumps(workflow).encode("utf-8"),
+            "prompt": json.dumps(prompt),
+        }
+        image.size = (64, 64)
+        image.format = "WEBP"
+        image.mode = "RGB"
+        with patch("utils.metadata_extractor.Image.open") as open_image:
+            open_image.return_value.__enter__.return_value = image
+            result = self.extractor.extract_metadata(tmp.name)
+        self.assertEqual(result["workflow"]["nodes"][0]["type"], "CLIPTextEncode")
+        self.assertIn("prompt", result)
 
 
 class TestGetFileInfo(MetadataTestCase):

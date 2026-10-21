@@ -1,0 +1,344 @@
+import { startCoverage, saveCoverage } from '../../tools/vendor/browser-coverage.mjs';
+import { test, expect } from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+
+test.beforeEach(async ({ request, page, browserName }) => {
+    await startCoverage(page, browserName);
+    await expect(await request.post('/__test__/reset')).toBeOK();
+    page.workflowErrors = [];
+    page.on('pageerror', error => page.workflowErrors.push(error.message));
+    page.on('response', response => {
+        if (response.status() >= 500 && response.url().includes('/prompt_manager/')) {
+            page.workflowErrors.push(`${response.status()} ${response.url()}`);
+        }
+    });
+    await page.addInitScript(() => { localStorage.setItem('pm_update_notice_dismissed', '3.2.0'); });
+});
+
+test.afterEach(async ({ page, browserName }) => {
+    await saveCoverage(page, browserName);
+    expect(page.workflowErrors).toEqual([]);
+});
+
+test('actual gallery form saves a prompt that the admin page can edit and reload', async ({ page, request }) => {
+    await page.goto('/prompt_manager/gallery');
+    await page.locator('#addPromptBtn').click();
+    await page.locator('#addPromptText').fill('Browser saved landscape');
+    await page.locator('#addPromptCategory').fill('Browser tests');
+    await page.locator('#addPromptTagInput').fill('browser-tag');
+    await page.locator('#addPromptTagInput').press('Enter');
+    await page.locator('#saveNewPromptBtn').click();
+    await expect(page.locator('#addPromptModal')).toBeHidden();
+    await page.goto('/prompt_manager/admin');
+    const text = page.locator('.prompt-text').filter({ hasText: 'Browser saved landscape' });
+    await expect(text).toBeVisible();
+    const id = await text.getAttribute('data-id');
+    await page.locator(`[data-action="edit"][data-prompt-id="${id}"]`).click();
+    const editor = page.locator(`.prompt-text[data-id="${id}"]`);
+    await editor.fill('Browser edited portrait');
+    await editor.press('Enter');
+    await expect(page.locator('.prompt-text').filter({ hasText: 'Browser edited portrait' })).toBeVisible();
+    await page.reload();
+    await expect(page.locator('.prompt-text').filter({ hasText: 'Browser edited portrait' })).toBeVisible();
+    const saved = await request.post('/prompt_manager/save', { data: { text: 'Browser saved landscape' } });
+    expect((await saved.json()).prompt_id).not.toBe(Number(id));
+});
+
+test('actual gallery review generates and persists tags for the selected root', async ({ page, request }) => {
+    await page.goto('/prompt_manager/gallery');
+    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(2);
+    await page.locator('#autoTagBtn').click();
+    const generated = page.waitForResponse(response => response.url().endsWith('/prompt_manager/autotag/single'));
+    await page.locator('#startReviewBtn').click();
+    const generation = await generated;
+    expect(generation.request().postDataJSON().root_index).toBe(0);
+    await expect(page.locator('#reviewTagsContainer')).toContainText('generated');
+    const result = page.waitForResponse(response => response.url().endsWith('/prompt_manager/autotag/apply'));
+    await page.locator('#applyReviewBtn').click();
+    expect((await (await result).json()).success).toBe(true);
+    const data = await (await request.get('/prompt_manager/recent?limit=20')).json();
+    expect(data.results.find(prompt => prompt.text === 'Cat portrait').tags).toContain('generated');
+    expect(data.results.find(prompt => prompt.text === 'Dog landscape').tags).not.toContain('generated');
+});
+
+test('actual Tags page reloads the selected filter and opens its image viewer', async ({ page }) => {
+    await page.goto('/prompt_manager/admin#/tags');
+    await page.locator('[data-tag-name="cats"]').click();
+    await expect(page.locator('#tagPromptsGrid')).toContainText('Cat portrait');
+    await page.locator('[data-tag-name="dogs"]').click();
+    await expect(page.locator('#tagPromptsGrid')).toContainText('Dog landscape');
+    await expect(page.locator('#tagPromptsGrid')).not.toContainText('Cat portrait');
+    await page.locator('#tagPromptsGrid img').first().click();
+    await expect(page.locator('.viewer-canvas img')).toBeVisible();
+    await page.locator('.viewer-container').getByRole('button', { name: 'Close', exact: true }).click();
+    await expect(page.locator('.viewer-container')).toHaveCount(0);
+});
+
+test('actual gallery serves colliding filenames and shows the matching prompt', async ({ page }) => {
+    await page.goto('/prompt_manager/gallery');
+    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(2);
+    const images = page.locator('#galleryGrid img[data-original]');
+    const first = await images.nth(0).getAttribute('data-original');
+    const second = await images.nth(1).getAttribute('data-original');
+    expect(first).not.toBe(second);
+    await page.locator('#galleryGrid .image-item[data-image-index="0"]').click();
+    await expect(page.locator('#metadata-content')).toContainText('Cat portrait');
+    await page.keyboard.press('ArrowRight');
+    await expect(page.locator('#metadata-content')).toContainText('Dog landscape');
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#metadata-sidebar')).toHaveCount(0);
+});
+
+test('an edit collision is rejected by the backend and the page restores the original text', async ({ page }) => {
+    await page.goto('/prompt_manager/admin');
+    const original = page.locator('.prompt-text').filter({ hasText: 'Cat portrait' });
+    const id = await original.getAttribute('data-id');
+    await page.locator(`[data-action="edit"][data-prompt-id="${id}"]`).click();
+    const editor = page.locator(`.prompt-text[data-id="${id}"]`);
+    await editor.fill('Dog landscape');
+    const rejected = page.waitForResponse(response => response.request().method() === 'PUT' && response.url().endsWith(`/prompts/${id}`));
+    await editor.press('Enter');
+    expect((await rejected).status()).toBe(409);
+    await expect(editor).toHaveText('Cat portrait');
+    await page.reload();
+    await expect(page.locator(`.prompt-text[data-id="${id}"]`)).toHaveText('Cat portrait');
+});
+
+test('a delayed real Tags response cannot replace a newer selection', async ({ page }) => {
+    let release;
+    const delayed = new Promise(resolve => { release = resolve; });
+    let received;
+    const waiting = new Promise(resolve => { received = resolve; });
+    await page.route('**/prompt_manager/tags/cats/prompts?*', async route => {
+        const response = await route.fetch();
+        received();
+        await delayed;
+        await route.fulfill({ response });
+    });
+    await page.goto('/prompt_manager/admin#/tags');
+    await page.locator('[data-tag-name="cats"]').click();
+    await waiting;
+    await page.locator('[data-tag-name="dogs"]').click();
+    await expect(page.locator('#tagPromptsGrid')).toContainText('Dog landscape');
+    const completed = page.waitForResponse(response => response.url().includes('/tags/cats/prompts?'));
+    release();
+    await completed;
+    await expect(page.locator('#tagPromptsGrid')).not.toContainText('Cat portrait');
+});
+
+test('gallery infinite scroll appends a real backend page while retaining existing cards', async ({ page, request }) => {
+    await expect(await request.post('/__test__/reset', { data: { extra_images: 108 } })).toBeOK();
+    await page.goto('/prompt_manager/gallery');
+    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(100);
+    await page.locator('#settingsBtn').click();
+    await page.locator('#infiniteScrollToggle').check();
+    await page.locator('#saveSettingsBtn').click();
+    await expect(page.locator('#settingsModal')).toBeHidden();
+    const first = page.locator('#galleryGrid .image-item').first();
+    await first.evaluate(element => { element.dataset.preserved = 'yes'; });
+    await page.locator('#galleryScroll').evaluate(element => { element.scrollTop = element.scrollHeight; });
+    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(110);
+    await expect(first).toHaveAttribute('data-preserved', 'yes');
+});
+
+async function promptSnapshot(request) {
+    const response = await request.get('/prompt_manager/recent?limit=100');
+    await expect(response).toBeOK();
+    return (await response.json()).results.map(({ id, text, tags, images }) => ({
+        id, text, tags: [...tags].sort(),
+        images: images.map(image => image.image_path).sort(),
+    })).sort((a, b) => a.id - b.id);
+}
+
+async function downloadBackup(page) {
+    const downloading = page.waitForEvent('download');
+    await page.locator('#backupBtn').click();
+    const download = await downloading;
+    expect(download.suggestedFilename()).toMatch(/^prompts_backup_.*\.db$/);
+    expect(await download.failure()).toBeNull();
+    const chunks = [];
+    for await (const chunk of await download.createReadStream()) chunks.push(chunk);
+    const buffer = Buffer.concat(chunks);
+    expect(buffer.subarray(0, 16).toString()).toBe('SQLite format 3\0');
+    return { name: download.suggestedFilename(), mimeType: 'application/octet-stream', buffer };
+}
+
+async function chooseRestore(page, file) {
+    await page.locator('#restoreBtn').click();
+    await expect(page.locator('#restoreModal')).toBeVisible();
+    await page.locator('#restoreFileInput').setInputFiles(file);
+}
+
+function confirmNextDialog(page, accept, message) {
+    page.once('dialog', async dialog => {
+        expect(dialog.type()).toBe('confirm');
+        expect(dialog.message()).toContain(message);
+        await (accept ? dialog.accept() : dialog.dismiss());
+    });
+}
+
+async function deletePromptButton(page, text) {
+    const prompt = page.locator('.prompt-text').filter({ hasText: text });
+    await expect(prompt).toBeVisible();
+    const id = await prompt.getAttribute('data-id');
+    return page.locator(`[data-action="delete"][data-prompt-id="${id}"]`);
+}
+
+test('downloaded backup restores deleted prompts, tags, and image links through the actual upload form', async ({ page, request }) => {
+    await page.goto('/prompt_manager/admin');
+    await expect(page.locator('.prompt-text')).toHaveCount(2);
+    const before = await promptSnapshot(request);
+    expect(before.map(prompt => prompt.tags)).toEqual([['cats'], ['dogs']]);
+    expect(before.every(prompt => prompt.images.length === 1)).toBe(true);
+    const backup = await downloadBackup(page);
+    const button = await deletePromptButton(page, 'Cat portrait');
+    confirmNextDialog(page, true, 'delete this prompt');
+    await button.click();
+    await expect(page.locator('.prompt-text')).toHaveCount(1);
+    await expect(await request.post('/prompt_manager/save', { data: { text: 'Added after backup', tags: ['temporary'] } })).toBeOK();
+    expect(await promptSnapshot(request)).not.toEqual(before);
+    await chooseRestore(page, backup);
+    confirmNextDialog(page, true, backup.name);
+    const restored = page.waitForResponse(response => response.url().endsWith('/prompt_manager/restore'));
+    await page.locator('#confirmRestore').click();
+    const response = await restored;
+    expect(response.ok()).toBe(true);
+    expect(await response.json()).toMatchObject({ success: true, prompt_count: 2, backup_created: expect.any(String) });
+    await expect(page.locator('#restoreModal')).toBeHidden();
+    await expect(page.locator('.prompt-text')).toHaveCount(2);
+    await page.reload();
+    await expect(page.locator('.prompt-text').filter({ hasText: 'Cat portrait' })).toBeVisible();
+    await expect(page.locator('.prompt-text').filter({ hasText: 'Added after backup' })).toHaveCount(0);
+    expect(await promptSnapshot(request)).toEqual(before);
+    await page.goto('/prompt_manager/admin#/tags');
+    await page.locator('[data-tag-name="cats"]').click();
+    await expect(page.locator('#tagPromptsGrid')).toContainText('Cat portrait');
+    await page.locator('#tagPromptsGrid img').first().click();
+    await expect(page.locator('.viewer-canvas img')).toBeVisible();
+    await expect.poll(() => page.locator('.viewer-canvas img').evaluate(image => image.complete && image.naturalWidth > 0)).toBe(true);
+});
+
+test('restore validation and cancellation preserve live data and allow a valid retry', async ({ page, request }) => {
+    await page.goto('/prompt_manager/admin');
+    const before = await promptSnapshot(request);
+    const backup = await downloadBackup(page);
+    let uploads = 0;
+    page.on('request', request => { if (request.url().endsWith('/prompt_manager/restore')) uploads++; });
+    await page.locator('#restoreBtn').click();
+    await page.locator('#confirmRestore').click();
+    await expect(page.getByText('Please select a database file to restore', { exact: true })).toBeVisible();
+    await page.locator('#restoreFileInput').setInputFiles({ ...backup, name: 'backup.txt' });
+    await page.locator('#confirmRestore').click();
+    await expect(page.getByText('Please select a valid .db file', { exact: true })).toBeVisible();
+    expect(uploads).toBe(0);
+    await page.locator('#restoreFileInput').setInputFiles(backup);
+    confirmNextDialog(page, false, 'replace your current database');
+    await page.locator('#confirmRestore').click();
+    await expect(page.locator('#restoreModal')).toBeVisible();
+    expect(uploads).toBe(0);
+    await page.locator('#restoreFileInput').setInputFiles({ name: 'corrupt.db', mimeType: 'application/octet-stream', buffer: Buffer.from('not a SQLite database') });
+    confirmNextDialog(page, true, 'corrupt.db');
+    const rejected = page.waitForResponse(response => response.url().endsWith('/prompt_manager/restore'));
+    await page.locator('#confirmRestore').click();
+    expect((await rejected).status()).toBe(400);
+    await expect(page.getByText(/Restore failed:/)).toBeVisible();
+    await expect(page.locator('#restoreModal')).toBeVisible();
+    await expect(page.locator('#confirmRestore')).toBeEnabled();
+    expect(await promptSnapshot(request)).toEqual(before);
+    await page.locator('#restoreFileInput').setInputFiles(backup);
+    confirmNextDialog(page, true, backup.name);
+    await page.locator('#confirmRestore').click();
+    await expect(page.locator('#restoreModal')).toBeHidden();
+    expect(await promptSnapshot(request)).toEqual(before);
+});
+
+test('backup and restore recover from interrupted network requests without losing data', async ({ page, request }) => {
+    await page.goto('/prompt_manager/admin');
+    const before = await promptSnapshot(request);
+    await page.route('**/prompt_manager/backup', route => route.abort('failed'), { times: 1 });
+    await page.locator('#backupBtn').click();
+    await expect(page.getByText(/Backup failed:/)).toBeVisible();
+    const backup = await downloadBackup(page);
+    await chooseRestore(page, backup);
+    await page.route('**/prompt_manager/restore', route => route.abort('failed'), { times: 1 });
+    confirmNextDialog(page, true, backup.name);
+    await page.locator('#confirmRestore').click();
+    await expect(page.getByText(/Restore failed:/)).toBeVisible();
+    await expect(page.locator('#confirmRestore')).toBeEnabled();
+    await expect(page.locator('#restoreModal')).toBeVisible();
+    expect(await promptSnapshot(request)).toEqual(before);
+    confirmNextDialog(page, true, backup.name);
+    await page.locator('#confirmRestore').click();
+    await expect(page.locator('#restoreModal')).toBeHidden();
+    expect(await promptSnapshot(request)).toEqual(before);
+});
+
+test('prompt deletion requires confirmation and can retry after a network failure', async ({ page, request }) => {
+    await page.goto('/prompt_manager/admin');
+    const before = await promptSnapshot(request);
+    const button = await deletePromptButton(page, 'Cat portrait');
+    let deletes = 0;
+    page.on('request', request => { if (request.method() === 'DELETE') deletes++; });
+    confirmNextDialog(page, false, 'delete this prompt');
+    await button.click();
+    expect(deletes).toBe(0);
+    expect(await promptSnapshot(request)).toEqual(before);
+    await page.route('**/prompt_manager/delete/*', route => route.abort('failed'), { times: 1 });
+    confirmNextDialog(page, true, 'delete this prompt');
+    await button.click();
+    await expect(page.getByText('Failed to delete prompt', { exact: true })).toBeVisible();
+    expect(await promptSnapshot(request)).toEqual(before);
+    confirmNextDialog(page, true, 'delete this prompt');
+    await button.click();
+    await expect(page.locator('.prompt-text')).toHaveCount(1);
+    await page.reload();
+    await expect(page.locator('.prompt-text')).toHaveCount(1);
+    expect(await promptSnapshot(request)).toEqual(before.filter(prompt => prompt.text !== 'Cat portrait'));
+    await page.goto('/prompt_manager/gallery');
+    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(2);
+    for (const url of await page.locator('#galleryGrid img[data-original]').evaluateAll(images => images.map(image => image.dataset.original))) {
+        await expect(await request.get(url)).toBeOK();
+    }
+});
+
+test('duplicate cleanup cancels safely and deletes only the selected file after a retry', async ({ page, request }) => {
+    await expect(await request.post('/__test__/reset', { data: { extra_images: 2 } })).toBeOK();
+    await page.goto('/prompt_manager/gallery');
+    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(4);
+    const originals = await page.locator('#galleryGrid img[data-original]').evaluateAll(images => images.map(image => image.dataset.original));
+    await page.locator('#settingsBtn').click();
+    await page.locator('#scanDuplicatesBtn').click();
+    await expect(page.locator('#duplicatesCount')).toHaveText('1');
+    const candidates = page.locator('.duplicate-checkbox');
+    await expect(candidates).toHaveCount(2);
+    const selected = await candidates.first().getAttribute('data-image-path');
+    const retained = await candidates.last().getAttribute('data-image-path');
+    const serve = path => `/prompt_manager/images/serve/${path.split(/[\\/]/).map(encodeURIComponent).join('/')}`;
+    await candidates.first().check();
+    let deletes = 0;
+    page.on('request', request => { if (request.url().endsWith('/delete_duplicate_images')) deletes++; });
+    confirmNextDialog(page, false, 'permanently delete 1 duplicate image files');
+    await page.locator('#removeDuplicatesBtn').click();
+    expect(deletes).toBe(0);
+    await expect(await request.get(serve(selected))).toBeOK();
+    await page.route('**/prompt_manager/delete_duplicate_images', route => route.abort('failed'), { times: 1 });
+    confirmNextDialog(page, true, 'permanently delete 1 duplicate image files');
+    await page.locator('#removeDuplicatesBtn').click();
+    await expect(page.getByText('Failed to delete duplicate images', { exact: true })).toBeVisible();
+    await expect(page.locator('#removeDuplicatesBtn')).toBeEnabled();
+    await expect(await request.get(serve(selected))).toBeOK();
+    confirmNextDialog(page, true, 'permanently delete 1 duplicate image files');
+    const deleted = page.waitForResponse(response => response.url().endsWith('/delete_duplicate_images'));
+    await page.locator('#removeDuplicatesBtn').click();
+    expect((await (await deleted).json())).toMatchObject({ success: true, deleted_count: 1, failed_count: 0 });
+    await expect(page.locator('#duplicatesModal')).toBeHidden();
+    expect((await request.get(serve(selected))).status()).toBe(404);
+    await expect(await request.get(serve(retained))).toBeOK();
+    await page.reload();
+    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(3);
+    const remaining = await page.locator('#galleryGrid img[data-original]').evaluateAll(images => images.map(image => image.dataset.original));
+    expect(remaining).toHaveLength(originals.length - 1);
+    for (const url of remaining) {
+        expect(originals).toContain(url);
+        await expect(await request.get(url)).toBeOK();
+    }
+});

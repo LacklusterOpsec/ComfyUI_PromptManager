@@ -13,11 +13,19 @@ import collections
 import logging
 import logging.handlers
 import os
-import json
 import threading
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+
+
+class _OwnedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Keep a retired owned sink closed when an in-flight record resumes."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Handler.handle and FileHandler.close hold the same handler lock.
+        if not self._closed:
+            super().emit(record)
 
 
 class PromptManagerLogger:
@@ -86,27 +94,34 @@ class PromptManagerLogger:
         # Main logger
         self.logger = logging.getLogger("prompt_manager")
         self.logger.setLevel(getattr(logging, self.config["level"]))
+        # ComfyUI's root handler would print every record a second time.
+        self.logger.propagate = False
 
-        # Clear existing handlers
+        # External handlers are detached but retain their caller-owned resources.
         for handler in self.logger.handlers[:]:
             self.logger.removeHandler(handler)
+            if getattr(handler, "_prompt_manager_owned", False) is True:
+                handler.close()
 
         # Custom formatter
         formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s",
+            "%(asctime)s - %(name)s - %(levelname)s - "
+            "%(filename)s:%(lineno)d - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
         # Console handler
         if self.config["console_logging"]:
             console_handler = logging.StreamHandler()
+            console_handler.setLevel(self._console_level())
             console_handler.setFormatter(formatter)
+            console_handler._prompt_manager_owned = True
             self.logger.addHandler(console_handler)
 
         # File handler with rotation and safe encoding for Windows
         if self.config["file_logging"]:
             log_file = self.log_dir / "prompt_manager.log"
-            file_handler = logging.handlers.RotatingFileHandler(
+            file_handler = _OwnedRotatingFileHandler(
                 log_file,
                 maxBytes=self.config["max_file_size"],
                 backupCount=self.config["backup_count"],
@@ -114,15 +129,26 @@ class PromptManagerLogger:
                 errors="replace",  # Replace problematic characters instead of crashing
             )
             file_handler.setFormatter(formatter)
+            file_handler._prompt_manager_owned = True
             self.logger.addHandler(file_handler)
 
         # Memory handler for web viewer
         memory_handler = MemoryBufferHandler(self)
         memory_handler.setFormatter(formatter)
+        memory_handler._prompt_manager_owned = True
         self.logger.addHandler(memory_handler)
 
         # Component-specific loggers
         self._setup_component_loggers()
+
+    def _console_level(self) -> int:
+        """Console threshold: everything at DEBUG, otherwise warnings only.
+
+        INFO still reaches the log file and the web log viewer.
+        """
+        if str(self.config["level"]).upper() == "DEBUG":
+            return logging.DEBUG
+        return logging.WARNING
 
     def _setup_component_loggers(self):
         """Set up loggers for specific components.
@@ -270,6 +296,36 @@ class PromptManagerLogger:
             self.logger.error(f"Error reading log file {filename}: {e}")
             raise
 
+    def _truncate_main_log(self, log_file: Path) -> None:
+        """Empty the main log through the handler that writes to it.
+
+        Opening the file a second time with ``"w"`` leaves the handler's own
+        stream at its old offset: later records land past the new end
+        (zero-padded on POSIX) and ``tell()`` keeps reporting the old size, so
+        the next record rolls the file over. Truncating the handler's stream
+        keeps position and size in step.
+        """
+        handled = False
+        target = os.path.normcase(os.path.realpath(str(log_file)))
+        for handler in self.logger.handlers:
+            stream = getattr(handler, "stream", None)
+            base = getattr(handler, "baseFilename", None)
+            if stream is None or base is None:
+                continue
+            if os.path.normcase(os.path.realpath(base)) != target:
+                continue
+            handler.acquire()
+            try:
+                stream.flush()
+                stream.seek(0)
+                stream.truncate()
+                handled = True
+            finally:
+                handler.release()
+        if not handled:
+            with open(log_file, "w", encoding="utf-8", errors="replace") as f:
+                f.write("")
+
     def truncate_logs(self) -> Dict[str, Any]:
         """Truncate all log files.
 
@@ -283,27 +339,33 @@ class PromptManagerLogger:
         """
         results = {"truncated": [], "errors": []}
 
-        for log_file in self.log_dir.glob("prompt_manager.log*"):
+        # Collect first and stay silent until every file has been handled:
+        # a log line written mid-way can roll the just-emptied main log over
+        # and recreate the backup that was deleted a moment earlier.
+        log_files = sorted(self.log_dir.glob("prompt_manager.log*"))
+        for log_file in log_files:
             try:
                 if log_file.name == "prompt_manager.log":
-                    # For main log file, just clear it with safe encoding
-                    with open(log_file, "w", encoding="utf-8", errors="replace") as f:
-                        f.write("")
+                    self._truncate_main_log(log_file)
                 else:
                     # For rotated files, delete them
                     log_file.unlink()
 
                 results["truncated"].append(log_file.name)
-                self.logger.info(f"Truncated log file: {log_file.name}")
 
             except Exception as e:
-                error_msg = f"Failed to truncate {log_file.name}: {str(e)}"
-                results["errors"].append(error_msg)
-                self.logger.error(error_msg)
+                results["errors"].append(
+                    f"Failed to truncate {log_file.name}: {str(e)}"
+                )
 
         # Clear memory buffer
         with self._buffer_lock:
             self._log_buffer.clear()
+
+        if results["truncated"]:
+            self.logger.info("Truncated log files: %s", ", ".join(results["truncated"]))
+        for error_msg in results["errors"]:
+            self.logger.error(error_msg)
 
         return results
 
@@ -326,6 +388,10 @@ class PromptManagerLogger:
                 if logger_name.startswith("prompt_manager"):
                     logger = logging.getLogger(logger_name)
                     logger.setLevel(level)
+
+            for handler in self.logger.handlers:
+                if type(handler) is logging.StreamHandler:
+                    handler.setLevel(self._console_level())
 
         # Re-setup loggers if handlers changed
         if any(

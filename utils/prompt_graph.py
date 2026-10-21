@@ -9,16 +9,40 @@ link-tracing rules of web/js/comfy-metadata.js.
 """
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-PROMPT_MANAGER_TYPES = frozenset({"PromptManager", "PromptManagerText"})
+PROMPT_MANAGER_TYPES = frozenset(
+    {
+        "PromptManager",
+        "PromptManagerText",
+        "PromptManagerFocused",
+        "PromptManagerSplit",
+        "PromptManagerPair",
+    }
+)
 
 # Upper bound on nodes expanded per graph; queued and embedded graphs are untrusted
 MAX_VISITS = 500
+# Longest text resolve_text will build; StringConcatenate chains can double
+# the text at every level, so anything larger is treated as unknowable
+MAX_TEXT_LENGTH = 100_000
+# Deepest chain of string nodes resolve_text follows (recursion stays bounded)
+MAX_DEPTH = 64
 
 # Inputs that carry positive conditioning or prompt text towards a sampler
 _CONDITIONING_KEY = re.compile(r"^conditioning(_\w+)?$")
 _TEXT_KEY = re.compile(r"^(text|string|prompt)(_?[a-z0-9]+)?$", re.IGNORECASE)
+# Input names that carry a negative prompt (text_negative, neg_text, negative_prompt)
+_NEGATIVE_KEY = re.compile(r"(^|_)neg(ative)?($|_)", re.IGNORECASE)
+
+
+def follows_input(key: Any) -> bool:
+    """Whether an input name carries positive conditioning or prompt text."""
+    if not isinstance(key, str) or _NEGATIVE_KEY.search(key):
+        return False
+    return key == "positive" or bool(
+        _CONDITIONING_KEY.match(key) or _TEXT_KEY.match(key)
+    )
 
 
 def _is_link(value: Any) -> bool:
@@ -36,19 +60,26 @@ def _inputs(node: Any) -> Dict[str, Any]:
 
 
 def _positive_roots(graph: Dict[str, Any]) -> List[Any]:
-    """Links into samplers' positive inputs (KSampler, CFGGuider, BasicGuider, ...)."""
+    """Links into samplers' positive inputs (KSampler, CFGGuider, BasicGuider, ...).
+
+    A sampler is a node taking a model plus positive/negative conditioning, or a
+    guider taking a model plus conditioning. Nodes named like a sampler also count
+    without a model link, so a negative-only graph is never mistaken for one with
+    no sampler at all.
+    """
     roots = []
     for node in graph.values():
-        inputs = _inputs(node)
-        if not _is_link(inputs.get("model")):
+        if not isinstance(node, dict):
             continue
+        inputs = _inputs(node)
+        class_name = str(node.get("class_type", "")).lower()
+        has_model = _is_link(inputs.get("model"))
         if _is_link(inputs.get("positive")) and _is_link(inputs.get("negative")):
-            roots.append(inputs["positive"])
-        elif (
-            _is_link(inputs.get("conditioning"))
-            and "guider" in str(node.get("class_type", "")).lower()
-        ):
-            roots.append(inputs["conditioning"])
+            if has_model or "sampler" in class_name:
+                roots.append(inputs["positive"])
+        elif has_model and _is_link(inputs.get("conditioning")):
+            if "guider" in class_name:
+                roots.append(inputs["conditioning"])
     return roots
 
 
@@ -58,46 +89,86 @@ def _upstream_links(inputs: Dict[str, Any]) -> List[Any]:
     for key, value in inputs.items():
         if not _is_link(value):
             continue
-        if key == "positive" or _CONDITIONING_KEY.match(key) or _TEXT_KEY.match(key):
+        if follows_input(key):
             links.append(value)
     return links
 
 
-def positive_prompt_nodes(graph: Any) -> List[str]:
-    """Ids of PromptManager/PromptManagerText nodes that feed a positive input.
+def has_sampler(graph: Any) -> bool:
+    """Whether the graph contains a node recognised as a sampler or guider."""
+    return isinstance(graph, dict) and bool(_positive_roots(graph))
 
-    Ordered by discovery, each id once. Malformed graphs yield an empty list.
-    """
+
+def positive_prompt_components(graph: Any) -> List[Tuple[str, str]]:
+    """Node/input identities reaching actual sampler positive wires."""
     if not isinstance(graph, dict):
         return []
 
-    found: List[str] = []
+    found: List[Tuple[str, str]] = []
     seen = set()
     stack = list(reversed(_positive_roots(graph)))
     while stack and len(seen) < MAX_VISITS:
-        node_id = str(stack.pop()[0])
-        if node_id in seen:
+        link = stack.pop()
+        node_id, slot = str(link[0]), link[1]
+        if (node_id, slot) in seen:
             continue
-        seen.add(node_id)
+        seen.add((node_id, slot))
         node = graph.get(node_id)
         if not isinstance(node, dict):
             continue
         if node.get("class_type") in PROMPT_MANAGER_TYPES:
-            found.append(node_id)
+            field = "text"
+            if node.get("class_type") == "PromptManagerPair":
+                field = {
+                    0: "text",
+                    1: "negative_text",
+                    2: "text",
+                    3: "negative_text",
+                }.get(slot)
+                if field is None:
+                    continue
+            identity = (node_id, field)
+            if identity not in found:
+                found.append(identity)
             continue
         stack.extend(reversed(_upstream_links(_inputs(node))))
     return found
 
 
+def positive_prompt_nodes(graph: Any) -> List[str]:
+    """Nodes whose main editor reaches a sampler's positive input."""
+    return list(
+        dict.fromkeys(
+            node_id
+            for node_id, field in positive_prompt_components(graph)
+            if field == "text"
+        )
+    )
+
+
+def run_prompt_components(graph: Any) -> List[Tuple[str, str]]:
+    """Actual positive components, retaining standalone main-editor fallback."""
+    components = positive_prompt_components(graph)
+    if components or not isinstance(graph, dict) or has_sampler(graph):
+        return components
+    return [
+        (str(node_id), "text")
+        for node_id, node in graph.items()
+        if isinstance(node, dict) and node.get("class_type") in PROMPT_MANAGER_TYPES
+    ]
+
+
 def run_prompt_nodes(graph: Any) -> List[str]:
     """Prompt nodes that represent a run: the positive ones, if any can be found.
 
-    When no PromptManager node can be traced to a positive input (an unrecognised
-    custom sampler, say), every PromptManager node counts, as before 3.2.4, so an
-    exotic workflow never silently loses usage counting or image linking.
+    When the graph has no recognisable sampler (an unrecognised custom sampler,
+    say), every PromptManager node counts, as before 3.2.4, so an exotic workflow
+    never silently loses usage counting or image linking. When a sampler exists
+    and no PromptManager node feeds its positive input, nothing counts: the only
+    PromptManager nodes are negative prompts.
     """
     positive = positive_prompt_nodes(graph)
-    if positive or not isinstance(graph, dict):
+    if positive or not isinstance(graph, dict) or has_sampler(graph):
         return positive
     return [
         str(node_id)
@@ -109,7 +180,8 @@ def run_prompt_nodes(graph: Any) -> List[str]:
 def _join_text_inputs(
     inputs: Dict[str, Any], keys: List[str], resolve
 ) -> Optional[str]:
-    """WAS-style join: resolve each key, optionally strip, skip empty, join by delimiter."""
+    """WAS-style join: resolve each key, optionally strip, skip empty, join by
+    delimiter."""
     delimiter = inputs.get("delimiter", " ")
     if not isinstance(delimiter, str):
         return None
@@ -155,24 +227,107 @@ def resolve_text(graph: Any, node_id: str) -> Optional[str]:
     """
     if not isinstance(graph, dict):
         return None
-    seen = set()
+    # Cycle detection is scoped to the current path so a node read by two
+    # branches (a diamond, or StringConcatenate(string_a=X, string_b=X))
+    # resolves in both. Each node's text is computed once and memoised, so a
+    # chain of diamonds costs one expansion per node rather than one per path,
+    # and the shared visit budget bounds total work whatever the shape. A node
+    # that fails because of a cycle fails from every path (the cycle is in the
+    # graph, not in the walk), so memoising None is sound.
+    path = {str(node_id)}
+    memo: Dict[str, Optional[str]] = {}
+    budget = [MAX_VISITS]
 
     def resolve(value: Any) -> Optional[str]:
         if isinstance(value, str):
-            return value
-        if not _is_link(value) or len(seen) >= MAX_VISITS:
+            return value if len(value) <= MAX_TEXT_LENGTH else None
+        if not _is_link(value):
             return None
         source_id = str(value[0])
-        if source_id in seen:
+        if source_id in memo:
+            return memo[source_id]
+        if source_id in path or budget[0] <= 0 or len(path) > MAX_DEPTH:
             return None
-        seen.add(source_id)
+        budget[0] -= 1
         source = graph.get(source_id)
         if not isinstance(source, dict):
+            memo[source_id] = None
             return None
-        return _resolve_string_node(
-            str(source.get("class_type", "")), _inputs(source), resolve
-        )
+        path.add(source_id)
+        try:
+            text = _resolve_string_node(
+                str(source.get("class_type", "")), _inputs(source), resolve
+            )
+        finally:
+            path.discard(source_id)
+        if isinstance(text, str) and len(text) > MAX_TEXT_LENGTH:
+            text = None
+        memo[source_id] = text
+        return text
 
-    seen.add(str(node_id))
     text = resolve(_inputs(graph.get(str(node_id))).get("text"))
     return text.strip() if isinstance(text, str) and text.strip() else None
+
+
+def intrinsic_pair_nodes(graph: Any) -> List[str]:
+    """Paired nodes whose matching outputs feed the same sampler, or standalone."""
+    if not isinstance(graph, dict) or len(graph) > MAX_VISITS:
+        return []
+    if not has_sampler(graph):
+        return [
+            str(key)
+            for key, value in graph.items()
+            if isinstance(value, dict)
+            and value.get("class_type") == "PromptManagerPair"
+        ]
+
+    def origin(link: Any, role: str, kind: str = "conditioning") -> Optional[str]:
+        seen = set()
+        while _is_link(link) and len(seen) < MAX_DEPTH:
+            node_id, slot = str(link[0]), link[1]
+            if (node_id, slot, kind) in seen:
+                return None
+            seen.add((node_id, slot, kind))
+            node = graph.get(node_id)
+            if not isinstance(node, dict):
+                return None
+            name, inputs = node.get("class_type"), _inputs(node)
+            if name == "PromptManagerPair":
+                expected = {
+                    ("positive", "conditioning"): 0,
+                    ("negative", "conditioning"): 1,
+                    ("positive", "string"): 2,
+                    ("negative", "string"): 3,
+                }
+                return node_id if slot == expected[(role, kind)] else None
+            if name == "CLIPTextEncode" and slot == 0 and kind == "conditioning":
+                link, kind = inputs.get("text"), "string"
+            elif name == "Reroute" and slot == 0:
+                keys = [key for key in ("value", "input", "in") if key in inputs]
+                if len(keys) != 1:
+                    return None
+                link = inputs[keys[0]]
+            else:
+                return None
+        return None
+
+    found = []
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = _inputs(node)
+        if not _is_link(inputs.get("positive")) or not _is_link(inputs.get("negative")):
+            continue
+        if (
+            not _is_link(inputs.get("model"))
+            and "sampler" not in str(node.get("class_type", "")).lower()
+        ):
+            continue
+        positive = origin(inputs["positive"], "positive")
+        if (
+            positive
+            and positive == origin(inputs["negative"], "negative")
+            and positive not in found
+        ):
+            found.append(positive)
+    return found

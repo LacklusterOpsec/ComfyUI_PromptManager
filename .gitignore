@@ -9,6 +9,12 @@ AGENTS.md
 CLAUDE.md
 
 # Local files
+# Local PromptManager state (config.json holds API keys and machine paths)
+config.json
+resume.sh
+*.backup_*
+promptmanager_logs/
+custom_data/
 data/
 docs/
 logs/
@@ -17,12 +23,6 @@ prompts.db
 prompts.db-shm
 prompts.db-wal
 prompts.db-journal
-prompts.db.backup_*
-prompts.db.prebackfill.bak
-
-# Local runtime state / secrets (may contain API keys)
-config.json
-.tracking
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -200,3 +200,14 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Maintainer-only JavaScript tooling and browser test artifacts
+node_modules/
+test-results/
+playwright-report/
+
+# Combined frontend coverage reports
+coverage/
+
+# Disposable upstream checkout for real-host CI
+.ci-comfyui/

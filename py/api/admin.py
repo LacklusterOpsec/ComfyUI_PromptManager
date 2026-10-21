@@ -1,0 +1,1616 @@
+"""Admin and maintenance API routes for PromptManager."""
+
+import asyncio
+import contextlib
+from contextlib import closing
+import datetime
+import hashlib
+import json
+import os
+import sqlite3
+import tempfile
+import threading
+from pathlib import Path
+
+from aiohttp import web
+
+from .prompts import thumbnail_url_for
+from .scan_job import ScanJob
+
+try:
+    from ...utils.parallel import map_parallel
+    from ...utils.validators import validate_result_timeout, validate_worker_threads
+except ImportError:
+    from utils.parallel import map_parallel
+    from utils.validators import validate_result_timeout, validate_worker_threads
+
+try:
+    from ...database.operations import PromptDatabase
+    from ...database.pair_ingestion import ingest_resolved_pair
+    from ...utils.generation_params import (
+        PLACEHOLDERS,
+        GenerationParamsError,
+        extract_generation_params,
+        parse_js_json,
+    )
+    from ...utils.prompt_pair_resolver import resolve_prompt_pair
+except ImportError:
+    from database.operations import PromptDatabase
+    from database.pair_ingestion import ingest_resolved_pair
+    from utils.generation_params import (
+        PLACEHOLDERS,
+        GenerationParamsError,
+        extract_generation_params,
+        parse_js_json,
+    )
+    from utils.prompt_pair_resolver import resolve_prompt_pair
+
+
+try:
+    from ...utils.hashing import generate_prompt_hash
+except ImportError:
+    from utils.hashing import generate_prompt_hash
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff")
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".wmv")
+SCAN_BATCH_SIZE = 50  # Files per executor call during the output scan
+MAX_SAFETY_BACKUPS = 10  # '<db>.backup_*' files kept next to the live database
+MAX_SCAN_FILES = 50_000  # Upper bound on media files one scan will look at
+SCAN_COUNT_KEYS = (
+    "processed",
+    "found",
+    "added",
+    "linked",
+    "enriched",
+    "unchanged",
+    "ambiguous",
+    "unresolved",
+    "conflict",
+    "failed",
+    "pairs_added",
+    "pair_links_added",
+)
+MAX_SCAN_DEPTH = 12  # Directory levels below an output root that are scanned
+# Files the duplicate cleaner may delete: everything the scan reports, plus
+# the common single-f TIFF spelling. Anything else inside the output
+# directory (databases, scripts, notes) is never a "duplicate image".
+DELETABLE_MEDIA_EXTENSIONS = frozenset(IMAGE_EXTENSIONS + VIDEO_EXTENSIONS + (".tif",))
+
+
+def _collect_media_files(output_dirs, extensions):
+    """Media files under ``output_dirs`` (blocking), bounded and symlink-free.
+
+    Walks each root without following symlinks, skips ``thumbnails``
+    directories and symlinked files, never descends more than MAX_SCAN_DEPTH
+    levels and stops after MAX_SCAN_FILES files in total. Extensions match
+    case-insensitively and each path is listed once.
+    """
+    wanted = {ext.lower() for ext in extensions}
+    found = []
+    seen = set()
+    for output_dir in output_dirs:
+        root = os.path.abspath(str(output_dir))
+        if not os.path.isdir(root):
+            continue
+        for current, dirnames, filenames in os.walk(root, followlinks=False):
+            depth = 0 if current == root else len(Path(current).relative_to(root).parts)
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d != "thumbnails"
+                and depth < MAX_SCAN_DEPTH
+                and not os.path.islink(os.path.join(current, d))
+            )
+            for name in sorted(filenames):
+                if os.path.splitext(name)[1].lower() not in wanted:
+                    continue
+                full = os.path.join(current, name)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                key = os.path.normcase(full)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(Path(full))
+                if len(found) >= MAX_SCAN_FILES:
+                    return found
+    return found
+
+
+def _thumbnail_rel_path(rel_path, thumbnail_ext):
+    """Relative path of the thumbnail the gallery would generate for ``rel_path``."""
+    return f"thumbnails/{rel_path.with_suffix('').as_posix()}_thumb{thumbnail_ext}"
+
+
+async def _read_json(request):
+    """Parse a JSON object body through the package's capped reader.
+
+    Returns:
+        (data, None) on success, or (None, response) carrying a 400/413 reply.
+    """
+    from . import _read_json_body
+
+    return await _read_json_body(request)
+
+
+def _sse(payload):
+    """Encode one server-sent event."""
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _inspect_restore_upload(path):
+    """Checks on a restore upload beyond PromptModel.verify_database_file.
+
+    Opens the file read-only with ``PRAGMA trusted_schema=OFF`` (so nothing
+    in the schema runs while it is inspected) and refuses databases that
+    carry triggers or views: the prompts database never needs either, and a
+    crafted upload could use them to run SQL against the live data later.
+
+    Returns:
+        None when acceptable, otherwise a human-readable reason (blocking).
+    """
+    uri = Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as e:
+        return f"Invalid SQLite database: {e}"
+    try:
+        conn.execute("PRAGMA trusted_schema=OFF")
+        rows = conn.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE type IN ('trigger', 'view') ORDER BY type, name"
+        ).fetchall()
+    except sqlite3.Error as e:
+        return f"Invalid SQLite database: {e}"
+    finally:
+        conn.close()
+    if rows:
+        listed = ", ".join(f"{kind} {name}" for kind, name in rows[:5])
+        return (
+            "Database contains triggers or views, which a prompts database "
+            f"never has: {listed}"
+        )
+    return None
+
+
+def _prune_safety_backups(db_path, keep=None):
+    """Delete the oldest ``<db_path>.backup_*`` files beyond ``keep`` (blocking).
+
+    Returns the paths removed. Errors deleting a file are ignored so a
+    stubborn old backup never fails the restore that just succeeded.
+    """
+    if keep is None:
+        keep = MAX_SAFETY_BACKUPS
+    db_path = os.path.abspath(db_path)
+    directory = os.path.dirname(db_path)
+    prefix = os.path.basename(db_path) + ".backup_"
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    candidates = [
+        os.path.join(directory, name)
+        for name in names
+        if name.startswith(prefix) and os.path.isfile(os.path.join(directory, name))
+    ]
+    candidates.sort(key=lambda p: (os.path.getmtime(p), p))
+    excess = candidates[: max(0, len(candidates) - keep)]
+    removed = []
+    for path in excess:
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError:
+            continue
+    return removed
+
+
+def _public_helpers():
+    """The package's public-path helpers (imported lazily to avoid a cycle)."""
+    from . import _public_error, _public_path
+
+    return _public_path, _public_error
+
+
+def _diagnose_database(db_path):
+    """Row counts straight from the database file (small blocking query)."""
+    _public_path, _public_error = _public_helpers()
+    if not os.path.exists(db_path):
+        return {
+            "status": "error",
+            "message": f"Database file not found: {os.path.basename(db_path)}",
+        }
+    try:
+        with closing(sqlite3.connect(db_path)) as conn:
+            prompt_count = conn.execute("SELECT COUNT(*) FROM prompts").fetchone()[0]
+            has_images_table = (
+                conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='generated_images'"
+                ).fetchone()
+                is not None
+            )
+            image_count = 0
+            if has_images_table:
+                image_count = conn.execute(
+                    "SELECT COUNT(*) FROM generated_images"
+                ).fetchone()[0]
+        return {
+            "status": "ok",
+            "prompt_count": prompt_count,
+            "has_images_table": has_images_table,
+            "image_count": image_count,
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Database error: {_public_error(e)}"}
+
+
+def _diagnose_dependencies():
+    """Presence of the optional runtime dependencies."""
+    dependencies = {"sqlite3": True}
+    for name in ("watchdog", "PIL"):
+        try:
+            __import__(name)
+            dependencies[name] = True
+        except ImportError:
+            dependencies[name] = False
+    return {
+        "status": "ok" if all(dependencies.values()) else "error",
+        "dependencies": dependencies,
+    }
+
+
+def _diagnose_output_dirs(configured_dirs):
+    """Configured gallery roots, ComfyUI's output dir, or relative fallbacks."""
+    _public_path, _ = _public_helpers()
+    candidates = list(configured_dirs)
+    try:
+        import folder_paths
+
+        candidates.append(folder_paths.get_output_directory())
+    except ImportError:
+        pass
+
+    output_dirs = []
+    seen = set()
+
+    def add(path):
+        # One entry per directory: resolve links and fold case (Windows)
+        real = os.path.realpath(path)
+        key = os.path.normcase(real)
+        if os.path.exists(real) and key not in seen:
+            seen.add(key)
+            output_dirs.append(real)
+
+    for candidate in candidates:
+        if candidate:
+            add(candidate)
+
+    if not output_dirs:
+        for rel in ("output", "../output", "../../output"):
+            add(rel)
+
+    return {
+        "status": "ok" if output_dirs else "warning",
+        "output_dirs": [_public_path(d) for d in output_dirs],
+    }
+
+
+def _diagnose_image_monitor():
+    """Status of the running image monitor, with public directory names."""
+    _public_path, _public_error = _public_helpers()
+    try:
+        monitor = _current_image_monitor()
+        if monitor is None:
+            return {"status": "error", "message": "Image monitor not initialized"}
+        status = dict(monitor.get_status())
+        status["monitored_directories"] = [
+            _public_path(d) for d in status.get("monitored_directories", [])
+        ]
+        return {"status": "ok" if status.get("observer_alive") else "error", **status}
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to get monitor status: {_public_error(e)}",
+        }
+
+
+def _image_monitor_module():
+    """The utils.image_monitor module under either package identity."""
+    try:
+        from ...utils import image_monitor
+    except ImportError:
+        from utils import image_monitor
+    return image_monitor
+
+
+def _current_image_monitor():
+    """The running ImageMonitor singleton, or None when not started."""
+    return getattr(_image_monitor_module(), "_monitor_instance", None)
+
+
+class AdminRoutesMixin:
+    """Mixin providing admin, diagnostics, and maintenance API endpoints."""
+
+    def _register_admin_routes(self, routes):
+        @routes.get("/prompt_manager/scan_duplicates")
+        async def scan_duplicates_route(request):
+            return await self.scan_duplicates_endpoint(request)
+
+        @routes.post("/prompt_manager/scan_duplicates/stream")
+        async def scan_duplicates_stream_route(request):
+            return await self.scan_duplicates_stream(request)
+
+        @routes.get("/prompt_manager/scan_duplicates/status")
+        async def scan_duplicates_status_route(request):
+            return await self.scan_duplicates_status(request)
+
+        @routes.post("/prompt_manager/delete_duplicate_images")
+        async def delete_duplicate_images_route(request):
+            return await self.delete_duplicate_images_endpoint(request)
+
+        @routes.post("/prompt_manager/cleanup")
+        async def cleanup_duplicates_route(request):
+            return await self.cleanup_duplicates_endpoint(request)
+
+        @routes.post("/prompt_manager/maintenance")
+        async def maintenance_route(request):
+            return await self.run_maintenance(request)
+
+        @routes.get("/prompt_manager/stats")
+        async def get_stats_route(request):
+            return await self.get_statistics(request)
+
+        @routes.get("/prompt_manager/settings")
+        async def get_settings_route(request):
+            return await self.get_settings(request)
+
+        @routes.post("/prompt_manager/settings")
+        async def save_settings_route(request):
+            return await self.save_settings(request)
+
+        @routes.get("/prompt_manager/backup")
+        async def backup_database_route(request):
+            return await self.backup_database(request)
+
+        @routes.post("/prompt_manager/restore")
+        async def restore_database_route(request):
+            return await self.restore_database(request)
+
+        @routes.get("/prompt_manager/diagnostics")
+        async def run_diagnostics_route(request):
+            return await self.run_diagnostics(request)
+
+        @routes.post("/prompt_manager/diagnostics/test-link")
+        async def test_image_link_route(request):
+            return await self.test_image_link(request)
+
+        @routes.post("/prompt_manager/scan")
+        async def scan_images_route(request):
+            return await self.scan_images(request)
+
+        @routes.post("/prompt_manager/scan/cancel")
+        async def cancel_scan_route(request):
+            return await self.cancel_scan(request)
+
+        @routes.get("/prompt_manager/scan/status")
+        async def scan_status_route(request):
+            return await self.scan_status(request)
+
+    LONG_JOB_DUPLICATES = "duplicates"
+
+    async def scan_duplicates_endpoint(self, request):
+        """Scan for duplicate images without removing them (single flight)."""
+        job = self._acquire_long_job(self.LONG_JOB_DUPLICATES)
+        if job is None:
+            return self._long_job_busy_response("Duplicate scan")
+        async with job:
+            return await self._scan_duplicates(request)
+
+    async def _scan_duplicates(self, request):
+        try:
+            duplicates = await self.find_duplicate_images()
+
+            return web.json_response(
+                {
+                    "success": True,
+                    "duplicates": duplicates,
+                    "message": f"Found {len(duplicates)} groups of duplicate images",
+                }
+            )
+
+        except Exception as e:
+            self.logger.error(f"Scan duplicates error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Failed to scan duplicate images"},
+                status=500,
+            )
+
+    async def scan_duplicates_stream(self, request):
+        """Run the duplicate scan as a background job and stream its progress.
+
+        A request while a scan is running attaches to it. The job holds the
+        duplicates lock, so a delete is refused (409) until it finishes.
+        """
+        job = self._duplicate_job
+        if job is None or job.finished:
+            guard = self._acquire_long_job(self.LONG_JOB_DUPLICATES)
+            if guard is None:
+                return self._long_job_busy_response("Duplicate scan or delete")
+            job = ScanJob()
+            self._duplicate_job = job
+            job.task = asyncio.ensure_future(self._run_duplicate_job(job, guard))
+        return await self._stream_scan_job(request, job)
+
+    async def scan_duplicates_status(self, request):
+        """Whether a duplicate scan is running, and its latest event."""
+        job = self._duplicate_job
+        return web.json_response(
+            {
+                "success": True,
+                "running": bool(job and job.running),
+                "last_event": job.last_event if job else None,
+            }
+        )
+
+    async def _run_duplicate_job(self, job, guard):
+        loop = asyncio.get_running_loop()
+        counts = {"processed": 0}
+
+        def report(done, total):
+            # Called from worker threads; hand the event to the loop.
+            counts["processed"] = done
+            pct = int(done / total * 100) if total else 100
+            loop.call_soon_threadsafe(
+                job.publish,
+                {
+                    "type": "progress",
+                    "progress": pct,
+                    "status": f"Hashing file {done}/{total}...",
+                    "processed": done,
+                    "found": 0,
+                },
+            )
+
+        try:
+            async with guard:
+                job.publish(
+                    {
+                        "type": "progress",
+                        "progress": 0,
+                        "status": "Collecting media files...",
+                        "processed": 0,
+                        "found": 0,
+                    }
+                )
+                output_dir = await self._run_in_executor(self._find_comfyui_output_dir)
+                groups = await self._run_in_executor(
+                    self._find_duplicate_images_sync, output_dir, report
+                )
+                job.publish(
+                    {
+                        "type": "complete",
+                        "processed": counts["processed"],
+                        "found": len(groups),
+                        "duplicates": groups,
+                        "message": f"Found {len(groups)} groups of duplicate images",
+                    }
+                )
+        except Exception:
+            self.logger.exception("Duplicate scan error")
+            job.publish(
+                {
+                    "type": "error",
+                    "message": (
+                        "An internal error occurred. Check server logs for details."
+                    ),
+                }
+            )
+        finally:
+            job.finish()
+
+    async def cleanup_duplicates_endpoint(self, request):
+        """Cleanup duplicate prompts endpoint."""
+        try:
+            removed_count = await self._run_in_executor(self.db.cleanup_duplicates)
+
+            return web.json_response(
+                {
+                    "success": True,
+                    "message": "Cleanup completed",
+                    "duplicates_removed": removed_count,
+                }
+            )
+
+        except Exception as e:
+            self.logger.error(f"Cleanup error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Failed to cleanup duplicates"},
+                status=500,
+            )
+
+    async def find_duplicate_images(self):
+        """Find duplicate media in the output directory, off the event loop."""
+        output_dir = await self._run_in_executor(self._find_comfyui_output_dir)
+        return await self._run_in_executor(self._find_duplicate_images_sync, output_dir)
+
+    def _find_duplicate_images_sync(self, output_dir, progress=None):
+        """Group media files under ``output_dir`` by content hash (blocking).
+
+        Files are hashed on ``PromptManagerConfig.WORKER_THREADS`` threads.
+        ``progress(done, total)`` is called from those threads about every
+        percent and once at the end.
+        """
+        from ..config import PromptManagerConfig
+
+        if not output_dir or not os.path.isdir(output_dir):
+            self.logger.warning("ComfyUI output directory not found")
+            return []
+
+        output_path = Path(output_dir)
+        extensions = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+        media_files = _collect_media_files([output_path], extensions)
+        total = len(media_files)
+        self.logger.info(f"Found {total} media files to analyze")
+        step = max(1, total // 100)
+        counter = {"done": 0}
+        lock = threading.Lock()
+
+        def describe(media_path):
+            try:
+                info = self._describe_media_file(media_path, output_path)
+            except Exception as e:
+                self.logger.error(f"Error processing file {media_path.name}: {e}")
+                info = None
+            with lock:
+                counter["done"] += 1
+                done = counter["done"]
+            if done % 100 == 0:
+                self.logger.info(
+                    f"Processed {done}/{total} files " "for duplicate detection"
+                )
+            if progress and (done % step == 0 or done == total):
+                progress(done, total)
+            return info
+
+        infos = map_parallel(describe, media_files, PromptManagerConfig.WORKER_THREADS)
+
+        file_hashes = {}
+        for info in infos:
+            if info is not None:
+                file_hashes.setdefault(info["hash"], []).append(info)
+
+        duplicates = []
+        for file_hash, images in file_hashes.items():
+            if len(images) > 1:
+                images.sort(key=lambda x: x["modified_time"])
+                duplicates.append(
+                    {"hash": file_hash, "images": images, "count": len(images)}
+                )
+
+        self.logger.info(f"Found {len(duplicates)} groups of duplicate images")
+        return duplicates
+
+    def _describe_media_file(self, media_path, output_path):
+        """Hash one media file and describe it for the duplicates response."""
+        stat = media_path.stat()
+        rel_path = media_path.relative_to(output_path)
+        extension = media_path.suffix.lower()
+        is_video = extension in VIDEO_EXTENSIONS
+
+        thumb_rel = _thumbnail_rel_path(rel_path, ".jpg" if is_video else extension)
+        thumbnail_url = thumbnail_url_for(thumb_rel, output_path / thumb_rel)
+
+        return {
+            "id": str(hash(str(media_path))),
+            "filename": media_path.name,
+            "path": str(rel_path),
+            "relative_path": str(rel_path),
+            "url": f"/prompt_manager/images/serve/{rel_path.as_posix()}",
+            "thumbnail_url": thumbnail_url,
+            "size": stat.st_size,
+            "modified_time": stat.st_mtime,
+            "extension": extension,
+            "media_type": "video" if is_video else "image",
+            "is_video": is_video,
+            "hash": self._calculate_file_hash(media_path),
+        }
+
+    def _calculate_file_hash(self, file_path):
+        """Calculate SHA-256 hash of a file's content."""
+        hash_sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_sha256.update(chunk)
+        return hash_sha256.hexdigest()
+
+    async def delete_duplicate_images_endpoint(self, request):
+        """Delete duplicate image files from disk (single flight with the scan)."""
+        job = self._acquire_long_job(self.LONG_JOB_DUPLICATES)
+        if job is None:
+            return self._long_job_busy_response("Duplicate scan or delete")
+        async with job:
+            return await self._delete_duplicate_images(request)
+
+    async def _delete_duplicate_images(self, request):
+        try:
+            data, error_response = await _read_json(request)
+            if error_response is not None:
+                return error_response
+            image_paths = data.get("image_paths", [])
+
+            if not image_paths or not isinstance(image_paths, list):
+                return web.json_response(
+                    {"success": False, "error": "No image paths provided"},
+                    status=400,
+                )
+
+            output_dir = await self._run_in_executor(self._find_comfyui_output_dir)
+            result = await self._run_in_executor(
+                self._delete_duplicate_images_sync, image_paths, output_dir
+            )
+
+            response_data = {
+                "success": True,
+                "deleted_count": result["deleted_count"],
+                "failed_count": result["failed_count"],
+                "message": f"Deleted {result['deleted_count']} files successfully",
+            }
+            if result["failed_count"] > 0:
+                response_data["failed_files"] = result["failed_files"]
+                response_data["message"] += f", {result['failed_count']} failed"
+
+            return web.json_response(response_data)
+
+        except Exception as e:
+            self.logger.error(f"Delete duplicate images error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Failed to delete duplicate images"},
+                status=500,
+            )
+
+    def _delete_duplicate_images_sync(self, image_paths, output_dir):
+        """Delete the given files (absolute or output-relative) within
+        ``output_dir``."""
+        result = {"deleted_count": 0, "failed_count": 0, "failed_files": []}
+        output_path = Path(output_dir) if output_dir else None
+
+        for image_path in image_paths:
+            if output_path is None:
+                failure = "output directory not found"
+            else:
+                try:
+                    failure = self._delete_one_duplicate(str(image_path), output_path)
+                except Exception as e:
+                    self.logger.error(f"Error deleting file {image_path}: {e}")
+                    failure = self._public_error(e)
+
+            if failure is None:
+                result["deleted_count"] += 1
+            else:
+                result["failed_count"] += 1
+                result["failed_files"].append(f"{image_path} ({failure})")
+
+        return result
+
+    def _delete_one_duplicate(self, image_path, output_path):
+        """Delete one file and its thumbnail; return a failure reason or None."""
+        file_path = Path(image_path)
+        if not file_path.is_absolute():
+            file_path = output_path / file_path
+
+        try:
+            rel_path = file_path.resolve().relative_to(output_path.resolve())
+        except ValueError:
+            self.logger.warning(
+                f"Attempted to delete file outside output directory: {image_path}"
+            )
+            return "outside output directory"
+
+        if file_path.suffix.lower() not in DELETABLE_MEDIA_EXTENSIONS:
+            return "not a media file"
+        if "thumbnails" in rel_path.parts:
+            return "thumbnails are managed by the gallery"
+
+        if not file_path.is_file():
+            return "file not found"
+
+        os.remove(file_path)
+        self.logger.info(f"Deleted duplicate image: {image_path}")
+
+        thumbnail_path = output_path / _thumbnail_rel_path(rel_path, file_path.suffix)
+        try:
+            if thumbnail_path.exists():
+                os.remove(thumbnail_path)
+                self.logger.debug(f"Deleted associated thumbnail: {thumbnail_path}")
+        except OSError as e:
+            self.logger.warning(f"Could not delete thumbnail for {image_path}: {e}")
+        return None
+
+    async def get_statistics(self, request):
+        """Get database statistics."""
+        try:
+            stats = await self._run_in_executor(self.db.get_statistics)
+
+            return web.json_response({"success": True, "stats": stats})
+
+        except Exception as e:
+            self.logger.error(f"Stats error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Failed to get statistics"},
+                status=500,
+            )
+
+    async def get_settings(self, request):
+        """Get current settings."""
+        try:
+            from ..config import PromptManagerConfig, GalleryConfig
+
+            root_paths = [
+                self._public_path(d) for d in GalleryConfig.MONITORING_DIRECTORIES
+            ]
+            return web.json_response(
+                {
+                    "success": True,
+                    "settings": {
+                        "result_timeout": PromptManagerConfig.RESULT_TIMEOUT,
+                        "webui_display_mode": PromptManagerConfig.WEBUI_DISPLAY_MODE,
+                        "infinite_scroll": PromptManagerConfig.INFINITE_SCROLL,
+                        "worker_threads": PromptManagerConfig.WORKER_THREADS,
+                        "cpu_count": PromptManagerConfig.max_worker_threads(),
+                        "gallery_root_paths": root_paths,
+                        "gallery_root_path": root_paths[0] if root_paths else "",
+                        "monitored_directories": [
+                            self._public_path(d) for d in self._monitored_directories()
+                        ],
+                    },
+                }
+            )
+        except Exception as e:
+            self.logger.error(f"Get settings error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Failed to get settings"},
+                status=500,
+            )
+
+    def _monitored_directories(self):
+        """Directories the running image monitor watches, else the configured roots."""
+        from ..config import GalleryConfig
+
+        monitor = _current_image_monitor()
+        if monitor is not None:
+            return list(getattr(monitor, "monitored_directories", []))
+        return list(GalleryConfig.MONITORING_DIRECTORIES)
+
+    async def save_settings(self, request):
+        """Save settings: the whole payload is validated before anything changes."""
+        try:
+            from ..config import PromptManagerConfig
+
+            data, error_response = await _read_json(request)
+            if error_response is not None:
+                return error_response
+
+            try:
+                updates = self._validate_settings(data)
+            except ValueError as ve:
+                return web.json_response(
+                    {"success": False, "error": str(ve)}, status=400
+                )
+
+            new_roots, error = self._parse_gallery_roots(data)
+            if error:
+                return web.json_response({"success": False, "error": error}, status=400)
+
+            for name, value in updates.items():
+                setattr(PromptManagerConfig, name, value)
+            restart_required = False
+            if new_roots is not None:
+                restart_required = self._apply_gallery_roots(new_roots)
+
+            self._persist_settings()
+
+            return web.json_response(
+                {
+                    "success": True,
+                    "message": "Settings saved successfully",
+                    "restart_required": restart_required,
+                }
+            )
+        except Exception as e:
+            self.logger.error(f"Save settings error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Failed to save settings"},
+                status=500,
+            )
+
+    @staticmethod
+    def _validate_settings(data):
+        """Scalar settings of a payload as ``{CONFIG_ATTR: value}``.
+
+        Raises ValueError with a user-facing message on the first bad value;
+        nothing is applied until every value passed.
+        """
+        from ..config import PromptManagerConfig
+
+        updates = {}
+        if "result_timeout" in data:
+            updates["RESULT_TIMEOUT"] = validate_result_timeout(data["result_timeout"])
+        if "webui_display_mode" in data:
+            mode = data["webui_display_mode"]
+            if mode not in ("popup", "newtab"):
+                raise ValueError("webui_display_mode must be 'popup' or 'newtab'")
+            updates["WEBUI_DISPLAY_MODE"] = mode
+        if "infinite_scroll" in data:
+            if not isinstance(data["infinite_scroll"], bool):
+                raise ValueError("infinite_scroll must be true or false")
+            updates["INFINITE_SCROLL"] = data["infinite_scroll"]
+        if "worker_threads" in data:
+            updates["WORKER_THREADS"] = validate_worker_threads(
+                data["worker_threads"], PromptManagerConfig.max_worker_threads()
+            )
+        return updates
+
+    def _parse_gallery_roots(self, data):
+        """Extract and validate gallery roots from a settings payload.
+
+        Accepts ``gallery_root_paths`` (list, preferred) or the legacy single
+        ``gallery_root_path`` string. Blank entries are dropped.
+
+        Returns:
+            (roots, error): ``roots`` is the validated list, or ``None`` when
+            the payload carries no gallery root key; ``error`` is a message
+            when validation failed (and ``roots`` is then ``None``).
+        """
+        if "gallery_root_paths" in data:
+            raw = data["gallery_root_paths"]
+            if not isinstance(raw, list):
+                return None, "gallery_root_paths must be a list"
+        elif "gallery_root_path" in data:
+            raw = [data["gallery_root_path"]]
+        else:
+            return None, None
+
+        from ..config import GalleryConfig
+
+        roots = []
+        for entry in raw:
+            if not isinstance(entry, str):
+                return None, "Gallery root paths must be strings"
+            entry = entry.strip()
+            if not entry:
+                continue
+            ok, reason = GalleryConfig.validate_gallery_root(entry)
+            if not ok:
+                return (
+                    None,
+                    f"Invalid gallery root '{os.path.basename(entry)}': {reason}",
+                )
+            roots.append(GalleryConfig.resolve_gallery_root(entry))
+        return roots, None
+
+    def _apply_gallery_roots(self, roots):
+        """Install validated gallery roots; returns True when they changed."""
+        from ..config import GalleryConfig
+
+        if roots == list(GalleryConfig.MONITORING_DIRECTORIES):
+            return False
+        GalleryConfig.MONITORING_DIRECTORIES = roots
+        self._cached_output_dir = None
+        self.reset_gallery_roots_cache()
+        return True
+
+    def _persist_settings(self):
+        """Merge the user-editable settings into the configured config.json.
+
+        Only the keys this endpoint owns are rewritten; every other section
+        (integrations, database, performance, ...) and every other key in
+        ``web_ui``/``gallery`` is kept as it was. A config file that cannot
+        be parsed is replaced.
+        """
+        from ..config import GalleryConfig, PromptManagerConfig, write_private_json
+
+        config_file = PromptManagerConfig.get_config_path()
+        existing = self._read_config_file(config_file)
+        web_ui = dict(existing.get("web_ui") or {})
+        web_ui["result_timeout"] = PromptManagerConfig.RESULT_TIMEOUT
+        web_ui["webui_display_mode"] = PromptManagerConfig.WEBUI_DISPLAY_MODE
+        web_ui["infinite_scroll"] = PromptManagerConfig.INFINITE_SCROLL
+        gallery = dict(existing.get("gallery") or {})
+        monitoring = dict(gallery.get("monitoring") or {})
+        monitoring["directories"] = list(GalleryConfig.MONITORING_DIRECTORIES)
+        gallery["monitoring"] = monitoring
+        performance = dict(existing.get("performance") or {})
+        performance["worker_threads"] = PromptManagerConfig.WORKER_THREADS
+        config_data = {
+            **existing,
+            "web_ui": web_ui,
+            "gallery": gallery,
+            "performance": performance,
+        }
+        try:
+            write_private_json(config_file, config_data)
+            self.logger.info(f"Settings saved to {config_file}")
+        except OSError as save_err:
+            self.logger.warning(f"Could not save config file: {save_err}")
+
+    def _read_config_file(self, config_file):
+        """Current contents of config.json as a dict, or {} when unusable."""
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def run_diagnostics(self, request):
+        """Run comprehensive system diagnostics and health checks."""
+        try:
+            from ..config import GalleryConfig
+
+            results = {
+                "database": _diagnose_database(self.db.model.db_path),
+                "dependencies": _diagnose_dependencies(),
+                "comfyui_output": _diagnose_output_dirs(
+                    GalleryConfig.MONITORING_DIRECTORIES
+                ),
+                "image_monitor": _diagnose_image_monitor(),
+            }
+            return web.json_response({"success": True, "diagnostics": results})
+
+        except Exception as e:
+            self.logger.error(f"Diagnostics error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Diagnostics failed"}, status=500
+            )
+
+    async def test_image_link(self, request):
+        """Test creating an image link."""
+        try:
+            data, error_response = await _read_json(request)
+            if error_response is not None:
+                return error_response
+            prompt_id = data.get("prompt_id")
+            if not prompt_id:
+                return web.json_response(
+                    {"success": False, "error": "prompt_id is required"}, status=400
+                )
+
+            # The client never chooses the stored path: a synthetic marker
+            # under the output directory stands in for a generated image.
+            output_dir = await self._run_in_executor(self._find_comfyui_output_dir)
+            image_path = self._test_link_marker_path(output_dir)
+            payload = await self._link_test_image(str(prompt_id), image_path)
+            return web.json_response(payload)
+
+        except Exception as e:
+            self.logger.error(f"Test link error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Test link failed"}, status=500
+            )
+
+    TEST_LINK_MARKER = "prompt_manager_test_link.png"
+
+    @classmethod
+    def _test_link_marker_path(cls, output_dir):
+        """Path recorded by the test-link diagnostic: a marker under ``output_dir``
+        (relative, when no output directory is known)."""
+        if output_dir:
+            return os.path.join(str(output_dir), cls.TEST_LINK_MARKER)
+        return cls.TEST_LINK_MARKER
+
+    async def _link_test_image(self, prompt_id, image_path):
+        """Link a synthetic image record to ``prompt_id``; returns the envelope."""
+        test_metadata = {
+            "file_info": {"size": 1024000, "dimensions": [512, 512], "format": "PNG"},
+            "workflow": {"test": True},
+            "prompt": {"test_prompt": "This is a test image"},
+        }
+        try:
+            image_id = await self._run_in_executor(
+                self.db.link_image_to_prompt,
+                prompt_id=prompt_id,
+                image_path=image_path,
+                metadata=test_metadata,
+            )
+        except Exception as e:
+            return {
+                "success": False,
+                "result": {
+                    "status": "error",
+                    "message": f"Failed to create test link: {self._public_error(e)}",
+                },
+            }
+        return {
+            "success": True,
+            "result": {
+                "status": "ok",
+                "image_id": image_id,
+                "message": f"Test image linked successfully with ID {image_id}",
+            },
+        }
+
+    DEFAULT_MAINTENANCE_OPERATIONS = (
+        "cleanup_duplicates",
+        "vacuum",
+        "cleanup_orphaned_images",
+    )
+
+    async def run_maintenance(self, request):
+        """Perform database maintenance operations and report each outcome."""
+        try:
+            data = {}
+            if request.content_type == "application/json":
+                data, error_response = await _read_json(request)
+                if error_response is not None:
+                    return error_response
+            operations = data.get(
+                "operations", list(self.DEFAULT_MAINTENANCE_OPERATIONS)
+            )
+
+            results = await self._run_in_executor(
+                self._run_maintenance_operations, operations
+            )
+            all_successful = all(r.get("success", False) for r in results.values())
+
+            return web.json_response(
+                {
+                    "success": True,
+                    "operations_completed": len(results),
+                    "all_successful": all_successful,
+                    "results": results,
+                    "message": (
+                        f"Maintenance completed: {len(results)} operations processed"
+                    ),
+                }
+            )
+
+        except Exception as e:
+            self.logger.error(f"Maintenance error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Maintenance failed"}, status=500
+            )
+
+    def _run_maintenance_operations(self, operations):
+        """Run each known operation in order; unknown names are ignored (blocking)."""
+        results = {}
+        for name in operations:
+            runner = self._maintenance_runners().get(name)
+            if runner is None:
+                continue
+            try:
+                results[name] = {"success": True, **runner()}
+            except Exception as e:
+                results[name] = {
+                    "success": False,
+                    "error": self._public_error(e),
+                    "message": f"Failed to run {name.replace('_', ' ')}",
+                }
+        return results
+
+    def _maintenance_runners(self):
+        """Map of operation name to a callable returning that operation's result."""
+        db = self.db
+
+        def count_result(count, noun):
+            return {"removed_count": count, "message": f"Removed {count} {noun}"}
+
+        def vacuum():
+            db.model.vacuum_database()
+            return {"message": "Database vacuum completed successfully"}
+
+        return {
+            "cleanup_duplicates": lambda: count_result(
+                db.cleanup_duplicates(), "duplicate prompts"
+            ),
+            "vacuum": vacuum,
+            "cleanup_orphaned_images": lambda: count_result(
+                db.cleanup_missing_images(), "orphaned image records"
+            ),
+            "check_hash_duplicates": lambda: self._hash_duplicates_result(
+                db.check_hash_duplicates()
+            ),
+            "statistics": lambda: {
+                "info": self._public_database_info(db.model.get_database_info()),
+                "message": "Database statistics retrieved",
+            },
+            "prune_orphaned_prompts": lambda: count_result(
+                db.prune_orphaned_prompts(),
+                "orphaned prompts (prompts with no linked images, "
+                "excluding protected prompts)",
+            ),
+            "check_consistency": lambda: self._consistency_result(
+                db.check_consistency()
+            ),
+        }
+
+    def _public_database_info(self, info):
+        """``get_database_info()`` with the absolute database_path made public."""
+        info = dict(info or {})
+        if info.get("database_path"):
+            info["database_path"] = self._public_path(info["database_path"])
+        return info
+
+    @staticmethod
+    def _hash_duplicates_result(groups):
+        return {
+            "duplicate_hashes": len(groups),
+            "message": f"Found {len(groups)} duplicate hash groups",
+        }
+
+    @staticmethod
+    def _consistency_result(issues):
+        return {
+            "issues_found": len(issues),
+            "issues": issues[:10],
+            "message": f"Found {len(issues)} consistency issues",
+        }
+
+    async def backup_database(self, request):
+        """Download a consistent copy of the prompts database (WAL included)."""
+        try:
+            model = self.db.model
+            db_path = model.db_path
+
+            if not os.path.exists(db_path):
+                return web.json_response(
+                    {"success": False, "error": "Database file not found"}, status=404
+                )
+
+            fd, temp_path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            try:
+                ok = await self._run_in_executor(model.backup_database, temp_path)
+                if not ok:
+                    return web.json_response(
+                        {"success": False, "error": "Failed to create database backup"},
+                        status=500,
+                    )
+                # Read once (the file is deleted right after) rather than
+                # streaming so the temp file never outlives the request.
+                with open(temp_path, "rb") as fh:
+                    file_data = fh.read()
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"prompts_backup_{timestamp}.db"
+
+            return web.Response(
+                body=file_data,
+                content_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(file_data)),
+                },
+            )
+
+        except Exception as e:
+            self.logger.error(f"Backup error: {e}", exc_info=True)
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": f"Failed to backup database: {self._public_error(e)}",
+                },
+                status=500,
+            )
+
+    async def restore_database(self, request):
+        """Restore the prompts database from an uploaded SQLite file.
+
+        The upload is streamed to a temp file (capped at restore_max_bytes),
+        verified with PromptModel.verify_database_file and only then copied
+        over the live database, which is backed up first.
+        """
+        max_bytes = getattr(self, "restore_max_bytes", 100 * 1024 * 1024)
+        temp_path = None
+        try:
+            reader = await request.multipart()
+            field = await reader.next()
+
+            if not field or field.name != "database_file":
+                return web.json_response(
+                    {
+                        "success": False,
+                        "error": (
+                            "No database file uploaded. "
+                            "Expected field name: database_file"
+                        ),
+                    },
+                    status=400,
+                )
+
+            fd, temp_path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            size = 0
+            with open(temp_path, "wb") as out:
+                while True:
+                    chunk = await field.read_chunk()
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_bytes:
+                        return web.json_response(
+                            {
+                                "success": False,
+                                "error": (
+                                    "File too large. Maximum size is "
+                                    f"{max_bytes // (1024 * 1024)}MB"
+                                ),
+                            },
+                            status=400,
+                        )
+                    out.write(chunk)
+
+            if size == 0:
+                return web.json_response(
+                    {"success": False, "error": "Uploaded file is empty"}, status=400
+                )
+
+            model = self.db.model
+            ok, reason = await self._run_in_executor(
+                model.verify_database_file, temp_path
+            )
+            if ok:
+                reason = await self._run_in_executor(_inspect_restore_upload, temp_path)
+                ok = reason is None
+            if not ok:
+                return web.json_response(
+                    {"success": False, "error": reason}, status=400
+                )
+
+            try:
+                backup_path = await self._run_in_executor(
+                    model.restore_from_file, temp_path
+                )
+            except sqlite3.OperationalError as exc:
+                if (
+                    getattr(exc, "_prompt_manager_restore_backup_created", False)
+                    is True
+                ):
+                    try:
+                        await self._run_in_executor(
+                            _prune_safety_backups, model.db_path
+                        )
+                    except Exception:
+                        self.logger.warning(
+                            "Could not prune safety backups after failed restore"
+                        )
+                raise
+            removed = await self._run_in_executor(_prune_safety_backups, model.db_path)
+            if removed:
+                self.logger.info(f"Removed {len(removed)} old safety backups")
+            previous = self.db
+            self.db = PromptDatabase(model.db_path)
+            # Its connections would otherwise linger (a file lock on Windows)
+            previous.close_all()
+            prompt_count = self.db.model.get_database_info().get("total_prompts", 0)
+
+            return web.json_response(
+                {
+                    "success": True,
+                    "message": (
+                        "Database restored successfully. "
+                        f"Found {prompt_count} prompts."
+                    ),
+                    "prompt_count": prompt_count,
+                    "backup_created": (
+                        self._public_path(backup_path) if backup_path else None
+                    ),
+                }
+            )
+
+        except Exception as e:
+            self.logger.error(f"Restore error: {e}", exc_info=True)
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": f"Failed to restore database: {self._public_error(e)}",
+                },
+                status=500,
+            )
+        finally:
+            if temp_path:
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    if os.path.exists(temp_path + suffix):
+                        os.unlink(temp_path + suffix)
+
+    async def scan_images(self, request):
+        """Scan ComfyUI output images for prompt metadata and add them to the database.
+
+        The scan runs as a background task that outlives this request, so a
+        closed tab never leaves a half-finished scan. Progress streams as
+        server-sent events; while a scan is running, a new request attaches
+        to it instead of starting another one.
+        """
+        job = self._scan_job
+        if job is None or job.finished:
+            job = self._start_scan_job()
+        return await self._stream_scan_job(request, job)
+
+    async def cancel_scan(self, request):
+        """Stop between file transactions; an in-flight extraction can finish."""
+        job = self._scan_job
+        requested = bool(job and job.running)
+        if requested:
+            job.cancelled = True
+        return web.json_response({"success": True, "cancellation_requested": requested})
+
+    async def scan_status(self, request):
+        """Whether an output scan is running, and its latest progress event."""
+        job = self._scan_job
+        return web.json_response(
+            {
+                "success": True,
+                "running": bool(job and job.running),
+                "last_event": job.last_event if job else None,
+            }
+        )
+
+    def _start_scan_job(self):
+        """Create the job record synchronously, then run the scan as a task."""
+        job = ScanJob()
+        self._scan_job = job
+        job.task = asyncio.ensure_future(self._run_scan_job(job))
+        return job
+
+    async def _run_scan_job(self, job):
+        try:
+            async for payload in self._scan_images_events():
+                job.publish(payload)
+        finally:
+            job.finish()
+
+    async def _stream_scan_job(self, request, job):
+        """Stream ``job`` as SSE; stop quietly if the client goes away."""
+        response = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await response.prepare(request)
+        try:
+            async with contextlib.aclosing(job.events()) as events:
+                async for payload in events:
+                    await response.write(_sse(payload).encode("utf-8"))
+            await response.write_eof()
+        except Exception as e:  # the socket closed under us; the scan goes on
+            self.logger.info(
+                f"Scan progress client disconnected ({e}); "
+                "the scan continues in the background"
+            )
+        return response
+
+    async def _scan_images_events(self):
+        """Yield progress payloads while scanning every configured output directory."""
+        try:
+            self.logger.info("Starting image scan operation")
+            output_dirs = self._get_all_output_dirs()
+            if not output_dirs:
+                self.logger.error("No output directories found")
+                yield {
+                    "type": "error",
+                    "message": "No output directories found. "
+                    "Configure scan directories in Settings.",
+                }
+                return
+
+            dir_names = [self._public_path(d) for d in output_dirs]
+            yield self._scan_progress(
+                0, f"Scanning {len(output_dirs)} directory(ies) for media files..."
+            )
+
+            media_files = await self._run_in_executor(
+                self._collect_output_media_sync, output_dirs
+            )
+            counts = dict.fromkeys(SCAN_COUNT_KEYS, 0)
+            if media_files:
+                yield self._scan_progress(
+                    5, f"Found {len(media_files)} media files to process...", counts
+                )
+            async for event in self._scan_batches(media_files, counts):
+                yield event
+
+            self.logger.info(
+                f"Scan completed: processed={counts['processed']}, "
+                f"found={counts['found']}, new_prompts_added={counts['added']}, "
+                f"images_linked_to_existing={counts['linked']}"
+            )
+            job = self._scan_job
+            final_type = "cancelled" if job and job.cancelled else "complete"
+            yield {"type": final_type, **counts, "directories": dir_names}
+
+        except Exception:
+            self.logger.exception("Scan error")
+            yield {
+                "type": "error",
+                "message": "An internal error occurred. Check server logs for details.",
+            }
+
+    async def _scan_batches(self, media_files, counts):
+        """Process ``media_files`` in executor batches, updating ``counts`` in place.
+
+        Yields one progress event per batch.
+        """
+        total = len(media_files)
+        for batch_start in range(0, total, SCAN_BATCH_SIZE):
+            if self._scan_job and self._scan_job.cancelled:
+                return
+            batch = media_files[batch_start : batch_start + SCAN_BATCH_SIZE]
+            batch_results = await self._run_in_executor(
+                self._extract_batch_metadata_sync, batch
+            )
+            batch_counts = await self._run_in_executor(
+                self._ingest_scan_batch_sync, batch_results
+            )
+            for key in counts:
+                counts[key] += batch_counts[key]
+
+            done = min(batch_start + len(batch), total)
+            yield self._scan_progress(
+                int(done / total * 100), f"Processing file {done}/{total}...", counts
+            )
+            await asyncio.sleep(0)
+
+    @staticmethod
+    def _scan_progress(progress, status, counts=None):
+        """Progress event payload for the output scan."""
+        counts = counts or {}
+        return {
+            "type": "progress",
+            "progress": progress,
+            "status": status,
+            "processed": counts.get("processed", 0),
+            **{key: counts.get(key, 0) for key in SCAN_COUNT_KEYS},
+        }
+
+    def _collect_output_media_sync(self, output_dirs):
+        """Collect all media files from the output directories (blocking I/O)."""
+        return _collect_media_files(output_dirs, IMAGE_EXTENSIONS + VIDEO_EXTENSIONS)
+
+    def _extract_batch_metadata_sync(self, file_batch):
+        """Extract metadata from a batch of files in one executor call.
+
+        Files are read on ``PromptManagerConfig.WORKER_THREADS`` threads:
+        Pillow decodes the whole image to reach trailing text chunks and
+        releases the GIL while doing so.
+        """
+        from ..config import PromptManagerConfig
+
+        def extract(media_file):
+            try:
+                return (media_file, self._extract_comfyui_metadata(str(media_file)))
+            except Exception:
+                return (media_file, {})
+
+        return map_parallel(extract, file_batch, PromptManagerConfig.WORKER_THREADS)
+
+    def _ingest_scan_batch_sync(self, batch_results):
+        """Store the prompts found in a metadata batch (blocking DB work)."""
+        counts = dict.fromkeys(SCAN_COUNT_KEYS, 0)
+        for media_file, metadata in batch_results:
+            if self._scan_job and self._scan_job.cancelled:
+                break
+            counts["processed"] += 1
+            try:
+                outcome = self._ingest_scanned_file(media_file, metadata, detailed=True)
+            except Exception as e:
+                self.logger.error(f"Error processing {media_file.name}: {e}")
+                counts["failed"] += 1
+                continue
+            if outcome is None:
+                continue
+            counts["found"] += 1
+            status = outcome["status"] if isinstance(outcome, dict) else outcome
+            if status in (
+                "added",
+                "linked",
+                "enriched",
+                "unchanged",
+                "ambiguous",
+                "unresolved",
+                "conflict",
+                "failed",
+            ):
+                counts[status] += 1
+            if isinstance(outcome, dict):
+                counts["pairs_added"] += outcome.get("pairs_added", 0)
+                counts["pair_links_added"] += outcome.get("links_added", 0)
+        return counts
+
+    @staticmethod
+    def _graph_prompt_text(metadata):
+        """The positive prompt the browser parser traces from the graphs, or None."""
+        records = {}
+        for key in ("prompt", "workflow"):
+            value = metadata.get(key)
+            records[key] = parse_js_json(value) if isinstance(value, str) else value
+        try:
+            positive = extract_generation_params(records)["positivePrompt"]
+        except GenerationParamsError:
+            return None
+        if not isinstance(positive, str) or positive == PLACEHOLDERS["positivePrompt"]:
+            return None
+        return positive.strip() or None
+
+    def _ingest_scanned_file(self, media_file, metadata, detailed=False):
+        """Enrich exact pairs; retain legacy positive-only import for absent pairs."""
+        if not metadata:
+            return None
+        canonical = dict(metadata)
+        for key in ("prompt", "workflow"):
+            if isinstance(canonical.get(key), str):
+                try:
+                    canonical[key] = json.loads(canonical[key])
+                except (ValueError, TypeError):
+                    # Preserve malformed metadata for conservative resolver rejection.
+                    pass
+        if not canonical.get("prompt") and not canonical.get("parameters"):
+            return None
+        resolution = resolve_prompt_pair(canonical)
+        if resolution["state"] == "resolved":
+            result = ingest_resolved_pair(
+                self.db, str(media_file), canonical, resolution
+            )
+            return result if detailed else result["status"]
+        if canonical.get("prompt") and resolution["state"] in (
+            "ambiguous",
+            "unresolved",
+        ):
+            # The resolver could not decide: link the prompt the inspector and the
+            # legacy pages show for this file (the browser parser, in Python).
+            # Graphs without a recognized sampler keep the legacy extractor below.
+            prompt_text = self._graph_prompt_text(metadata)
+            if not prompt_text:
+                return resolution["state"]
+        elif resolution["state"] == "ambiguous":
+            return "ambiguous"
+        elif resolution["state"] == "unresolved" and not isinstance(
+            canonical.get("parameters"), str
+        ):
+            return resolution["state"]
+        else:
+            parsed = self._parse_comfyui_prompt(metadata)
+            if not (parsed.get("prompt") or parsed.get("parameters")):
+                return None
+            prompt_text = self._extract_readable_prompt(parsed)
+            if prompt_text is not None and not isinstance(prompt_text, str):
+                prompt_text = str(prompt_text)
+            if not (prompt_text and prompt_text.strip()):
+                return "found"
+            prompt_text = prompt_text.strip()
+
+        prompt_hash = generate_prompt_hash(prompt_text)
+        existing = self.db.get_prompt_by_hash(prompt_hash)
+        if existing:
+            try:
+                image_id = self.db.link_image_to_prompt(
+                    existing["id"], str(media_file), metadata=canonical
+                )
+            except Exception as e:
+                self.logger.error(
+                    f"Failed to link {media_file.name} to existing prompt: {e}"
+                )
+                return "found"
+            return "linked" if image_id else "unchanged"
+
+        prompt_id = self.db.save_prompt(
+            prompt_text,
+            "scanned",
+            ["auto-scanned"],
+            None,
+            f"Auto-scanned from {media_file.name}",
+            prompt_hash,
+        )
+        if not prompt_id:
+            return "found"
+        try:
+            self.db.link_image_to_prompt(prompt_id, str(media_file), metadata=canonical)
+        except Exception as e:
+            self.logger.error(f"Failed to link {media_file.name} to new prompt: {e}")
+        return "added"

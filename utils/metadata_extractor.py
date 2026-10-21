@@ -1,8 +1,9 @@
 """ComfyUI metadata extraction utilities.
 
-This module provides comprehensive metadata extraction capabilities for ComfyUI-generated
-images. It can extract workflow information, prompt data, and generation parameters from
-PNG images that contain embedded ComfyUI metadata in their text chunks.
+This module provides comprehensive metadata extraction capabilities for
+ComfyUI-generated images. It can extract workflow information, prompt data, and
+generation parameters from PNG images that contain embedded ComfyUI metadata in
+their text chunks.
 
 The extractor supports:
 - Complete workflow data extraction from PNG text chunks
@@ -34,7 +35,6 @@ import os
 import json
 from typing import Optional, Dict, Any
 from PIL import Image
-from PIL.PngImagePlugin import PngInfo
 
 from .logging_config import get_logger
 
@@ -88,24 +88,24 @@ class ComfyUIMetadataExtractor:
                 # Add basic file information
                 metadata["file_info"] = self.get_file_info(image_path, image)
 
-                # Extract ComfyUI-specific metadata from PNG text chunks or image.info (WebP, JPEG, etc.)
+                # ComfyUI writes PNG text chunks, but other savers put the same
+                # keys in image.info (WebP, JPEG, GIF). Read both so images from
+                # those nodes still link to their prompts.
                 text_chunks = {}
                 if hasattr(image, "text") and image.text:
                     text_chunks.update(image.text)
                 if hasattr(image, "info") and image.info:
-                    for k, v in image.info.items():
-                        if isinstance(v, (str, bytes)):
-                            text_chunks[k] = v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
+                    for key, value in image.info.items():
+                        if isinstance(value, bytes):
+                            text_chunks[key] = value.decode("utf-8", errors="replace")
+                        elif isinstance(value, str):
+                            text_chunks[key] = value
 
                 if text_chunks:
                     # Look for ComfyUI workflow data
                     if "workflow" in text_chunks:
                         try:
-                            workflow_data = (
-                                json.loads(text_chunks["workflow"])
-                                if isinstance(text_chunks["workflow"], str)
-                                else text_chunks["workflow"]
-                            )
+                            workflow_data = json.loads(text_chunks["workflow"])
                             metadata["workflow"] = workflow_data
 
                             # Extract text encoder nodes from workflow
@@ -115,23 +115,20 @@ class ComfyUIMetadataExtractor:
                             if text_encoder_nodes:
                                 metadata["text_encoder_nodes"] = text_encoder_nodes
 
-                        except (json.JSONDecodeError, TypeError) as e:
+                        except json.JSONDecodeError as e:
                             self.logger.warning(f"Failed to parse workflow JSON: {e}")
 
                     # Look for prompt data
                     if "prompt" in text_chunks:
                         try:
-                            prompt_data = (
-                                json.loads(text_chunks["prompt"])
-                                if isinstance(text_chunks["prompt"], str)
-                                else text_chunks["prompt"]
-                            )
+                            prompt_data = json.loads(text_chunks["prompt"])
                             metadata["prompt"] = prompt_data
-                        except (json.JSONDecodeError, TypeError) as e:
+                        except json.JSONDecodeError as e:
                             self.logger.warning(f"Failed to parse prompt JSON: {e}")
 
                     # Extract other common metadata fields
                     metadata_fields = [
+                        "comfyassets_prompt_pairs",
                         "parameters",
                         "model",
                         "sampler",
@@ -147,11 +144,7 @@ class ComfyUIMetadataExtractor:
                         if field in text_chunks:
                             try:
                                 # Try to parse as JSON first
-                                metadata[field] = (
-                                    json.loads(text_chunks[field])
-                                    if isinstance(text_chunks[field], str)
-                                    else text_chunks[field]
-                                )
+                                metadata[field] = json.loads(text_chunks[field])
                             except (json.JSONDecodeError, TypeError):
                                 # Store as string if not valid JSON
                                 metadata[field] = text_chunks[field]

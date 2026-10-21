@@ -10,6 +10,7 @@ Verifies that:
 import asyncio
 import json
 import os
+from contextlib import closing
 import sys
 import tempfile
 import types
@@ -33,13 +34,13 @@ class TestGalleryDiagnosticsDbPath(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             custom_path = os.path.join(tmpdir, "custom.db")
-            fake_config_mod = types.ModuleType("promptmanager_core.config")
+            fake_config_mod = types.ModuleType("py.config")
             fake_pm_config = type(
                 "PromptManagerConfig", (), {"DEFAULT_DB_PATH": custom_path}
             )
             fake_config_mod.PromptManagerConfig = fake_pm_config
 
-            with patch.dict(sys.modules, {"promptmanager_core.config": fake_config_mod, "py.config": fake_config_mod}):
+            with patch.dict(sys.modules, {"py.config": fake_config_mod}):
                 diag = GalleryDiagnostics()
 
             self.assertEqual(diag.db_path, custom_path)
@@ -63,13 +64,13 @@ class TestGalleryDiagnosticsDbPath(unittest.TestCase):
         """A relative path from config should resolve against extension root."""
         from utils.diagnostics import GalleryDiagnostics
 
-        fake_config_mod = types.ModuleType("promptmanager_core.config")
+        fake_config_mod = types.ModuleType("py.config")
         fake_pm_config = type(
             "PromptManagerConfig", (), {"DEFAULT_DB_PATH": "data/prompts.db"}
         )
         fake_config_mod.PromptManagerConfig = fake_pm_config
 
-        with patch.dict(sys.modules, {"promptmanager_core.config": fake_config_mod, "py.config": fake_config_mod}):
+        with patch.dict(sys.modules, {"py.config": fake_config_mod}):
             diag = GalleryDiagnostics()
 
         expected = os.path.join(EXTENSION_ROOT, "data", "prompts.db")
@@ -84,9 +85,18 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
 
     def _make_api_stub(self, db_path):
         """Create a minimal object that mimics the admin mixin's self."""
+        from py.api import PromptManagerAPI
+
         stub = MagicMock()
         stub.db.model.db_path = db_path
         stub.logger = MagicMock()
+        stub._public_path = PromptManagerAPI._public_path
+        stub._public_error = PromptManagerAPI._public_error
+
+        async def run_in_executor(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        stub._run_in_executor = run_in_executor
         return stub
 
     def _run_async(self, coro):
@@ -102,21 +112,22 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
         if "server" not in sys.modules:
             sys.modules["server"] = MagicMock()
 
-        from promptmanager_core.api.admin import AdminRoutesMixin
+        from py.api.admin import AdminRoutesMixin
 
-        f = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-        db_file = f.name
-        f.close()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+            db_file = f.name
 
         try:
             import sqlite3
 
-            with sqlite3.connect(db_file) as conn:
+            with closing(sqlite3.connect(db_file)) as conn, conn:
                 conn.execute(
-                    "CREATE TABLE prompts (id INTEGER PRIMARY KEY, text TEXT, created_at TEXT)"
+                    "CREATE TABLE prompts "
+                    "(id INTEGER PRIMARY KEY, text TEXT, created_at TEXT)"
                 )
                 conn.execute(
-                    "INSERT INTO prompts (text, created_at) VALUES ('test', '2024-01-01')"
+                    "INSERT INTO prompts (text, created_at) "
+                    "VALUES ('test', '2024-01-01')"
                 )
 
             stub = self._make_api_stub(db_file)
@@ -129,20 +140,14 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
             self.assertEqual(body["diagnostics"]["database"]["status"], "ok")
             self.assertEqual(body["diagnostics"]["database"]["prompt_count"], 1)
         finally:
-            for suffix in ("", "-wal", "-shm"):
-                p = db_file + suffix
-                if os.path.exists(p):
-                    try:
-                        os.unlink(p)
-                    except Exception:
-                        pass
+            os.unlink(db_file)
 
     def test_run_diagnostics_reports_missing_custom_path(self):
         """If the configured db_path doesn't exist, diagnostics should report error."""
         if "server" not in sys.modules:
             sys.modules["server"] = MagicMock()
 
-        from promptmanager_core.api.admin import AdminRoutesMixin
+        from py.api.admin import AdminRoutesMixin
 
         stub = self._make_api_stub("/nonexistent/custom/prompts.db")
 
@@ -150,46 +155,48 @@ class TestAdminEndpointsUseConfigPath(unittest.TestCase):
         body = json.loads(result.body)
         self.assertTrue(body["success"])
         self.assertEqual(body["diagnostics"]["database"]["status"], "error")
-        self.assertIn(
-            "/nonexistent/custom/prompts.db",
-            body["diagnostics"]["database"]["message"],
-        )
+        # The message names the file but never the absolute server path.
+        message = body["diagnostics"]["database"]["message"]
+        self.assertIn("prompts.db", message)
+        self.assertNotIn("/nonexistent/custom", message)
 
     def test_backup_uses_model_db_path(self):
         """backup_database should read from self.db.model.db_path."""
         if "server" not in sys.modules:
             sys.modules["server"] = MagicMock()
 
-        from promptmanager_core.api.admin import AdminRoutesMixin
+        from py.api.admin import AdminRoutesMixin
 
-        f = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-        f.write(b"SQLite format 3\x00test data for backup")
-        db_file = f.name
-        f.close()
+        from database.operations import PromptDatabase
 
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as f:
+            db_file = f.name
+
+        # A WAL-safe backup copies pages through sqlite itself, so the
+        # configured path has to hold a real database, not arbitrary bytes.
+        real_db = PromptDatabase(db_file)
         try:
             stub = self._make_api_stub(db_file)
+            stub.db.model = real_db.model
             result = self._run_async(
                 AdminRoutesMixin.backup_database(stub, MagicMock())
             )
 
             self.assertEqual(result.content_type, "application/octet-stream")
             self.assertGreater(len(result.body), 0)
+            self.assertTrue(result.body.startswith(b"SQLite format 3\x00"))
         finally:
+            real_db.close_all()
             for suffix in ("", "-wal", "-shm"):
-                p = db_file + suffix
-                if os.path.exists(p):
-                    try:
-                        os.unlink(p)
-                    except Exception:
-                        pass
+                if os.path.exists(db_file + suffix):
+                    os.unlink(db_file + suffix)
 
     def test_backup_reports_missing_custom_path(self):
         """backup_database should return 404 when configured path doesn't exist."""
         if "server" not in sys.modules:
             sys.modules["server"] = MagicMock()
 
-        from promptmanager_core.api.admin import AdminRoutesMixin
+        from py.api.admin import AdminRoutesMixin
 
         stub = self._make_api_stub("/nonexistent/custom/prompts.db")
 

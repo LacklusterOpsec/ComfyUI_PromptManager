@@ -1,14 +1,18 @@
 # Runtime dependencies
-watchdog>=2.1.0
-Pillow>=8.0.0
-aiohttp>=3.8.0
+watchdog>=6.0.0
+Pillow>=12.3.0
+aiohttp>=3.14.5
+
+# Tests and coverage
+coverage>=7.16.2
+numpy>=2.2.6  # WD14 engine tests
 
 # Code quality
-black>=24.0.0
-flake8>=7.0.0
+black>=26.10.1
+flake8>=7.4.1
 
 # Security scanning
-bandit[toml]>=1.7.0
+bandit[toml]>=1.9.4
 
 # Pre-commit hooks
-pre-commit>=4.0.0
+pre-commit>=4.6.2

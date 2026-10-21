@@ -6,7 +6,6 @@ OUTPUT_IS_LIST=True, allowing direct connection to nodes that accept list inputs
 """
 
 import re
-from typing import Any, Dict, List, Tuple
 
 try:
     from .utils.logging_config import get_logger
@@ -31,13 +30,13 @@ except ImportError:
     InputTypeDict = dict
 
 try:
-    from .database.operations import get_prompt_database
+    from .database.operations import PromptDatabase
 except ImportError:
     import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from database.operations import get_prompt_database
+    from database.operations import PromptDatabase
 
 
 class PromptSearchList(ComfyNodeABC):
@@ -55,7 +54,7 @@ class PromptSearchList(ComfyNodeABC):
     def __init__(self):
         self.logger = get_logger("prompt_search_list.node")
         self.logger.debug("Initializing PromptSearchList node")
-        self.db = get_prompt_database()
+        self.db = PromptDatabase()
 
     @classmethod
     def INPUT_TYPES(cls) -> InputTypeDict:
@@ -80,7 +79,9 @@ class PromptSearchList(ComfyNodeABC):
                     IO.STRING,
                     {
                         "default": "",
-                        "tooltip": "Comma-separated list of tags to filter by (partial match)",
+                        "tooltip": (
+                            "Comma-separated list of tags to filter by (partial match)"
+                        ),
                     },
                 ),
                 "min_rating": (
@@ -105,7 +106,10 @@ class PromptSearchList(ComfyNodeABC):
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "Skip prompts containing Clip_1/Clip_2/etc. multi-part markers",
+                        "tooltip": (
+                            "Skip prompts containing Clip_1/Clip_2/etc. "
+                            "multi-part markers"
+                        ),
                     },
                 ),
             },
@@ -138,7 +142,6 @@ class PromptSearchList(ComfyNodeABC):
         min_rating: int = 0,
         limit: int = 50,
         skip_multipart: bool = True,
-        **kwargs,
     ):
         """
         Search for prompts matching the given criteria.
@@ -220,14 +223,7 @@ class PromptSearchList(ComfyNodeABC):
 
     @classmethod
     def IS_CHANGED(
-        cls,
-        text="",
-        category="",
-        tags="",
-        min_rating=0,
-        limit=50,
-        skip_multipart=True,
-        **kwargs,
+        cls, text="", category="", tags="", min_rating=0, limit=50, skip_multipart=True
     ):
         """
         Always re-execute to get fresh results from the database.
