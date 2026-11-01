@@ -16,6 +16,7 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.background_stops import stop_tracker  # noqa: E402
 from database.operations import PromptDatabase
 from prompt_manager_base import PromptManagerBase
 from utils.hashing import generate_prompt_hash
@@ -477,10 +478,19 @@ class TestPendingFirstUse(unittest.TestCase):
 class FakeTracker:
     def __init__(self):
         self.calls = []
+        self.runs = []
 
-    def set_current_prompt(self, prompt_text, additional_data=None, push_to_queue=True):
+    def set_current_prompt(
+        self, prompt_text, additional_data=None, push_to_queue=True, **run
+    ):
         self.calls.append({"text": prompt_text, "push_to_queue": push_to_queue})
+        self.runs.append(run)
         return "exec-1"
+
+    def mark_empty(self, run_key=None, run_id=None, push_to_queue=False):
+        self.calls.append(
+            {"empty": True, "run_key": run_key, "push_to_queue": push_to_queue}
+        )
 
 
 class TestNodeRoles(DbTestCase):
@@ -587,6 +597,7 @@ class TestNodeRoles(DbTestCase):
 class TestTrackerQueueFlag(unittest.TestCase):
     def setUp(self):
         self.tracker = PromptTracker(mock.Mock())
+        self.addCleanup(stop_tracker, self, self.tracker)
 
     def test_push_to_queue_false_keeps_the_batch_queue_empty(self):
         self.tracker.set_current_prompt("a cat", {"prompt_id": 1}, push_to_queue=False)

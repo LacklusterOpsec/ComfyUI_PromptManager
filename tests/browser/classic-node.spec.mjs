@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { test, expect } from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import { test, expect } from './fixtures.mjs';
 import { startCoverage, saveCoverage } from '../../tools/vendor/browser-coverage.mjs';
 
 test.beforeEach(async ({page, browserName}) => {
@@ -7,7 +7,7 @@ test.beforeEach(async ({page, browserName}) => {
     page.classicErrors = [];
     page.on('pageerror', error => page.classicErrors.push(error.message));
     await page.route('**/scripts/app.js', route => route.fulfill({contentType:'text/javascript', body:'export const app = window.fixtureApp;'}));
-    await page.route('**/scripts/api.js', route => route.fulfill({contentType:'text/javascript', body:'export const api = {fileURL: path => path, queuePrompt: async (...args) => args};'}));
+    await page.route('**/scripts/api.js', route => route.fulfill({contentType:'text/javascript', body:'export const api = {fileURL: path => (window.fixtureApiBase ?? "") + path, queuePrompt: async (...args) => args};'}));
     await page.route('**/extensions/promptmanager/prompt_manager.js', route => route.fulfill({contentType:'text/javascript', body:readFileSync(new URL('../../web/comfy/prompt_manager.js', import.meta.url),'utf8')}));
     await page.goto('/prompt_manager/test');
     await page.evaluate(() => {
@@ -19,7 +19,7 @@ test.beforeEach(async ({page, browserName}) => {
         await import('/extensions/promptmanager/prompt_manager.js');
         class Node {
             constructor(){
-                this.widgets=['text','category','tags','search_text'].map(name=>({name,value:'',inputEl:document.createElement('textarea')}));
+                this.widgets=[...['text','category','tags','search_text'].map(name=>({name,value:'',inputEl:document.createElement('textarea')})),{name:'save_to_library',type:'toggle',value:true}];
                 this.widgets_values=[]; this.inputs=[];
             }
             addDOMWidget(name,type,element){document.body.append(element);return {element};}
@@ -34,6 +34,14 @@ test.beforeEach(async ({page, browserName}) => {
 test.afterEach(async ({page,browserName}) => {
     await saveCoverage(page,browserName);
     expect(page.classicErrors).toEqual([]);
+});
+
+test('Classic loads an older workflow with Save to library on and keeps a saved off (#90)',async({page})=>{
+    // A workflow saved before the switch held the search UI's slot ('') at the switch's index
+    const loaded=await page.evaluate(()=>{const widget=node.widgets.find(w=>w.name==='save_to_library');widget.value='';node.configure({});return widget.value;});
+    expect(loaded).toBe(true);
+    const off=await page.evaluate(()=>{const widget=node.widgets.find(w=>w.name==='save_to_library');widget.value=false;node.configure({});return [widget.value,node.serialize().widgets_values[4]];});
+    expect(off).toEqual([false,false]);
 });
 
 test('Classic keeps immediate selection, search query and metadata serialization',async({page})=>{
@@ -56,8 +64,31 @@ test('Classic keeps immediate selection, search query and metadata serialization
     await expect(page.getByRole('button',{name:'🌐 Web UI',exact:true})).toBeVisible();
 });
 
+test('Classic Web UI opens the workspace Library in the saved display mode, through the mount prefix (#525)',async({page})=>{
+    await page.evaluate(()=>{window.fixtureApiBase='/mounted';window.open=(...args)=>{window.openArgs=args;return {};};});
+    const webUi=page.getByRole('button',{name:'🌐 Web UI',exact:true});
+    for (const [mode,args] of [
+        ['newtab',['/mounted/prompt_manager/workspace#/library','_blank']],
+        ['popup',['/mounted/prompt_manager/workspace#/library','_blank','width=1200,height=800,scrollbars=yes,resizable=yes']],
+    ]) {
+        await page.evaluate(value=>{node.properties.webuiDisplayMode=value;},mode);
+        await webUi.click();
+        expect(await page.evaluate(()=>window.openArgs)).toEqual(args);
+    }
+});
+
+test('Classic Web UI reports a blocked popup and keeps the canvas open (#525)',async({page})=>{
+    const before=page.url();
+    await page.evaluate(()=>{window.open=()=>null;});
+    await page.getByRole('button',{name:'🌐 Web UI',exact:true}).click();
+    await expect(page.getByText('Allow popups to open Web UI, then try again.')).toBeVisible();
+    expect(page.url()).toBe(before);
+    await expect(page.locator('.pm-classic')).toBeVisible();
+});
+
 test('Classic detaches native text synchronization on removal',async({page})=>{
-    await page.waitForTimeout(60);
+    // The page installs the text sync (serializeValue and its listeners) in a 50 ms timer; wait for it, not for time.
+    await expect.poll(()=>page.evaluate(()=>typeof node.widgets.find(item=>item.name==='text').serializeValue)).toBe('function');
     const values=await page.evaluate(()=>{
         const widget=node.widgets.find(item=>item.name==='text');
         widget.inputEl.value='Before removal';widget.inputEl.dispatchEvent(new Event('input'));
@@ -147,4 +178,50 @@ test('Classic test button reports success and failure and releases expired notif
     await expect(page.locator('.pm-classic-results [role="alert"]')).toContainText('Not ready');
     await page.clock.fastForward(3001);
     await expect(page.locator('.pm-classic-notification')).toHaveCount(0);
+});
+
+test('Classic shows linked text, keeps the typed text through save and refuses to overwrite it (#343)',async({page})=>{
+    await page.route('**/prompt_manager/recent?**',route=>route.fulfill({json:{success:true,results:[{text:'Saved prompt',tags:[]}]}}));
+    const note=page.locator('.pm-classic').getByText('Text comes from a link. Your typed text is kept for when you disconnect it.',{exact:true});
+    await expect(note).toBeHidden();
+    await page.evaluate(()=>{
+        const widget=node.widgets.find(item=>item.name==='text');widget.value=widget.inputEl.value='Typed classic';
+        node.inputs=[{name:'text',type:'STRING',link:3,widget:{name:'text'}}];node.onConnectionsChange();
+    });
+    await expect(note).toBeVisible();
+    // The link drives the run; the saved workflow keeps what the user typed, not a stale or empty value.
+    expect(await page.evaluate(()=>node.serialize().widgets_values[0])).toBe('Typed classic');
+    await page.getByRole('button',{name:'📋 Recent',exact:true}).click();
+    await page.getByRole('button',{name:/Saved prompt/}).click();
+    expect(await page.evaluate(()=>node.widgets.find(item=>item.name==='text').value)).toBe('Typed classic');
+    await expect(page.getByRole('alert').filter({hasText:'Text comes from a link. Disconnect it to use a saved prompt.'})).toBeVisible();
+    await page.evaluate(()=>{node.inputs[0].link=null;node.onConnectionsChange();});
+    await expect(note).toBeHidden();
+    await page.getByRole('button',{name:/Saved prompt/}).click();
+    expect(await page.evaluate(()=>node.widgets.find(item=>item.name==='text').value)).toBe('Saved prompt');
+    // A workflow load re-evaluates the link state.
+    await page.evaluate(()=>{node.inputs[0].link=8;node.configure({});});
+    await expect(note).toBeVisible();
+});
+
+test('PromptManagerText shows linked text in its legacy controls and keeps the typed text (#343)',async({page})=>{
+    await page.evaluate(async()=>{
+        class TextNode {
+            constructor(){this.widgets=['text','category','tags','search_text'].map(name=>({name,value:'',inputEl:document.createElement('textarea')}));this.widgets_values=[];this.inputs=[{name:'text',type:'STRING',link:null,widget:{name:'text'}}];}
+            addDOMWidget(name,type,element){element.id='legacy-text-node';document.body.append(element);return {element};}
+            setSize(){} setDirtyCanvas(){} serialize(){return {properties:{...this.properties}};}
+        }
+        await fixtureApp.extensions[0].beforeRegisterNodeDef(TextNode,{name:'PromptManagerText'},fixtureApp);
+        window.textNode=new TextNode();textNode.onNodeCreated();
+        const widget=textNode.widgets[0];widget.value=widget.inputEl.value='Typed text node';
+    });
+    const note=page.locator('#legacy-text-node').getByText('Text comes from a link. Your typed text is kept for when you disconnect it.',{exact:true});
+    await expect(note).toBeHidden();
+    await page.evaluate(()=>{textNode.inputs[0].link=5;textNode.onConnectionsChange();});
+    await expect(note).toBeVisible();
+    expect(await page.evaluate(()=>textNode.serialize().widgets_values[0])).toBe('Typed text node');
+    await page.evaluate(()=>{textNode.usePrompt({text:'Replacement'},0);});
+    expect(await page.evaluate(()=>textNode.widgets[0].value)).toBe('Typed text node');
+    await page.evaluate(()=>{textNode.inputs[0].link=null;textNode.onConnectionsChange();textNode.onRemoved();});
+    await expect(note).toBeHidden();
 });

@@ -27,7 +27,7 @@ function envelope(entry = image()) {
             workflow_graph: { status: 'absent', value: null }, parameters: null,
         },
         resolution: { state: 'ambiguous', sampler_id: null, reason: 'unknown negative' },
-        library: { status: 'linked', scope: 'saved-library', positive_id: 7, pair_id: 8, title: 'Recipe', category: 'Subject', tags: ['cat'], metadata_scope: 'pair' },
+        library: { status: 'linked', scope: 'saved-library', positive_id: 7, pair_id: 8, title: 'Recipe', category: 'Subject', tags: ['cat'], category_scope: 'pair', tags_scope: 'pair' },
     };
 }
 function pendingApi() {
@@ -276,6 +276,11 @@ test('record rejects root path media and invalid versioned fields with retryable
         data => { data.file.size = -1; }, data => { data.library.positive_id = 9007199254740992; },
         data => { data.metadata.prompt_graph = { status: 'limited', value: {} }; },
         data => { data.resolution.sampler_id = {}; },
+        data => { data.library.tags_scope = 'recipe'; },
+        data => { data.library.category_scope = 'recipe'; },
+        data => { data.library.tags_scope = 'image'; },
+        data => { delete data.library.category_scope; },
+        data => { delete data.library.tags_scope; },
     ]) {
         const data = envelope(); mutate(data);
         assert.throws(() => toRecord(data, image(), extractGenerationFacts), error => error instanceof TypeError && !error.refreshRequired);
@@ -534,6 +539,136 @@ test('a definite server prompt is kept even when the legacy parser reads it diff
     assert.equal(record.prompts.positive.text, 'a lighthouse at dusk, oil painting');
 });
 
+// #249: a LoRA compare grid. Every sampler's negative is a ConditioningZeroOut of the
+// positive encode; the legacy parser follows the zero-out back to the positive text.
+function zeroedGridGraph(samplers = 3) {
+    const graph = {
+        1: { class_type: 'UNETLoader', inputs: { unet_name: 'base.safetensors', weight_dtype: 'default' } },
+        2: { class_type: 'CLIPLoader', inputs: { clip_name: 'te.safetensors', type: 'stable_diffusion' } },
+        4: { class_type: 'CLIPTextEncode', inputs: { text: 'a woman holding a coffee cup', clip: ['2', 0] } },
+        5: { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['4', 0] } },
+        6: { class_type: 'EmptyLatentImage', inputs: { width: 512, height: 512, batch_size: 1 } },
+    };
+    for (let index = 0; index < samplers; index++) {
+        graph[`1${index}`] = { class_type: 'LoraLoaderModelOnly', inputs: { lora_name: `epoch_${index}.safetensors`, strength_model: 1, model: ['1', 0] } };
+        graph[`2${index}`] = { class_type: 'KSampler', inputs: { seed: 42, steps: 8, cfg: 1, sampler_name: 'euler', scheduler: 'simple', denoise: 1,
+            model: [`1${index}`, 0], positive: ['4', 0], negative: ['5', 0], latent_image: ['6', 0] } };
+    }
+    return graph;
+}
+
+function undecided(graph) {
+    const entry = image(), data = envelope(entry);
+    data.prompts = { positive: { status: 'ambiguous', text: null, source: null }, negative: { status: 'ambiguous', text: null, source: null } };
+    data.metadata.prompt_graph = { status: 'parsed', value: graph };
+    data.resolution = { state: 'ambiguous', sampler_id: null, reason: 'Multiple sampler branches' };
+    return contract('toInspectionRecord')(data, entry, extractGenerationFacts);
+}
+
+test('a zeroed negative is never filled with the positive text from the legacy parse (#249)', t => {
+    const parser = require('../../web/js/comfy-metadata.js');
+    globalThis.ComfyMetadata = parser;
+    t.after(() => { delete globalThis.ComfyMetadata; });
+    // The legacy pages keep their reading: the zero-out passes the positive through.
+    assert.equal(parser.extractGenerationParams({ prompt: zeroedGridGraph() }).negativePrompt, 'a woman holding a coffee cup');
+    const record = undecided(zeroedGridGraph());
+    assert.deepEqual(record.prompts.positive, { status: 'resolved', text: 'a woman holding a coffee cup', source: 'graph-inferred' });
+    assert.deepEqual(record.prompts.negative, { status: 'resolved', text: '', source: 'zeroed-conditioning' });
+    // Behind an API-graph Reroute the legacy parse reads no negative, so there is nothing
+    // to correct: the server's answer stays.
+    const rerouted = zeroedGridGraph(1);
+    rerouted[7] = { class_type: 'Reroute', inputs: { value: ['5', 0] } };
+    rerouted[20].inputs.negative = ['7', 0];
+    assert.equal(parser.legacyNegativeSource({ prompt: rerouted }), null);
+    assert.deepEqual(undecided(rerouted).prompts.negative, { status: 'ambiguous', text: null, source: null });
+});
+
+test('the zero-out check follows the sampler the legacy parse read (#249)', t => {
+    const parser = require('../../web/js/comfy-metadata.js');
+    globalThis.ComfyMetadata = parser;
+    t.after(() => { delete globalThis.ComfyMetadata; });
+    const zeroed = { status: 'resolved', text: '', source: 'zeroed-conditioning' };
+    // The legacy parse reads the first sampler (20): its negative is the zero-out.
+    const mixed = zeroedGridGraph(2);
+    mixed[8] = { class_type: 'CLIPTextEncode', inputs: { text: 'blurry', clip: ['2', 0] } };
+    mixed[21].inputs.negative = ['8', 0];
+    assert.deepEqual(undecided(mixed).prompts.negative, zeroed);
+    // Reversed: the sampler it reads encodes "blurry", which it showed before and still does.
+    const reversed = zeroedGridGraph(2);
+    reversed[8] = { class_type: 'CLIPTextEncode', inputs: { text: 'blurry', clip: ['2', 0] } };
+    reversed[20].inputs.negative = ['8', 0];
+    assert.equal(parser.extractGenerationParams({ prompt: reversed }).negativePrompt, 'blurry');
+    assert.deepEqual(undecided(reversed).prompts.negative, { status: 'resolved', text: 'blurry', source: 'graph-inferred' });
+    // The positive fills from the legacy parse in both cases.
+    assert.equal(undecided(mixed).prompts.positive.text, 'a woman holding a coffee cup');
+    assert.equal(undecided(reversed).prompts.positive.text, 'a woman holding a coffee cup');
+});
+
+test('a zero-out mixed into the read negative leaves it as the server left it (#249)', t => {
+    globalThis.ComfyMetadata = require('../../web/js/comfy-metadata.js');
+    t.after(() => { delete globalThis.ComfyMetadata; });
+    // A zero-out combined with another conditioning is not an empty negative.
+    const combined = zeroedGridGraph(1);
+    combined[8] = { class_type: 'CLIPTextEncode', inputs: { text: 'blurry', clip: ['2', 0] } };
+    combined[9] = { class_type: 'ConditioningCombine', inputs: { conditioning_1: ['5', 0], conditioning_2: ['8', 0] } };
+    combined[20].inputs.negative = ['9', 0];
+    assert.deepEqual(undecided(combined).prompts.negative, { status: 'ambiguous', text: null, source: null });
+});
+
+function workflowOnly(workflow) {
+    const entry = image(), data = envelope(entry);
+    data.prompts = { positive: { status: 'unresolved', text: null, source: null }, negative: { status: 'unresolved', text: null, source: null } };
+    Object.assign(data.metadata, { raw: { workflow: JSON.stringify(workflow) }, record_formats: { workflow: 'reserialized-json' },
+        prompt_graph: { status: 'absent', value: null }, workflow_graph: { status: 'parsed', value: workflow } });
+    return contract('toInspectionRecord')(data, entry, extractGenerationFacts);
+}
+
+// A UI workflow: encode 4 -> zero-out 5 -> sampler 3's negative, encode 4 -> positive.
+function zeroedWorkflow({ zeroMode = 0, extraNodes = [], extraLinks = [], negativeLink = 3 } = {}) {
+    return { nodes: [
+        { id: 4, type: 'CLIPTextEncode', inputs: [], outputs: [{ links: [1, 2] }], widgets_values: ['a woman holding a coffee cup'] },
+        { id: 5, type: 'ConditioningZeroOut', mode: zeroMode, inputs: [{ name: 'conditioning', type: 'CONDITIONING', link: 1 }], outputs: [{ links: [3] }] },
+        { id: 1, type: 'UNETLoader', inputs: [], outputs: [{ links: [4] }], widgets_values: ['base.safetensors', 'default'] },
+        { id: 3, type: 'KSampler', inputs: [{ name: 'model', link: 4 }, { name: 'positive', link: 2 }, { name: 'negative', link: negativeLink }], widgets_values: [42, 'fixed', 8, 1, 'euler', 'simple', 1] },
+        ...extraNodes,
+    ], links: [[1, 4, 0, 5, 0, 'CONDITIONING'], [2, 4, 0, 3, 1, 'CONDITIONING'], [3, 5, 0, 3, 2, 'CONDITIONING'], [4, 1, 0, 3, 0, 'MODEL'], ...extraLinks] };
+}
+
+test('workflow-only files follow the legacy reading of their zero-out (#249)', t => {
+    const parser = require('../../web/js/comfy-metadata.js');
+    globalThis.ComfyMetadata = parser;
+    t.after(() => { delete globalThis.ComfyMetadata; });
+    // A connected zero-out on the read sampler's negative is the zeroed empty negative.
+    const direct = zeroedWorkflow();
+    assert.equal(parser.extractGenerationParams({ workflow: direct }).negativePrompt, 'a woman holding a coffee cup', 'the legacy parse would fill it');
+    assert.deepEqual(workflowOnly(direct).prompts.negative, { status: 'resolved', text: '', source: 'zeroed-conditioning' });
+    // A bypassed zero-out (mode 4) passes its conditioning through: the legacy reading is right.
+    const bypassed = workflowOnly(zeroedWorkflow({ zeroMode: 4 }));
+    assert.deepEqual(bypassed.prompts.negative, { status: 'resolved', text: 'a woman holding a coffee cup', source: 'graph-inferred' });
+    // An unconnected zero-out beside a text negative changes nothing.
+    const unconnected = workflowOnly(zeroedWorkflow({ negativeLink: 6,
+        extraNodes: [{ id: 6, type: 'CLIPTextEncode', inputs: [], outputs: [{ links: [6] }], widgets_values: ['blurry'] }],
+        extraLinks: [[6, 6, 0, 3, 2, 'CONDITIONING']] }));
+    assert.deepEqual(unconnected.prompts.negative, { status: 'resolved', text: 'blurry', source: 'graph-inferred' });
+});
+
+test('a negative read through a subgraph holding a zero-out is not filled (#249)', t => {
+    const parser = require('../../web/js/comfy-metadata.js');
+    globalThis.ComfyMetadata = parser;
+    t.after(() => { delete globalThis.ComfyMetadata; });
+    // The sampler's negative comes from a subgraph instance whose definition zeroes it.
+    const definition = 'aaaaaaaa-0000-4000-8000-000000000001';
+    const workflow = zeroedWorkflow({ negativeLink: 7,
+        extraNodes: [{ id: 9, type: definition, inputs: [{ name: 'conditioning', type: 'CONDITIONING', link: 8 }], outputs: [{ links: [7] }] }],
+        extraLinks: [[7, 9, 0, 3, 2, 'CONDITIONING'], [8, 4, 0, 9, 0, 'CONDITIONING']] });
+    workflow.definitions = { subgraphs: [{ id: definition, nodes: [{ id: 1, type: 'ConditioningZeroOut', inputs: [], outputs: [] }], links: [] }] };
+    assert.equal(parser.extractGenerationParams({ workflow }).negativePrompt, 'a woman holding a coffee cup', 'the legacy parse would fill it');
+    assert.deepEqual(workflowOnly(workflow).prompts.negative, { status: 'unresolved', text: null, source: null });
+    // The same instance of a definition without a zero-out keeps the legacy fill.
+    workflow.definitions.subgraphs[0].nodes[0].type = 'Reroute';
+    assert.equal(workflowOnly(workflow).prompts.negative.text, 'a woman holding a coffee cup');
+});
+
 test('callers without the browser global pass the legacy parser explicitly', () => {
     const parser = require('../../web/js/comfy-metadata.js');
     const entry = image(), data = envelope(entry);
@@ -567,4 +702,255 @@ test('a workflow the legacy parser throws on keeps the server result instead of 
     const record = contract('toInspectionRecord')(data, entry, extractGenerationFacts);
     assert.deepEqual(record.prompts.positive, { status: 'resolved', text: 'exact\npositive', source: 'execution' });
     assert.equal(record.prompts.negative.status, 'ambiguous');
+});
+
+// PR L2 Task 4(a): an adapter that reads by itself (the local file adapter) never reaches the API.
+test('controller prefers adapter.read and never touches api', async () => {
+    const createController = contract('createInspectionController');
+    const forbidden = new Proxy({}, { get(_, key) { assert.fail(`api.${String(key)} touched`); } });
+    const reads = [], records = [];
+    const adapter = {
+        validate(item) { if (!item?.key) throw new TypeError('bad'); }, key: item => item.key, scope: () => 'own', inspectionPath: item => `own:${item.key}`,
+        read(item, options) { const pending = {}; reads.push({ item, options, pending }); return new Promise((resolve, reject) => Object.assign(pending, { resolve, reject })); },
+        toRecord(result, item) { records.push([result, item.key]); return { identity: { kind: 'own', key: item.key }, prompts: result.prompts }; },
+    };
+    for (const api of [forbidden, null]) {
+        reads.length = 0; records.length = 0;
+        const controller = createController({ api, adapter, extractFacts: extractGenerationFacts });
+        const first = controller.select({ key: 'a' });
+        assert.equal(reads.length, 1);
+        assert.equal(reads[0].item.key, 'a');
+        assert.ok(reads[0].options.signal instanceof AbortSignal);
+        assert.equal(controller.state.loading, true);
+        const second = controller.select({ key: 'b' });
+        assert.equal(reads[0].options.signal.aborted, true, 'a new selection aborts the previous read');
+        reads[0].pending.resolve({ prompts: { positive: { status: 'resolved', text: 'late' } } });
+        await first;
+        assert.equal(controller.state.record, null, 'a superseded read never publishes');
+        reads[1].pending.resolve({ prompts: { positive: { status: 'resolved', text: 'current' } } });
+        await second;
+        assert.deepEqual(records.map(([, key]) => key), ['b']);
+        assert.equal(controller.state.record.prompts.positive.text, 'current');
+        const retry = controller.retry();
+        reads[2].pending.reject(new Error('read failed'));
+        await retry;
+        assert.equal(controller.state.error, true);
+        assert.equal(controller.state.message, 'Could not read details from this file.');
+        controller.dispose();
+    }
+});
+
+test('rooted and history adapters are unchanged', async () => {
+    const createController = contract('createInspectionController');
+    const { reportedLocationAdapter } = await import('../../web/js/workspace/history-media.mjs');
+    for (const adapter of [module.rootedFileAdapter, reportedLocationAdapter]) {
+        assert.equal(adapter.read, undefined, 'server adapters read through the API');
+        assert.equal(adapter.mediaUrl, undefined, 'server adapters keep the cache-busted original');
+    }
+    const { api, requests } = pendingApi();
+    const rooted = createController({ api, extractFacts: extractGenerationFacts });
+    rooted.select(image());
+    assert.deepEqual(requests.map(request => request.url), [`/prompt_manager/images/inspect/folder/a%20%23%25.png?root=0&root_scope=${scopeA}`]);
+    rooted.dispose();
+    const run = '22222222-2222-2222-2222-222222222222', epoch = '11111111-1111-1111-1111-111111111111';
+    const query = new URLSearchParams({ node: '1', ordinal: '1', epoch, current_scope: scopeA }), base = `/prompt_manager/history/runs/${run}/output/current`;
+    const target = { kind: 'reported-location', location_key: 'c'.repeat(64), history_epoch: epoch, current_scope: scopeA, occurrence: { run_id: run, output_node_id: '1', image_ordinal: 1 },
+        reference: { folder_type: 'output', subfolder: '', filename: 'a.png', path_style: 'posix', root_key: scopeB }, filename: 'a.png', is_video: false,
+        url: `${base}/media?${query}`, thumbnail_url: `${base}/thumbnail?${query}`, inspection_url: `${base}/inspection?${query}` };
+    const history = pendingApi(), recorded = createController({ api: history.api, adapter: reportedLocationAdapter, extractFacts: extractGenerationFacts });
+    recorded.select(target);
+    assert.deepEqual(history.requests.map(request => request.url), [target.inspection_url]);
+    recorded.dispose();
+});
+
+test('fileFor rejects selected-local-file for rooted identity', () => {
+    const entry = image(), data = envelope(entry);
+    data.file = { ...data.file, observation: 'selected-local-file', source_label: 'Selected local file' };
+    assert.throws(() => contract('toInspectionRecord')(data, entry, extractGenerationFacts), /Invalid inspection file/);
+    const project = contract('projectInspectionPayload');
+    assert.throws(() => project(data, { kind: 'rooted-file', key: 'k', path: 'a.png' }, null, extractGenerationFacts), /Invalid inspection file/);
+    assert.throws(() => project(envelope(entry), { kind: 'local-file', key: 'local:1', path: 'a.png' }, null, extractGenerationFacts), /Invalid inspection file/);
+    assert.equal(project(data, { kind: 'local-file', key: 'local:1', path: 'a.png' }, null, extractGenerationFacts).file.observation, 'selected-local-file');
+});
+
+// #249 PR C Task C3: the B3 envelope's `image_tags` facet, the file's own current tags (S1).
+test('image_tags facet is kept exactly and absent stays null', () => {
+    const entry = image(), project = contract('toInspectionRecord');
+    assert.equal(project(envelope(entry), entry, extractGenerationFacts).imageTags, null);
+    for (const facet of [{ state: 'current', tags: ['dunes', 'warm_light'] }, { state: 'current', tags: [] }, { state: 'none', tags: [] }, { state: 'unavailable', tags: [] }]) {
+        const data = { ...envelope(entry), image_tags: facet };
+        const record = project(data, entry, extractGenerationFacts);
+        assert.deepEqual(record.imageTags, facet);
+        assert.notEqual(record.imageTags.tags, facet.tags);
+    }
+    const hundred = Array.from({ length: 100 }, (_, index) => `tag_${index}`);
+    assert.deepEqual(project({ ...envelope(entry), image_tags: { state: 'current', tags: hundred } }, entry, extractGenerationFacts).imageTags.tags, hundred);
+});
+
+test('rejects a malformed image_tags facet', () => {
+    const entry = image();
+    for (const facet of [null, [], 'current', { state: 'current' }, { tags: [] }, { state: 'current', tags: ['a'], extra: 1 },
+        { state: 'stale', tags: [] }, { state: 'none', tags: ['a'] }, { state: 'unavailable', tags: ['a'] }, { state: 'current', tags: 'a' },
+        { state: 'current', tags: [1] }, { state: 'current', tags: [''] }, { state: 'current', tags: [' a'] }, { state: 'current', tags: ['a,b'] },
+        { state: 'current', tags: ['a\nb'] }, { state: 'current', tags: ['x'.repeat(51)] },
+        { state: 'current', tags: Array.from({ length: 101 }, (_, index) => `tag_${index}`) }]) {
+        assert.throws(() => module.toInspectionRecord({ ...envelope(entry), image_tags: facet }, entry, extractGenerationFacts), TypeError, JSON.stringify(facet));
+    }
+    assert.equal(module.toInspectionRecord({ ...envelope(entry), image_tags: { state: 'current', tags: ['é'.repeat(50)] } }, entry, extractGenerationFacts).imageTags.tags[0].length, 50);
+});
+
+test('refresh re-reads the selected file and keeps the shown record until the new read lands', async () => {
+    const { api, requests } = pendingApi(), updates = [];
+    const controller = contract('createInspectionController')({ api, extractFacts: extractGenerationFacts });
+    assert.equal(typeof controller.refresh, 'function', 'refresh is part of the controller');
+    controller.subscribe(state => updates.push(state));
+    const load = controller.select(image()); requests[0].resolve(envelope()); await load;
+    const shown = controller.state, count = updates.length;
+    const refresh = controller.refresh();
+    assert.equal(requests.length, 2);
+    // No loading state is published: the panel keeps its content.
+    assert.equal(controller.state, shown); assert.equal(updates.length, count);
+    requests[1].resolve({ ...envelope(), image_tags: { state: 'current', tags: ['fresh'] } }); await refresh;
+    assert.deepEqual(controller.state.record.imageTags, { state: 'current', tags: ['fresh'] });
+    assert.equal(controller.state.loading, false); assert.equal(updates.length, count + 1);
+    // A failed quiet re-read reports the failure as a read would.
+    const failing = controller.refresh(); requests[2].reject(new Error('offline')); await failing;
+    assert.equal(controller.state.error, true);
+    // Without a shown record a refresh is an ordinary retry (loading published).
+    const again = controller.refresh(); assert.equal(controller.state.loading, true);
+    requests[3].resolve(envelope()); await again; assert.equal(controller.state.error, false);
+    // A newer selection supersedes a refresh in flight.
+    const stale = controller.refresh(); const other = controller.select({ ...image(), path: 'folder/b.png', filename: 'b.png', url: image().url.replace('a%20%23%25', 'b') });
+    requests[5].resolve(envelope({ ...image(), path: 'folder/b.png', filename: 'b.png', url: image().url.replace('a%20%23%25', 'b') })); await other;
+    requests[4].resolve(envelope()); await stale;
+    assert.equal(controller.state.record.identity.path, 'folder/b.png');
+    controller.dispose(); assert.equal(await controller.refresh(), undefined);
+});
+
+test('metadata off shows an explicit load and loads once on request', async () => {
+    const { api, requests } = pendingApi(), updates = [];
+    const controller = contract('createInspectionController')({ api, extractFacts: extractGenerationFacts, autoLoad: false });
+    controller.subscribe(state => updates.push(state));
+    // Selecting reads nothing: the state says the metadata waits for a request.
+    assert.equal(controller.select(image()), undefined);
+    assert.equal(requests.length, 0);
+    assert.equal(controller.state.deferred, true);
+    assert.equal(controller.state.loading, false);
+    assert.equal(controller.state.record, null);
+    // Selecting the same file again still reads nothing.
+    controller.select({ ...image() });
+    assert.equal(requests.length, 0);
+    const load = controller.load();
+    assert.equal(requests.length, 1);
+    assert.equal(controller.state.loading, true);
+    assert.equal(controller.state.deferred, false);
+    // A second press while it reads, and the same file selected again once it loaded, read nothing more.
+    controller.load();
+    assert.equal(requests.length, 1);
+    requests[0].resolve(envelope()); await load;
+    assert.equal(controller.state.record.generation.seed.value, '9007199254740993');
+    controller.load(); controller.select(image());
+    assert.equal(requests.length, 1);
+    // Another file waits for its own request again.
+    controller.select({ ...image(), path: 'folder/b.png', filename: 'b.png', url: image().url.replace('a%20%23%25', 'b') });
+    assert.equal(controller.state.deferred, true);
+    assert.equal(requests.length, 1);
+    // The default controller loads on selection, as before.
+    const eager = contract('createInspectionController')({ api, extractFacts: extractGenerationFacts });
+    eager.select(image());
+    assert.equal(requests.length, 2);
+    assert.equal(eager.state.deferred, false);
+    eager.dispose(); controller.dispose();
+    assert.equal(controller.load(), undefined);
+});
+
+test('cache off rereads the current selection; on reuses the one current record', async () => {
+    for (const cache of [true, false]) {
+        const { api, requests } = pendingApi();
+        const controller = contract('createInspectionController')({ api, extractFacts: extractGenerationFacts, cache });
+        const first = controller.select(image());
+        // A read in flight is shared either way.
+        controller.select(image());
+        assert.equal(requests.length, 1);
+        requests[0].resolve(envelope()); await first;
+        const again = controller.select(image());
+        assert.equal(requests.length, cache ? 1 : 2, `cache ${cache}`);
+        if (!cache) { requests[1].resolve(envelope()); await again; assert.equal(controller.state.record.identity.path, 'folder/a #%.png'); }
+        controller.dispose();
+    }
+});
+
+test('cache off never rereads a selection whose source changed, and refresh never loads a deferred one', async () => {
+    const { api, requests } = pendingApi();
+    const controller = contract('createInspectionController')({ api, extractFacts: extractGenerationFacts, cache: false });
+    const first = controller.select(image());
+    requests[0].reject(new ApiError(409, refreshMessage, 'source-changed')); await first;
+    assert.equal(controller.state.refreshRequired, true);
+    controller.select(image());
+    assert.equal(requests.length, 1);
+    controller.dispose();
+    const deferred = contract('createInspectionController')({ api, extractFacts: extractGenerationFacts, autoLoad: false });
+    deferred.select(image());
+    assert.equal(deferred.refresh(), undefined);
+    assert.equal(requests.length, 1);
+    assert.equal(deferred.state.deferred, true);
+    deferred.dispose();
+});
+
+test('record carries the listing thumbnail as its preview, never another file (#249)', () => {
+    const toRecord = contract('toInspectionRecord'), entry = image();
+    const thumb = `/prompt_manager/images/serve/thumbnails/folder/a%20%23%25_thumb.png?root=0&root_scope=${scopeA}`;
+    assert.deepEqual(toRecord(envelope(entry), { ...entry, thumbnail_url: thumb }, extractGenerationFacts).preview, { url: thumb });
+    const versioned = `/prompt_manager/images/serve/thumbnails/folder/a%20%23%25_thumb.png?v=12&root=0&root_scope=${scopeA}`;
+    assert.deepEqual(toRecord(envelope(entry), { ...entry, thumbnail_url: versioned }, extractGenerationFacts).preview, { url: versioned });
+    // No thumbnail, or one naming another file, root or origin: no preview (the cover keeps the original).
+    for (const thumbnail_url of [undefined, null, '', thumb.replace('a%20%23%25_thumb', 'b_thumb'), thumb.replace('root=0', 'root=1'),
+        thumb.replace(scopeA, scopeB), `https://other.test${thumb}`, thumb.replace('thumbnails/', ''), `${thumb}#x`]) {
+        assert.equal(toRecord(envelope(entry), { ...entry, thumbnail_url }, extractGenerationFacts).preview, null, String(thumbnail_url));
+    }
+    const video = { root_index: 0, path: 'clip.MP4', filename: 'clip.MP4', url: `/prompt_manager/images/serve/clip.MP4?root=0&root_scope=${scopeA}`, root_scope: scopeA,
+        thumbnail_url: `/prompt_manager/images/serve/thumbnails/clip_thumb.jpg?root=0&root_scope=${scopeA}` };
+    const data = envelope(video); data.file = { ...data.file, media_type: 'video', extension: '.mp4', format: 'MP4' };
+    assert.deepEqual(toRecord(data, video, extractGenerationFacts).preview, { url: video.thumbnail_url });
+});
+
+test('the preview may be any thumbnail format the file owns (#317)', () => {
+    const toRecord = contract('toInspectionRecord'), entry = image();
+    const base = '/prompt_manager/images/serve/thumbnails/folder/a%20%23%25_thumb';
+    for (const extension of ['.webp', '.jxl', '.jpg', '.png']) {
+        const thumbnail_url = `${base}${extension}?v=3&root=0&root_scope=${scopeA}`;
+        assert.deepEqual(toRecord(envelope(entry), { ...entry, thumbnail_url }, extractGenerationFacts).preview, { url: thumbnail_url }, extension);
+    }
+    // Not a thumbnail format, upper case, no extension, or a legacy name another file owns: no preview.
+    for (const extension of ['.txt', '.WEBP', '', '.gif', '.jpeg', '.webp.png']) {
+        const thumbnail_url = `${base}${extension}?root=0&root_scope=${scopeA}`;
+        assert.equal(toRecord(envelope(entry), { ...entry, thumbnail_url }, extractGenerationFacts).preview, null, extension);
+    }
+    const video = { root_index: 0, path: 'clip.MP4', filename: 'clip.MP4', url: `/prompt_manager/images/serve/clip.MP4?root=0&root_scope=${scopeA}`, root_scope: scopeA };
+    const data = envelope(video); data.file = { ...data.file, media_type: 'video', extension: '.mp4', format: 'MP4' };
+    for (const [extension, owned] of [['.webp', true], ['.jxl', true], ['.jpg', true], ['.png', false]]) {
+        const thumbnail_url = `/prompt_manager/images/serve/thumbnails/clip_thumb${extension}?root=0&root_scope=${scopeA}`;
+        assert.deepEqual(toRecord(data, { ...video, thumbnail_url }, extractGenerationFacts).preview, owned ? { url: thumbnail_url } : null, extension);
+    }
+});
+
+test("names the server quotes (parentheses, '!*') still match their original and preview (#249 M11)", () => {
+    const toRecord = contract('toInspectionRecord');
+    const entry = { root_index: 0, path: "folder/a (1)!'*.png", filename: "a (1)!'*.png", root_scope: scopeA,
+        url: `/prompt_manager/images/serve/folder/a%20%281%29%21%27%2A.png?root=0&root_scope=${scopeA}`,
+        thumbnail_url: `/prompt_manager/images/serve/thumbnails/folder/a%20%281%29%21%27%2A_thumb.png?root=0&root_scope=${scopeA}` };
+    const record = toRecord(envelope(entry), entry, extractGenerationFacts);
+    assert.equal(record.download.url, entry.url);
+    assert.deepEqual(record.preview, { url: entry.thumbnail_url });
+});
+
+test('record accepts an image\'s own category on any link status (#332)', () => {
+    const toRecord = contract('toInspectionRecord');
+    for (const status of ['linked', 'none', 'ambiguous', 'unavailable']) {
+        const data = envelope();
+        Object.assign(data.library, { status, category: 'Scans', category_scope: 'image' });
+        const record = toRecord(data, image(), extractGenerationFacts);
+        assert.equal(record.library.category, 'Scans');
+        assert.equal(record.library.category_scope, 'image');
+    }
 });

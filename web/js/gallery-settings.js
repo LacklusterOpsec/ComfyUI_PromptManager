@@ -4,6 +4,9 @@
  *
  * Settings are per browser (localStorage key "gallerySettings"). Anything
  * stored can be stale or hand-edited, so every value is checked before use.
+ * The workspace shares this object ("One display configuration", #249 System
+ * S3): it adds workspaceLayout and workspaceDensity, and every key either page
+ * does not know is kept.
  *
  * Loadable in the browser (window.GallerySettings) and in Node for tests.
  */
@@ -11,6 +14,10 @@
     "use strict";
 
     const VIEW_MODES = ["grid", "list"];
+    // The workspace Images defaults; the legacy gallery's defaultViewMode has no masonry.
+    const WORKSPACE_LAYOUTS = ["grid", "list", "masonry"];
+    const WORKSPACE_DENSITIES = ["comfortable", "large", "compact"];
+    const VIEWER_OPEN_MODES = ["centered", "fullscreen"];
     const LIMIT_OPTIONS = [50, 100, 200, 500];
     const MIN_COLUMNS = 2;
     const MAX_COLUMNS = 12;
@@ -34,6 +41,11 @@
         videoAutoplay: false,
         videoMute: true,
         videoLoop: true,
+        // #451: Images opens in Masonry unless this browser chose another layout.
+        workspaceLayout: "masonry",
+        workspaceDensity: "comfortable",
+        // #450 (D156): how the workspace viewer opens.
+        viewerOpenMode: "centered",
     });
 
     function toInt(value) {
@@ -72,6 +84,9 @@
             videoAutoplay: bool(merged.videoAutoplay, DEFAULT_SETTINGS.videoAutoplay),
             videoMute: bool(merged.videoMute, DEFAULT_SETTINGS.videoMute),
             videoLoop: bool(merged.videoLoop, DEFAULT_SETTINGS.videoLoop),
+            workspaceLayout: WORKSPACE_LAYOUTS.includes(merged.workspaceLayout) ? merged.workspaceLayout : DEFAULT_SETTINGS.workspaceLayout,
+            workspaceDensity: WORKSPACE_DENSITIES.includes(merged.workspaceDensity) ? merged.workspaceDensity : DEFAULT_SETTINGS.workspaceDensity,
+            viewerOpenMode: VIEWER_OPEN_MODES.includes(merged.viewerOpenMode) ? merged.viewerOpenMode : DEFAULT_SETTINGS.viewerOpenMode,
         };
     }
 
@@ -81,7 +96,7 @@
         return `repeat(${n}, minmax(0, 1fr))`;
     }
 
-    const api = { DEFAULT_SETTINGS, LIMIT_OPTIONS, VIEW_MODES, normalizeGallerySettings, gridColumnsStyle };
+    const api = { DEFAULT_SETTINGS, LIMIT_OPTIONS, VIEW_MODES, WORKSPACE_LAYOUTS, WORKSPACE_DENSITIES, VIEWER_OPEN_MODES, normalizeGallerySettings, gridColumnsStyle };
     if (typeof module !== "undefined" && module.exports) module.exports = api;
     else root.GallerySettings = api;
 })(typeof window !== "undefined" ? window : globalThis);

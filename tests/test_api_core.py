@@ -1,5 +1,6 @@
 """Tests for the core API module (py/api/__init__.py): helpers and base routes."""
 
+import asyncio
 import json
 import os
 import shutil
@@ -165,8 +166,19 @@ class TestGzipMiddleware(AioHTTPTestCase):
             await resp.write_eof()
             return resp
 
+        async def declared_length(request):
+            # The log download (#329) declares its length before the middleware
+            # compresses it.
+            body = b"x" * 3000
+            return web.Response(
+                body=body,
+                content_type="text/plain",
+                headers={"Content-Length": str(len(body))},
+            )
+
         app = web.Application(middlewares=[api_module._gzip_middleware])
         app.router.add_get("/prompt_manager/big", big_json)
+        app.router.add_get("/prompt_manager/declared", declared_length)
         app.router.add_get("/prompt_manager/small", small_json)
         app.router.add_get("/prompt_manager/encoded", already_encoded)
         app.router.add_get("/prompt_manager/binary", binary)
@@ -192,6 +204,18 @@ class TestGzipMiddleware(AioHTTPTestCase):
         import gzip
 
         self.assertIn(b'"data"', gzip.decompress(await resp.read()))
+
+    async def test_compressed_body_declares_its_own_length(self):
+        # A stale Content-Length (the uncompressed size) makes a browser wait
+        # for bytes that never come (#329: Download log hung on any log > 1 KB).
+        resp = await self._get("/prompt_manager/declared")
+        self.assertEqual(resp.headers.get("Content-Encoding"), "gzip")
+        # Bounded: a stale length would otherwise wait for the missing bytes.
+        body = await asyncio.wait_for(resp.read(), timeout=10)
+        self.assertEqual(int(resp.headers["Content-Length"]), len(body))
+        import gzip
+
+        self.assertEqual(gzip.decompress(body), b"x" * 3000)
 
     async def test_small_body_not_compressed(self):
         resp = await self._get("/prompt_manager/small")
@@ -327,8 +351,6 @@ class TestLongJobLock(unittest.TestCase):
         self.api = PromptManagerAPI(db=database)
 
     def _run(self, coro):
-        import asyncio
-
         return asyncio.run(coro)
 
     def test_second_acquire_is_refused_until_first_releases(self):
@@ -384,6 +406,8 @@ class CoreRoutesTestCase(AioHTTPTestCase):
 
     async def tearDownAsync(self):
         await super().tearDownAsync()  # closes the aiohttp test client
+        # The automatic preview worker writes into the temp tree: stop it first.
+        self.api.close_auto_thumbnails()
         self.api.db.close_all()
         assert_closed(self, self.tmpdir)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -448,6 +472,42 @@ class TestUiRoutes(CoreRoutesTestCase):
         resp = await self.client.request("GET", "/prompt_manager/test")
         self.assertTrue((await resp.json())["success"])
 
+    async def test_image_annotation_routes_are_registered(self):
+        table = {
+            (route.method, route.resource.canonical)
+            for route in self.app.router.routes()
+            if route.resource is not None
+        }
+        for entry in (
+            ("POST", "/prompt_manager/image-annotations/observe"),
+            ("GET", "/prompt_manager/image-annotations/capture/{token}"),
+            ("DELETE", "/prompt_manager/image-annotations/capture/{token}"),
+            ("PUT", "/prompt_manager/image-annotations/tags"),
+        ):
+            self.assertIn(entry, table)
+
+    async def test_image_tag_job_route_is_registered_beside_the_scan_job(self):
+        table = {
+            (route.method, route.resource.canonical)
+            for route in self.app.router.routes()
+            if route.resource is not None
+        }
+        self.assertIn(("POST", "/prompt_manager/jobs/scan"), table)
+        self.assertIn(("POST", "/prompt_manager/jobs/image-tags"), table)
+
+    async def test_review_routes_are_registered(self):
+        table = {
+            (route.method, route.resource.canonical)
+            for route in self.app.router.routes()
+            if route.resource is not None
+        }
+        for entry in (
+            ("GET", "/prompt_manager/review/items"),
+            ("GET", "/prompt_manager/review/items/{item_id}"),
+            ("POST", "/prompt_manager/review/items/{item_id}/decision"),
+        ):
+            self.assertIn(entry, table)
+
 
 class TestStaticRoutes(CoreRoutesTestCase):
 
@@ -462,6 +522,30 @@ class TestStaticRoutes(CoreRoutesTestCase):
         )
         self.assertEqual(resp.status, 200)
         self.assertIn("application/javascript", resp.headers["Content-Type"])
+
+    async def test_inspection_semantics_table_is_the_one_json_served(self):
+        """Local Inspect reads the node table the server resolves with (#249 PR L3).
+
+        Only that exact file is served; every other JSON stays forbidden.
+        """
+        resp = await self.client.request(
+            "GET", "/prompt_manager/js/inspection-semantics.json"
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertIn("application/json", resp.headers["Content-Type"])
+        table = Path(__file__).resolve().parents[1] / "web" / "js"
+        self.assertEqual(
+            await resp.read(), (table / "inspection-semantics.json").read_bytes()
+        )
+        for path in (
+            "js/shared/toolkit/provenance.json",
+            "lib/viewerjs/provenance.json",
+            "lib/inspection-semantics.json",
+            "js/workspace/..%2Finspection-semantics.json",
+            "js/INSPECTION-SEMANTICS.json",
+        ):
+            resp = await self.client.request("GET", f"/prompt_manager/{path}")
+            self.assertEqual(resp.status, 403, path)
 
     async def test_lib_served(self):
         web_dir = self._fake_root()
@@ -555,6 +639,28 @@ class TestStaticRoutes(CoreRoutesTestCase):
         resp = await self.client.request("GET", "/prompt_manager/lib/link.js")
         self.assertEqual(resp.status, 403)
 
+    async def test_inspection_semantics_symlink_escaping_web_dir_is_403(self):
+        """The exact-path JSON gets the same realpath containment as any file."""
+        web_dir = self._fake_root()
+        secret = Path(self.tmpdir) / "secret.json"
+        secret.write_text('{"secret": true}')
+        try:
+            os.symlink(secret, web_dir / "js" / "inspection-semantics.json")
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks not available")
+        resp = await self.client.request(
+            "GET", "/prompt_manager/js/inspection-semantics.json"
+        )
+        self.assertEqual(resp.status, 403)
+        self.assertNotIn("secret", await resp.text())
+
+    async def test_inspection_semantics_missing_is_404(self):
+        self._fake_root()
+        resp = await self.client.request(
+            "GET", "/prompt_manager/js/inspection-semantics.json"
+        )
+        self.assertEqual(resp.status, 404)
+
     async def test_empty_path_is_not_served(self):
         for prefix in ("lib", "js"):
             resp = await self.client.request("GET", f"/prompt_manager/{prefix}/")
@@ -576,6 +682,132 @@ class TestStaticRoutes(CoreRoutesTestCase):
         self.assertEqual(resp.status, 403)
 
 
+class TestRevalidatedCaching(CoreRoutesTestCase):
+    """Every served page and static file is revalidated on reload (#478).
+
+    ``Cache-Control: no-cache`` makes the browser ask before it reuses a copy,
+    and the ETag lets an unchanged file answer 304 without a body, so an update
+    reaches the browser on a normal reload and an unchanged reload stays cheap.
+    """
+
+    STATIC_PATHS = (
+        "/prompt_manager/js/workspace/index.mjs",
+        "/prompt_manager/js/admin.js",
+        "/prompt_manager/js/inspection-semantics.json",
+        "/prompt_manager/lib/viewerjs/viewer.min.css",
+    )
+
+    async def _assert_revalidated(self, path):
+        resp = await self.client.request("GET", path)
+        self.assertEqual(resp.status, 200, path)
+        self.assertEqual(resp.headers.get("Cache-Control"), "no-cache", path)
+        etag = resp.headers.get("ETag")
+        self.assertTrue(etag, path)
+        body = await resp.read()
+        self.assertTrue(body, path)
+
+        again = await self.client.request("GET", path, headers={"If-None-Match": etag})
+        self.assertEqual(again.status, 304, path)
+        self.assertEqual(again.headers.get("ETag"), etag, path)
+        self.assertEqual(again.headers.get("Cache-Control"), "no-cache", path)
+        self.assertEqual(await again.read(), b"", path)
+
+        stale = await self.client.request(
+            "GET", path, headers={"If-None-Match": 'W/"stale"'}
+        )
+        self.assertEqual(stale.status, 200, path)
+        self.assertEqual(await stale.read(), body, path)
+        return etag
+
+    async def test_static_files_are_revalidated(self):
+        for path in self.STATIC_PATHS:
+            await self._assert_revalidated(path)
+
+    async def test_pages_are_revalidated(self):
+        for path in UI_PATHS:
+            await self._assert_revalidated(path)
+
+    async def test_etag_matches_in_a_list_and_as_wildcard(self):
+        path = "/prompt_manager/js/workspace/index.mjs"
+        etag = (await self.client.request("GET", path)).headers["ETag"]
+        for header in (f'W/"other", {etag}', etag.removeprefix("W/"), "*"):
+            resp = await self.client.request(
+                "GET", path, headers={"If-None-Match": header}
+            )
+            self.assertEqual(resp.status, 304, header)
+
+    async def test_changed_file_gets_a_new_etag_and_its_new_body(self):
+        web_dir = self._fake_root()
+        module = web_dir / "js" / "m.mjs"
+        module.write_text("export const v = 1;")
+        path = "/prompt_manager/js/m.mjs"
+        first = await self.client.request("GET", path)
+        etag = first.headers["ETag"]
+        # Same size and, on coarse clocks, the same mtime: only the bytes differ.
+        module.write_text("export const v = 2;")
+        resp = await self.client.request("GET", path, headers={"If-None-Match": etag})
+        self.assertEqual(resp.status, 200)
+        self.assertNotEqual(resp.headers["ETag"], etag)
+        self.assertEqual(await resp.text(), "export const v = 2;")
+
+    async def test_gzipped_and_plain_bodies_share_a_weak_etag(self):
+        """The gzip middleware changes the bytes, so the tag must be weak."""
+        resp = await self.client.request("GET", "/prompt_manager/js/admin.js")
+        self.assertTrue(resp.headers["ETag"].startswith('W/"'))
+
+    async def test_errors_carry_no_validator(self):
+        resp = await self.client.request("GET", "/prompt_manager/js/nope.js")
+        self.assertEqual(resp.status, 404)
+        self.assertNotIn("ETag", resp.headers)
+
+
+@web.middleware
+async def _comfyui_cache_control(request, handler):
+    """ComfyUI's own middleware (middleware/cache_middleware.py), JS/CSS branch.
+
+    It only fills a missing Cache-Control, and ``.mjs`` is not ``.js``: that is
+    why the workspace modules went out with no header at all before #478.
+    """
+    response = await handler(request)
+    if request.path.endswith(".js") or request.path.endswith(".css"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+class TestRevalidatedCachingBehindMiddlewares(CoreRoutesTestCase):
+    """The host's middlewares keep the header and the 304 intact."""
+
+    async def get_application(self):
+        app = await super().get_application()
+        app.middlewares.append(_comfyui_cache_control)
+        app.middlewares.append(api_module._gzip_middleware)
+        return app
+
+    async def test_gzipped_files_keep_no_cache_and_answer_304(self):
+        for path in (
+            "/prompt_manager/js/workspace/index.mjs",
+            "/prompt_manager/js/admin.js",
+            "/prompt_manager/lib/viewerjs/viewer.min.css",
+            "/prompt_manager/workspace",
+        ):
+            resp = await self.client.request(
+                "GET", path, headers={"Accept-Encoding": "gzip"}
+            )
+            self.assertEqual(resp.status, 200, path)
+            self.assertEqual(resp.headers.get("Content-Encoding"), "gzip", path)
+            self.assertEqual(resp.headers["Cache-Control"], "no-cache", path)
+            again = await self.client.request(
+                "GET",
+                path,
+                headers={
+                    "Accept-Encoding": "gzip",
+                    "If-None-Match": resp.headers["ETag"],
+                },
+            )
+            self.assertEqual(again.status, 304, path)
+            self.assertEqual(again.headers["Cache-Control"], "no-cache", path)
+
+
 # ── instance helpers ──────────────────────────────────────────────────
 
 
@@ -591,8 +823,6 @@ class TestInstanceHelpers(FolderPathsFixture):
         self.addCleanup(setattr, GalleryConfig, "MONITORING_DIRECTORIES", orig_dirs)
 
     def _run(self, coro):
-        import asyncio
-
         return asyncio.run(coro)
 
     def test_run_in_executor_with_kwargs(self):
@@ -603,9 +833,23 @@ class TestInstanceHelpers(FolderPathsFixture):
         self.assertEqual(self._run(self.api._run_in_executor(add, 1, 2)), 3)
 
     def test_invalidate_gallery_cache(self):
-        self.api._gallery_cache = {"x": 1}
+        record = self.api._root_listing(self.output_dir)
+        record.files = [(self.output_dir / "a.png", 1.0)]
+        record.folders = record.folders_with_ancestors = frozenset()
+        record.walked_at = 1.0
+        self.api._favorite_listing_cache = {"x": 1}
+        self.api._workspace_order_cache = {"x": 1}
         self.api.invalidate_gallery_cache()
-        self.assertEqual(self.api._gallery_cache, {})
+        # The record stays: its generation outlives every drop (#348).
+        self.assertIs(self.api._root_listings[str(self.output_dir)], record)
+        self.assertIsNone(record.files)
+        self.assertIsNone(record.folders)
+        self.assertIsNone(record.walked_at)
+        self.assertEqual(record.generation, 1)
+        self.assertEqual(self.api._favorite_listing_cache, {})
+        self.assertEqual(self.api._workspace_order_cache, {})
+        self.api.reset_gallery_roots_cache()
+        self.assertEqual(record.generation, 2)
 
     def test_enrich_images_adds_urls_and_thumbnails(self):
         GalleryConfig.MONITORING_DIRECTORIES = [str(self.output_dir)]
@@ -713,7 +957,6 @@ class TestMetadataParsing(unittest.TestCase):
         self.assertEqual(parsed["positive_prompt"], "a cat")
         self.assertEqual(parsed["negative_prompt"], "dog")
         self.assertEqual(parsed["parameters"]["parameters"], meta["parameters"])
-        self.assertEqual(self.api._extract_readable_prompt(parsed), "a cat")
 
     def test_parse_comfyui_fields(self):
         meta = {
@@ -733,97 +976,6 @@ class TestMetadataParsing(unittest.TestCase):
         )
         self.assertEqual(parsed["prompt"], "plain text")
         self.assertEqual(parsed["workflow"], {"nodes": []})
-
-    def test_extract_readable_prompt_variants(self):
-        extract = self.api._extract_readable_prompt
-        self.assertEqual(extract({"prompt": "plain"}), "plain")
-        self.assertEqual(extract({"prompt": ["a", "", "b"]}), "a b")
-        self.assertEqual(extract({"prompt": 42}), "42")
-        self.assertEqual(
-            extract({"prompt": None, "parameters": {"positive": ["x", "y"]}}), "x y"
-        )
-        self.assertIsNone(extract({"prompt": {}, "parameters": {}}))
-
-        graph = {
-            "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "pos"}},
-            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "neg"}},
-            "3": {
-                "class_type": "KSampler",
-                "inputs": {"positive": ["1", 0], "negative": ["2", 0]},
-            },
-        }
-        self.assertEqual(extract({"prompt": graph}), "pos")
-        self.assertEqual(extract({"prompt": {"x": 1}, "workflow": graph}), "pos")
-
-    def test_node_inputs_and_text_lookup(self):
-        self.assertEqual(self.api._get_node_inputs("nope"), {})
-        self.assertEqual(self.api._get_node_inputs({"inputs": 5}), {})
-        self.assertEqual(self.api._get_node_inputs({"inputs": {"a": 1}}), {"a": 1})
-        listed = self.api._get_node_inputs(
-            {"inputs": [{"name": "text", "link": None}, {"nope": 1}, "junk"]}
-        )
-        self.assertEqual(list(listed), ["text"])
-
-        self.assertIsNone(self.api._find_text_in_node(None))
-        self.assertEqual(self.api._find_text_in_node({"inputs": {"text": "hi"}}), "hi")
-        self.assertEqual(
-            self.api._find_text_in_node(
-                {"type": "CLIPTextEncode", "widgets_values": ["w"]}
-            ),
-            "w",
-        )
-        self.assertIsNone(
-            self.api._find_text_in_node(
-                {"type": "CLIPTextEncode", "widgets_values": [" "]}
-            )
-        )
-        self.assertIsNone(self.api._find_text_in_node({"type": "KSampler"}))
-
-    def test_positive_prompt_from_nodes_array_and_fallbacks(self):
-        extract = self.api._extract_positive_prompt_from_comfyui_data
-        self.assertIsNone(extract("x"))
-        self.assertIsNone(extract({}))
-        self.assertIsNone(extract({"nodes": []}))
-
-        workflow = {
-            "nodes": [
-                {"id": 1, "type": "CLIPTextEncode", "widgets_values": ["pos"]},
-                {
-                    "id": 2,
-                    "type": "CLIPTextEncode",
-                    "widgets_values": ["neg"],
-                    "title": "Negative",
-                },
-                {"id": 3, "type": "KSampler", "inputs": [{"name": "seed", "link": 4}]},
-                "junk",
-            ]
-        }
-        self.assertEqual(extract(workflow), "pos")
-
-        only_negative = {
-            "nodes": [
-                {
-                    "id": 2,
-                    "type": "CLIPTextEncode",
-                    "widgets_values": ["neg"],
-                    "title": "neg",
-                },
-            ]
-        }
-        self.assertEqual(extract(only_negative), "neg")
-
-        bad_link = {
-            "1": {"class_type": "CLIPTextEncode", "inputs": {"text": "pos"}},
-            "3": {
-                "class_type": "KSampler",
-                "inputs": {"positive": "oops", "negative": []},
-            },
-            "4": {
-                "class_type": "KSampler",
-                "inputs": {"positive": ["zz", 0], "negative": []},
-            },
-        }
-        self.assertEqual(extract(bad_link), "pos")
 
 
 if __name__ == "__main__":

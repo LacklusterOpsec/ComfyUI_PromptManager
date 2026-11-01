@@ -30,19 +30,21 @@ routes = server_instance.routes
 # Extension info
 extension_uri = None  # Will be set in __init__.py
 
+import hashlib  # noqa: E402
 import os  # noqa: E402
-from pathlib import Path  # noqa: E402
 from typing import Any, Dict, List, Optional, Tuple  # noqa: E402
 
 # Import logging system
 try:
     from ..utils.logging_config import get_logger
+    from ..utils import library_location
 except ImportError:
     import sys
 
     current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, current_dir)
     from utils.logging_config import get_logger
+    from utils import library_location
 
 # Initialize logger for config operations
 config_logger = get_logger("prompt_manager.config")
@@ -50,6 +52,14 @@ config_logger = get_logger("prompt_manager.config")
 # Environment variable listing extra directories (os.pathsep-separated) that
 # may be used as gallery roots in addition to ComfyUI's own directories.
 EXTRA_GALLERY_ROOTS_ENV = "PROMPT_MANAGER_EXTRA_GALLERY_ROOTS"
+
+# The one answer for every path outside the allowed folders. The filesystem
+# root and the home directory answer it too, so no caller learns the server's
+# layout (home path, user name) from a refusal (#249 S4).
+OUTSIDE_ALLOWED_REASON = (
+    "Gallery root must be inside a ComfyUI directory (output, input, temp, user) "
+    f"or one listed in {EXTRA_GALLERY_ROOTS_ENV}"
+)
 
 # Environment variable overriding where config.json is read from and saved to.
 CONFIG_PATH_ENV = "PROMPT_MANAGER_CONFIG_PATH"
@@ -87,6 +97,29 @@ def write_private_json(path: str, data: Any) -> None:
         json.dump(data, f, indent=2)
     if os.name == "posix":
         os.chmod(path, 0o600)
+
+
+def _lexical_path(path: str) -> str:
+    """``path`` normalised for comparison without touching the filesystem.
+
+    normpath collapses ``.`` and ``..`` as text and normcase folds case on
+    Windows; neither opens, stats nor resolves anything (no SMB request for a
+    UNC path). A symlink is only seen by :func:`_canonical_path` later.
+    """
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _lexically_inside(path: str, parents: List[str]) -> bool:
+    """Whether the normalised ``path`` is one of ``parents`` or below one.
+
+    Pure text on normalised spellings (:func:`_lexical_path` or
+    :func:`_canonical_path`): no filesystem access.
+    """
+    sep = os.path.sep
+    return any(
+        path == parent or path.startswith(parent.rstrip(sep) + sep)
+        for parent in parents
+    )
 
 
 def _is_filesystem_root(path: str) -> bool:
@@ -162,6 +195,8 @@ class GalleryConfig:
 
     Attributes:
         MONITORING_ENABLED (bool): Enable/disable automatic image monitoring
+        SAVE_FOREIGN_RUNS (bool): The monitor stores the certain prompt of an
+            output whose workflow has no PromptManager node (#247)
         MONITORING_DIRECTORIES (List[str]): Directories to monitor for new images
         SUPPORTED_EXTENSIONS (List[str]): Image file extensions to process
         PROCESSING_DELAY (float): Delay in seconds before processing new files
@@ -170,7 +205,6 @@ class GalleryConfig:
         AUTO_CLEANUP_MISSING_FILES (bool): Automatically remove missing file records
         MAX_IMAGE_AGE_DAYS (int): Maximum age in days before cleaning up images
         IMAGES_PER_PAGE (int): Number of images to display per page in web UI
-        THUMBNAIL_SIZE (int): Size in pixels for generated thumbnails
         ENABLE_SEARCH (bool): Enable search functionality in web interface
         ENABLE_METADATA_VIEW (bool): Enable metadata viewing for images
         MAX_CONCURRENT_PROCESSING (int): Maximum concurrent image processing tasks
@@ -179,6 +213,8 @@ class GalleryConfig:
 
     # Image monitoring settings
     MONITORING_ENABLED = True
+    # Read by the monitor for every file, so a save applies without a restart
+    SAVE_FOREIGN_RUNS = True
     MONITORING_DIRECTORIES = []  # Auto-detect if empty
     SUPPORTED_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
     PROCESSING_DELAY = 2.0  # Seconds to wait before processing new files
@@ -195,7 +231,6 @@ class GalleryConfig:
 
     # Web interface settings
     IMAGES_PER_PAGE = 20
-    THUMBNAIL_SIZE = 256
     ENABLE_SEARCH = True
     ENABLE_METADATA_VIEW = True
 
@@ -221,6 +256,7 @@ class GalleryConfig:
         return {
             "monitoring": {
                 "enabled": cls.MONITORING_ENABLED,
+                "save_foreign_runs": cls.SAVE_FOREIGN_RUNS,
                 "directories": cls.MONITORING_DIRECTORIES,
                 "extensions": cls.SUPPORTED_EXTENSIONS,
                 "processing_delay": cls.PROCESSING_DELAY,
@@ -235,7 +271,6 @@ class GalleryConfig:
             },
             "web_interface": {
                 "images_per_page": cls.IMAGES_PER_PAGE,
-                "thumbnail_size": cls.THUMBNAIL_SIZE,
                 "enable_search": cls.ENABLE_SEARCH,
                 "enable_metadata_view": cls.ENABLE_METADATA_VIEW,
             },
@@ -268,7 +303,20 @@ class GalleryConfig:
         """
         monitoring = new_config.get("monitoring", {})
         if "enabled" in monitoring:
-            cls.MONITORING_ENABLED = monitoring["enabled"]
+            if isinstance(monitoring["enabled"], bool):
+                cls.MONITORING_ENABLED = monitoring["enabled"]
+            else:  # a hand-edited "false" would otherwise switch it on
+                config_logger.warning(
+                    "Ignoring gallery monitoring enabled: expected true or false"
+                )
+        if "save_foreign_runs" in monitoring:
+            if isinstance(monitoring["save_foreign_runs"], bool):
+                cls.SAVE_FOREIGN_RUNS = monitoring["save_foreign_runs"]
+            else:
+                config_logger.warning(
+                    "Ignoring gallery monitoring save_foreign_runs: expected true "
+                    "or false"
+                )
         if "directories" in monitoring:
             directories = cls._validated_directories(monitoring["directories"])
             if directories is not None:
@@ -293,8 +341,6 @@ class GalleryConfig:
         web_interface = new_config.get("web_interface", {})
         if "images_per_page" in web_interface:
             cls.IMAGES_PER_PAGE = web_interface["images_per_page"]
-        if "thumbnail_size" in web_interface:
-            cls.THUMBNAIL_SIZE = web_interface["thumbnail_size"]
         if "enable_search" in web_interface:
             cls.ENABLE_SEARCH = web_interface["enable_search"]
         if "enable_metadata_view" in web_interface:
@@ -337,31 +383,56 @@ class GalleryConfig:
         Filesystem roots are never allowed as parents, even when listed in
         the environment, because that would re-open the whole disk.
         """
-        parents = []
+        return [canonical for canonical, _spelling in cls._allowed_parent_pairs()]
+
+    @classmethod
+    def _allowed_parent_pairs(cls) -> List[Tuple[str, str]]:
+        """``(canonical, lexical spelling)`` of each allowed parent.
+
+        Only trusted directories (ComfyUI's own and the environment's) are
+        resolved here; the spelling is how ComfyUI or the environment wrote
+        the directory, so a submitted path can be compared without resolving it.
+        """
+        pairs = []
+        seen = set()
         for candidate in _comfyui_directories() + _extra_gallery_roots():
             try:
                 canonical = _canonical_path(candidate)
+                spelling = _lexical_path(os.path.abspath(candidate))
             except (OSError, ValueError):
                 continue
             if _is_filesystem_root(canonical) or not os.path.isdir(canonical):
                 continue
-            if canonical not in parents:
-                parents.append(canonical)
-        return parents
+            if canonical not in seen:
+                seen.add(canonical)
+                pairs.append((canonical, spelling))
+        return pairs
 
     @classmethod
     def path_anchors(cls) -> List[str]:
         """Canonical directories that relative gallery paths are resolved against.
 
         The ComfyUI base directory comes first, followed by the parent of each
-        directory listed in PROMPT_MANAGER_EXTRA_GALLERY_ROOTS, so an extra
-        root is addressed by its own name (``gallery/sub``) rather than by an
-        absolute path. The same anchors drive the public (relative) form of
-        paths in API responses.
+        ComfyUI directory outside it (``--output-directory D:\\Renders``) and of
+        each directory listed in PROMPT_MANAGER_EXTRA_GALLERY_ROOTS, so such a
+        directory is addressed by its own name (``Renders/sub``) rather than by
+        an absolute path, and two folders of one name stay apart. The same
+        anchors drive the public (relative) form of paths in API responses.
         """
         anchors = []
         base = _comfyui_base_directory()
         candidates = [base] if base else []
+        try:
+            base_key = _canonical_path(base) if base else None
+        except (OSError, ValueError):
+            base_key = None
+        for directory in _comfyui_directories():
+            try:
+                canonical = _canonical_path(directory)
+            except (OSError, ValueError):
+                continue
+            if base_key is None or not _lexically_inside(canonical, [base_key]):
+                candidates.append(os.path.dirname(canonical))
         candidates.extend(os.path.dirname(root) for root in _extra_gallery_roots())
         for candidate in candidates:
             try:
@@ -399,33 +470,69 @@ class GalleryConfig:
             (True, "") when the directory lies inside one of
             :meth:`allowed_gallery_parents`; otherwise (False, reason).
         """
+        code, reason = cls.gallery_root_problem(path)
+        return code is None, reason
+
+    @classmethod
+    def gallery_root_problem(cls, path: Any) -> Tuple[Optional[str], str]:
+        """``(code, reason)`` why ``path`` may not be a gallery root, else (None, "").
+
+        Codes: ``empty``, ``unresolvable``, ``outside-allowed``, ``not-found``
+        and ``not-directory``. No reason names the path.
+
+        Containment is decided twice. First lexically, with no filesystem
+        access at all: a path (UNC, ``\\\\?\\``, a device, anything) whose
+        normalised spelling lies outside every allowed parent answers
+        ``outside-allowed`` before it is resolved, so the server never opens
+        or stats it (no SMB connection, no existence or timing oracle). Only
+        then is it resolved and checked again, which catches a symlink out.
+        The filesystem root and the home directory answer ``outside-allowed``
+        too: one answer for every caller (validate-source, the settings save,
+        config.json), and the detail goes to the log only.
+        """
         if not isinstance(path, str) or not path.strip():
-            return False, "Gallery root must be a non-empty path"
+            return "empty", "Gallery root must be a non-empty path"
+
+        pairs = cls._allowed_parent_pairs()
+        spellings = [spelling for pair in pairs for spelling in pair]
+        try:
+            lexical = cls._lexical_candidates(path)
+        except (TypeError, ValueError):
+            return "unresolvable", "Gallery root could not be resolved"
+        if not any(_lexically_inside(candidate, spellings) for candidate in lexical):
+            return "outside-allowed", OUTSIDE_ALLOWED_REASON
 
         try:
             canonical = cls.resolve_gallery_root(path)
         except (OSError, ValueError):
-            return False, "Gallery root could not be resolved"
+            return "unresolvable", "Gallery root could not be resolved"
 
         if _is_filesystem_root(canonical):
-            return False, "Gallery root cannot be a filesystem root"
+            config_logger.info("Gallery root refused: a filesystem root")
+            return "outside-allowed", OUTSIDE_ALLOWED_REASON
         if canonical == _canonical_path(os.path.expanduser("~")):
-            return False, "Gallery root cannot be the home directory"
+            config_logger.info("Gallery root refused: the home directory")
+            return "outside-allowed", OUTSIDE_ALLOWED_REASON
+        if not _lexically_inside(canonical, [canonical for canonical, _ in pairs]):
+            return "outside-allowed", OUTSIDE_ALLOWED_REASON
         if not os.path.exists(canonical):
-            return False, "Gallery root does not exist"
+            return "not-found", "Gallery root does not exist"
         if not os.path.isdir(canonical):
-            return False, "Gallery root is not a directory"
+            return "not-directory", "Gallery root is not a directory"
+        return None, ""
 
-        candidate = Path(canonical)
-        for parent in cls.allowed_gallery_parents():
-            if candidate.is_relative_to(Path(parent)):
-                return True, ""
+    @classmethod
+    def _lexical_candidates(cls, path: str) -> List[str]:
+        """Every spelling ``path`` may resolve to, normalised as text (no IO).
 
-        return (
-            False,
-            "Gallery root must be inside a ComfyUI directory "
-            f"(output, input, temp, user) or one listed in {EXTRA_GALLERY_ROOTS_ENV}",
-        )
+        An absolute path is itself; a relative one is joined to each
+        :meth:`path_anchors` entry, as :meth:`resolve_gallery_root` tries them.
+        """
+        path = path.strip()
+        if os.path.isabs(path):
+            return [_lexical_path(path)]
+        anchors = cls.path_anchors()
+        return [_lexical_path(os.path.join(anchor, path)) for anchor in anchors]
 
 
 class IntegrationConfig:
@@ -463,6 +570,313 @@ class IntegrationConfig:
             cls.LORA_TRIGGER_WORDS_ENABLED = lora["trigger_words_enabled"]
         if "civitai_api_key" in lora:
             cls.CIVITAI_API_KEY = lora["civitai_api_key"]
+
+
+# Number of tag suggestions the Tag dialogs request by default (D68). The cap
+# is the image tag set limit: more suggestions could never all be kept.
+DEFAULT_SUGGESTION_LIMIT = 10
+MAX_SUGGESTION_LIMIT = 100  # pinned to MAX_IMAGE_TAGS by tests/test_config.py
+
+# The tagging engines, options, template and validators (server-free, #328).
+try:
+    from .tagging_defaults import (  # noqa: F401 - re-exported
+        DEFAULT_TAG_TEMPLATE,
+        EXISTING_POLICIES,
+        LLM_MODEL_TYPES,
+        MAX_INSTRUCTION_BYTES,
+        MAX_INSTRUCTION_CHARS,
+        MODEL_TYPES,
+        WD14_MODEL_TYPES,
+        validate_saved_threshold,
+        validate_skipped_tags,
+        validate_template,
+        validate_threshold,
+        BUILTIN_INSTRUCTIONS_ID,
+        INSTRUCTION_ENGINES,
+        MAX_SAVED_INSTRUCTIONS,
+        builtin_instructions,
+        validate_default_instructions,
+        validate_instructions,
+    )
+except ImportError:
+    from py.tagging_defaults import (  # noqa: F401 - re-exported
+        DEFAULT_TAG_TEMPLATE,
+        EXISTING_POLICIES,
+        LLM_MODEL_TYPES,
+        MAX_INSTRUCTION_BYTES,
+        MAX_INSTRUCTION_CHARS,
+        MODEL_TYPES,
+        WD14_MODEL_TYPES,
+        validate_saved_threshold,
+        validate_skipped_tags,
+        validate_template,
+        validate_threshold,
+        BUILTIN_INSTRUCTIONS_ID,
+        INSTRUCTION_ENGINES,
+        MAX_SAVED_INSTRUCTIONS,
+        builtin_instructions,
+        validate_default_instructions,
+        validate_instructions,
+    )
+
+
+def _valid_model_type(value: Any) -> str:
+    if not isinstance(value, str) or value not in MODEL_TYPES:
+        raise ValueError("must be one of " + ", ".join(sorted(MODEL_TYPES)))
+    return value
+
+
+def _valid_existing(value: Any) -> str:
+    if not isinstance(value, str) or value not in EXISTING_POLICIES:
+        raise ValueError("must be one of " + ", ".join(EXISTING_POLICIES))
+    return value
+
+
+def _valid_skipped_tags(value: Any) -> Tuple[str, ...]:
+    return tuple(validate_skipped_tags(value))
+
+
+def _reason(error: ValueError) -> str:
+    """A settings sentence as a load warning's reason ("entry 2 is empty")."""
+    text = str(error).rstrip(".")
+    for prefix in ("Skipped tags", "Saved instructions"):
+        if text.startswith(prefix):
+            return text.removeprefix(prefix).lstrip(": ")
+    return text
+
+
+def _text_id(text: str) -> str:
+    """A migrated entry's id: deterministic, so every load gives the same."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _fallback_warning(key: str, error: ValueError, default: Any) -> str:
+    """The one load warning of a saved tagging default that fails its check."""
+    if key == "skipped_tags":
+        return f"autotag.defaults.skipped_tags {_reason(error)}; using no skipped tags"
+    return f"autotag.defaults.{key} {error}; using {default!r}"
+
+
+def _valid_suggestion_limit(value: Any) -> int:
+    if type(value) is not int or not 1 <= value <= MAX_SUGGESTION_LIMIT:
+        raise ValueError(f"must be an integer from 1 to {MAX_SUGGESTION_LIMIT}")
+    return value
+
+
+class AutotagConfig:
+    """Persisted tagging defaults under ``autotag.defaults`` in config.json.
+
+    One tagging configuration (#328): the model, what a batch does with
+    prompts already tagged, the two WD14 thresholds, the language-model
+    template and how many suggestions Generate returns. Each key is checked
+    alone on load; a hand-edited value that fails its check falls back to
+    its default with one warning rather than failing the load.
+    """
+
+    MODEL_TYPE = "wd14-swinv2"
+    EXISTING = "skip"
+    GENERAL_THRESHOLD = 0.35
+    CHARACTER_THRESHOLD = 0.85
+    SUGGESTION_LIMIT = DEFAULT_SUGGESTION_LIMIT
+    SKIPPED_TAGS: Tuple[str, ...] = ()
+    # #431: the saved instructions (Built-in is never stored) and the default
+    # of each language-model engine, by id.
+    INSTRUCTIONS: Tuple[Dict[str, str], ...] = ()
+    DEFAULT_INSTRUCTIONS: Dict[str, str] = {
+        "gguf": BUILTIN_INSTRUCTIONS_ID,
+        "hf": BUILTIN_INSTRUCTIONS_ID,
+    }
+    # The old single template as read at load (None when absent or invalid);
+    # only the migration reads it. Saves keep it as the GGUF default's mirror.
+    _LEGACY_TEMPLATE: Optional[str] = None
+
+    # config.json key -> (attribute, validator, default)
+    _KEYS = {
+        "model_type": ("MODEL_TYPE", _valid_model_type, "wd14-swinv2"),
+        "existing": ("EXISTING", _valid_existing, "skip"),
+        "general_threshold": (
+            "GENERAL_THRESHOLD",
+            lambda v: validate_saved_threshold("value", v),
+            0.35,
+        ),
+        "character_threshold": (
+            "CHARACTER_THRESHOLD",
+            lambda v: validate_saved_threshold("value", v),
+            0.85,
+        ),
+        "suggestion_limit": (
+            "SUGGESTION_LIMIT",
+            _valid_suggestion_limit,
+            DEFAULT_SUGGESTION_LIMIT,
+        ),
+        # #431: words whose suggested tags are never offered.
+        "skipped_tags": ("SKIPPED_TAGS", _valid_skipped_tags, ()),
+    }
+
+    @classmethod
+    def suggestion_limit(cls) -> int:
+        return cls.SUGGESTION_LIMIT
+
+    @staticmethod
+    def valid_suggestion_limit(value: Any) -> bool:
+        return (
+            type(value) is int and 1 <= value <= MAX_SUGGESTION_LIMIT
+        )  # bool, float and str are rejected
+
+    @classmethod
+    def all_instructions(cls) -> List[Dict[str, str]]:
+        """Built-in first, then the saved entries (copies)."""
+        return [builtin_instructions()] + [dict(item) for item in cls.INSTRUCTIONS]
+
+    @classmethod
+    def default_instructions_text(cls, engine: str) -> str:
+        """The text of ``engine``'s (``gguf`` or ``hf``) default instructions."""
+        if engine not in INSTRUCTION_ENGINES:
+            raise ValueError(f"{engine} takes no instructions")
+        wanted = cls.DEFAULT_INSTRUCTIONS.get(engine, BUILTIN_INSTRUCTIONS_ID)
+        for item in cls.INSTRUCTIONS:
+            if item["id"] == wanted:
+                return item["text"]
+        return DEFAULT_TAG_TEMPLATE
+
+    @classmethod
+    def mirror_template(cls) -> Optional[str]:
+        """What an older build reads as its one template (#431 B1.1): the
+        GGUF default's text, or None (no key) when that default is Built-in."""
+        if cls.DEFAULT_INSTRUCTIONS.get("gguf") == BUILTIN_INSTRUCTIONS_ID:
+            return None
+        return cls.default_instructions_text("gguf")
+
+    @classmethod
+    def get_config(cls) -> Dict[str, Any]:
+        """The saved defaults; ``template`` only as the GGUF default's mirror."""
+        defaults = {
+            key: getattr(cls, attr) for key, (attr, _v, _d) in cls._KEYS.items()
+        }
+        defaults["skipped_tags"] = list(defaults["skipped_tags"])
+        defaults["instructions"] = [dict(item) for item in cls.INSTRUCTIONS]
+        defaults["default_instructions"] = dict(cls.DEFAULT_INSTRUCTIONS)
+        mirror = cls.mirror_template()
+        if mirror is not None:
+            defaults["template"] = mirror
+        return {"defaults": defaults}
+
+    @classmethod
+    def _load_instructions(cls, defaults: Dict[str, Any]) -> None:
+        """Each instruction key alone, then the cross-key default check, then
+        the in-memory migration of the old template (#431). Nothing is
+        written here, so the revision never changes at load."""
+        cls._LEGACY_TEMPLATE = None
+        if "template" in defaults:
+            try:
+                cls._LEGACY_TEMPLATE = validate_template(defaults["template"])
+            except ValueError as error:
+                config_logger.warning(
+                    f"autotag.defaults.template {error}; using the built-in one"
+                )
+        entries: List[Dict[str, str]] = []
+        damaged = False
+        if "instructions" in defaults:
+            try:
+                entries = validate_instructions(defaults["instructions"])
+            except ValueError as error:
+                damaged = True
+                config_logger.warning(
+                    f"autotag.defaults.instructions {_reason(error)}; "
+                    "using Built-in only"
+                )
+        chosen = {engine: BUILTIN_INSTRUCTIONS_ID for engine in INSTRUCTION_ENGINES}
+        stored = defaults.get("default_instructions")
+        if damaged:
+            # Both defaults fall back with the list (its one warning says so);
+            # the old template is migrated as on a first upgrade.
+            pass
+        elif "default_instructions" in defaults and (
+            not isinstance(stored, dict) or set(stored) != set(INSTRUCTION_ENGINES)
+        ):
+            config_logger.warning(
+                "autotag.defaults.default_instructions must name gguf and hf; "
+                "using Built-in"
+            )
+        elif isinstance(stored, dict):
+            ids = {item["id"] for item in entries}
+            for engine in INSTRUCTION_ENGINES:
+                value = stored[engine]
+                if isinstance(value, str) and (
+                    value == BUILTIN_INSTRUCTIONS_ID or value in ids
+                ):
+                    chosen[engine] = value
+                else:
+                    config_logger.warning(
+                        f"autotag.defaults.default_instructions.{engine} names no "
+                        "saved instructions; using Built-in"
+                    )
+        cls._migrate_template(
+            entries,
+            chosen,
+            first=damaged or "instructions" not in defaults,
+            keep_defaults=not damaged and "default_instructions" in defaults,
+        )
+        cls.INSTRUCTIONS = tuple(entries)
+        cls.DEFAULT_INSTRUCTIONS = chosen
+
+    @classmethod
+    def _migrate_template(cls, entries, chosen, *, first, keep_defaults) -> None:
+        """Bring a template saved by an older build in as a named entry."""
+        legacy = cls._LEGACY_TEMPLATE
+        if legacy is None or legacy == DEFAULT_TAG_TEMPLATE:
+            return
+        if first:
+            # The first upgrade: it becomes "Custom template", the default for
+            # both engines unless defaults are stored already (20A).
+            entries.append(
+                {"id": _text_id(legacy), "name": "Custom template", "text": legacy}
+            )
+            if not keep_defaults:
+                for engine in INSTRUCTION_ENGINES:
+                    chosen[engine] = entries[-1]["id"]
+            return
+        if any(item["text"] == legacy for item in entries):
+            return  # the mirror of a saved default
+        # Edited on an older build after an upgrade (B1.2): import it.
+        if len(entries) >= MAX_SAVED_INSTRUCTIONS:
+            config_logger.warning(
+                "The tagging template edited on an older version was not imported: "
+                f"the saved instructions are full ({MAX_SAVED_INSTRUCTIONS})"
+            )
+            return
+        names = {item["name"].casefold() for item in entries}
+        number = 2
+        while f"custom template ({number})" in names:
+            number += 1
+        name = f"Custom template ({number})"
+        ids = {item["id"] for item in entries}
+        new_id, n = _text_id(legacy), 2
+        while new_id in ids:
+            new_id, n = _text_id(f"{legacy}\n{n}"), n + 1
+        entries.append({"id": new_id, "name": name, "text": legacy})
+        config_logger.info(
+            "Imported the tagging template edited on an older version as " f"'{name}'"
+        )
+
+    @classmethod
+    def update_config(cls, new_config: Any) -> None:
+        if not isinstance(new_config, dict):
+            config_logger.warning("Ignoring autotag settings that are not an object")
+            return
+        defaults = new_config.get("defaults", {})
+        if not isinstance(defaults, dict):
+            config_logger.warning("Ignoring autotag.defaults that is not an object")
+            return
+        for key, (attr, validate, default) in cls._KEYS.items():
+            if key not in defaults:
+                continue
+            try:
+                setattr(cls, attr, validate(defaults[key]))
+            except ValueError as error:
+                config_logger.warning(_fallback_warning(key, error, default))
+                setattr(cls, attr, default)
+        cls._load_instructions(defaults)
 
 
 class PromptManagerConfig:
@@ -509,6 +923,23 @@ class PromptManagerConfig:
     # default so ComfyUI's own generation keeps CPU headroom. 1..max_worker_threads().
     DEFAULT_WORKER_THREADS = max(1, (os.cpu_count() or 1) // 2)
     WORKER_THREADS = DEFAULT_WORKER_THREADS
+
+    # Maintenance: a reviewed apply takes a verified safety backup of the
+    # database first (System › Backup & export › Recovery policy, #249 S6).
+    SAFETY_BACKUP = True
+
+    # "Keep it here" (#249 S6b): the user chose to keep a node-folder library
+    # where it is, so the workspace stops offering to move it.
+    KEEP_LIBRARY_IN_NODE_FOLDER = False
+
+    # Thumbnails (#317): every preview writer reads these through
+    # py/api/thumbnail_settings.py (System › Appearance). The legacy
+    # ``gallery.web_interface.thumbnail_size`` was never read and is ignored.
+    THUMBNAIL_FORMATS = ("webp", "jxl", "jpeg")
+    THUMBNAIL_FORMAT = "webp"
+    THUMBNAIL_QUALITY = 80
+    THUMBNAIL_EDGE = 512
+    THUMBNAIL_EDGE_RANGE = (128, 2048)
 
     @classmethod
     def max_worker_threads(cls) -> int:
@@ -564,22 +995,28 @@ class PromptManagerConfig:
                 "auto_backup_interval": cls.AUTO_BACKUP_INTERVAL,
                 "worker_threads": cls.WORKER_THREADS,
             },
+            "maintenance": {"safety_backup": cls.SAFETY_BACKUP},
+            "library": {"keep_in_node_folder": cls.KEEP_LIBRARY_IN_NODE_FOLDER},
+            "thumbnails": {
+                "format": cls.THUMBNAIL_FORMAT,
+                "quality": cls.THUMBNAIL_QUALITY,
+                "edge": cls.THUMBNAIL_EDGE,
+            },
             "gallery": GalleryConfig.get_config(),
             "integrations": IntegrationConfig.get_config(),
+            "autotag": AutotagConfig.get_config(),
         }
 
     @classmethod
     def get_config_path(cls) -> str:
         """Path of the persisted config.json.
 
-        Honours ``PROMPT_MANAGER_CONFIG_PATH`` when set; otherwise the file
-        lives at the repository root next to ``pyproject.toml``.
+        Honours ``PROMPT_MANAGER_CONFIG_PATH`` when set; otherwise it lives in
+        the library's data folder (``utils.library_location``): the node
+        folder for a library that was not moved, else ComfyUI's
+        ``user/__promptmanager``.
         """
-        override = os.environ.get(CONFIG_PATH_ENV, "").strip()
-        if override:
-            return override
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(repo_root, "config.json")
+        return library_location.config_location()[0]
 
     @classmethod
     def load_from_file(cls, config_path: Optional[str] = None):
@@ -698,6 +1135,20 @@ class PromptManagerConfig:
                 performance["worker_threads"], cls.WORKER_THREADS
             )
 
+        maintenance = new_config.get("maintenance", {})
+        if isinstance(maintenance, dict) and isinstance(
+            maintenance.get("safety_backup"), bool
+        ):
+            cls.SAFETY_BACKUP = maintenance["safety_backup"]
+
+        library = new_config.get("library", {})
+        if isinstance(library, dict) and isinstance(
+            library.get("keep_in_node_folder"), bool
+        ):
+            cls.KEEP_LIBRARY_IN_NODE_FOLDER = library["keep_in_node_folder"]
+
+        cls._update_thumbnails(new_config.get("thumbnails"))
+
         # Update gallery config
         if "gallery" in new_config:
             GalleryConfig.update_config(new_config["gallery"])
@@ -705,6 +1156,25 @@ class PromptManagerConfig:
         # Update integration config
         if "integrations" in new_config:
             IntegrationConfig.update_config(new_config["integrations"])
+
+        if "autotag" in new_config:
+            AutotagConfig.update_config(new_config["autotag"])
+
+    @classmethod
+    def _update_thumbnails(cls, section: Any) -> None:
+        """Apply a ``thumbnails`` section; a hand-edited bad value is ignored."""
+        if not isinstance(section, dict):
+            return
+        fmt = section.get("format")
+        if fmt in cls.THUMBNAIL_FORMATS:
+            cls.THUMBNAIL_FORMAT = fmt
+        quality = section.get("quality")
+        if type(quality) is int and 1 <= quality <= 100:
+            cls.THUMBNAIL_QUALITY = quality
+        edge = section.get("edge")
+        low, high = cls.THUMBNAIL_EDGE_RANGE
+        if type(edge) is int and low <= edge <= high:
+            cls.THUMBNAIL_EDGE = edge
 
 
 # Load configuration on import

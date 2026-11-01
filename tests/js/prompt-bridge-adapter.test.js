@@ -17,6 +17,17 @@ test('lists only explicit PromptManager destinations and roles for all five sche
     assert.equal(targets[0].id,'0'); assert.equal(targets[0].label,'My prompts');
     assert.deepEqual(createPromptAdapter({}).listTargets(),[]);
 });
+test('each destination says which renderer its window draws nodes with (System › Integrations, S10)',async()=>{
+    const {createPromptAdapter}=await source; const {app}=fixture();
+    assert.equal(createPromptAdapter(app,{runtime:{LiteGraph:{vueNodesMode:true}}}).listTargets()[0].renderer,'nodes2');
+    assert.equal(createPromptAdapter(app,{runtime:{LiteGraph:{vueNodesMode:false}}}).listTargets()[0].renderer,'classic');
+    assert.equal(createPromptAdapter(app,{runtime:{LiteGraph:{}}}).listTargets()[0].renderer,'classic');
+    assert.equal(Object.hasOwn(createPromptAdapter(app,{runtime:{}}).listTargets()[0],'renderer'),false);
+    // Read at every listing: a window that switches renderer reports the new one.
+    const runtime={LiteGraph:{vueNodesMode:false}}; const adapter=createPromptAdapter(app,{runtime});
+    runtime.LiteGraph.vueNodesMode=true;
+    assert.equal(adapter.listTargets()[0].renderer,'nodes2');
+});
 test('previews exact composition, updates requested visible/serialized values, preserves other fields',async()=>{
     const {createPromptAdapter}=await source; const {app,node,widget}=fixture(); const adapter=createPromptAdapter(app);
     const {preview,snapshot}=adapter.preview('7',{positive:'new'});
@@ -139,4 +150,23 @@ test('callback failure preserves serialization normalized between preview and ap
     const adapter=createPromptAdapter(app),{snapshot}=adapter.preview('7',{positive:'new'});
     node.widgets_values=node.widgets.map(item=>item.value); widget('text').callback=()=>{throw new Error('callback failed');};
     assert.throws(()=>adapter.apply(snapshot),/failed/); assert.equal(node.widgets_values[0],'old'); assert.equal(widget('text').value,'old');
+});
+
+test('listTargets reports which roles are linked to an upstream node',async()=>{
+    const {createPromptAdapter}=await import('../../web/js/prompt-bridge-adapter.js');
+    const widgets=[{name:'text',value:''},{name:'negative_text',value:''}];
+    const app={graph:{_nodes:[{id:1,type:'PromptManagerPair',widgets,inputs:[{name:'text',link:null},{name:'negative_text',link:4}]},{id:2,type:'PromptManager',widgets,inputs:[]}]}};
+    const [pair,plain]=createPromptAdapter(app,{runtime:{}}).listTargets();
+    assert.deepEqual(pair.linkedRoles,['negative']);assert.deepEqual(plain.linkedRoles,[]);
+});
+
+test('the revision moves when the graph is edited and when a load replaces the node, even at the same version',async()=>{
+    const {createPromptAdapter}=await import('../../web/js/prompt-bridge-adapter.js');
+    const node=()=>({id:1,type:'PromptManager',widgets:[{name:'text',value:''}],inputs:[]});
+    const app={graph:{_version:9,_nodes:[node()]}};
+    const adapter=createPromptAdapter(app,{runtime:{}});
+    const first=adapter.listTargets()[0].revision;
+    assert.equal(adapter.preview('1',{positive:'x'}).preview.revision,first);
+    app.graph._version=10;const edited=adapter.listTargets()[0].revision;assert.notEqual(edited,first);
+    app.graph={_version:10,_nodes:[node()]};assert.notEqual(adapter.listTargets()[0].revision,edited);
 });

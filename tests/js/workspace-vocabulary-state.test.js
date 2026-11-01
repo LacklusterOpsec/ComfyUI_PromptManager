@@ -461,6 +461,57 @@ test('after dispose an unconfirmed write invalidates and a failed write does not
     }
 });
 
+test('a tag stream sends its search and sort, replaces them on reset and needs the server to echo them (#444)', async () => {
+    const {createVocabularyStream, TAG_SORTS} = await source;
+    assert.deepEqual(TAG_SORTS.map(([value]) => value), ['created', 'name', 'name-desc', 'prompts', 'prompts-asc']);
+    assert.deepEqual(TAG_SORTS.map(([, label]) => label), ['Oldest first', 'Name A–Z', 'Name Z–A', 'Most prompts', 'Fewest prompts']);
+    const echo = (page, search, sort) => ({...page, search, sort, untagged_count: 4});
+    const {calls, api} = queued([
+        echo(tagPage([tag(1)], 'next'), 'cat', 'name'), echo(tagPage([tag(2)]), 'cat', 'name'),
+        echo(tagPage([tag(3)]), '', 'created'), tagPage([tag(4)]), echo(tagPage([tag(5)]), 'dog', 'created'),
+    ]);
+    const stream = createVocabularyStream({api, kind: 'tags', query: {search: ' cat ', sort: 'name'}});
+    await stream.loadMore();
+    assert.equal(params(calls[0].url).get('search'), 'cat');
+    assert.equal(params(calls[0].url).get('sort'), 'name');
+    assert.equal(stream.state.untaggedCount, 4);
+    await stream.loadMore();
+    assert.equal(params(calls[1].url).get('search'), 'cat');
+    assert.equal(params(calls[1].url).get('cursor'), 'next');
+    assert.deepEqual(stream.state.query, {search: 'cat', sort: 'name'});
+    // The default query sends neither, so an older server answers it unchanged.
+    await stream.reset({search: '', sort: 'created'});
+    assert.equal(params(calls[2].url).has('search'), false);
+    assert.equal(params(calls[2].url).has('sort'), false);
+    assert.deepEqual(stream.state.items.map(row => row.id), [3]);
+    // A server that ignored the search (no echo) is an error, never a wrong list.
+    await stream.reset({search: 'dog', sort: 'created'});
+    assert.deepEqual(stream.state.items, []);
+    assert.ok(stream.state.error instanceof TypeError);
+    assert.equal(stream.state.untaggedCount, 4, 'the last known untagged count survives a reset');
+    await stream.loadMore();
+    assert.deepEqual(stream.state.items.map(row => row.id), [5]);
+    assert.throws(() => stream.reset({search: 'x', sort: 'count'}), TypeError);
+    assert.throws(() => createVocabularyStream({api, kind: 'categories', query: {search: 'x'}}), TypeError);
+    assert.throws(() => createVocabularyStream({api, kind: 'tags', query: {search: 3}}), TypeError);
+    stream.dispose();
+});
+
+test('an invalid untagged_count rejects the page', async () => {
+    const {createVocabularyStream} = await source;
+    for (const untagged_count of [-1, 1.5, '2']) {
+        const stream = createVocabularyStream({api: queued([{...tagPage([tag(1)]), untagged_count}]).api, kind: 'tags'});
+        await stream.loadMore();
+        assert.ok(stream.state.error instanceof TypeError, String(untagged_count));
+        assert.equal(stream.state.untaggedCount, null);
+    }
+});
+
+test('untaggedBrowseFilters opens the Library on prompts without tags (#444)', async () => {
+    const {untaggedBrowseFilters} = await source;
+    assert.deepEqual(untaggedBrowseFilters(), {text: '', category: '', tags: [], sort: 'newest', tagMode: 'untagged'});
+});
+
 test('browseFilters hands Library one exact constraint', async () => {
     const {browseFilters} = await source;
     assert.deepEqual(browseFilters('tags', 'a'), {text: '', category: '', tags: ['a'], sort: 'newest'});
@@ -507,10 +558,62 @@ test('category preview text states the real impact and whether it renames or con
         '“Landscapes” is used by 2 other saved prompts. Apply renames it to “Scenery”.');
 });
 
+test('accepts image_count and names images in the delete text', async () => {
+    const {createVocabularyStream, createVocabularyCommand, readTagImpact, deleteTagText} = await helpers;
+    const rows = [{...tag(1, 'mist', 2), image_count: 3}, tag(2, 'dusk', 0)];
+    const stream = createVocabularyStream({api: queued([tagPage(rows)]).api, kind: 'tags'});
+    assert.equal(await stream.loadMore(), 2);
+    assert.deepEqual(stream.state.items.map(row => row.image_count), [3, undefined]);
+    for (const bad of [{...tag(1), image_count: -1}, {...tag(1), image_count: '3'}, {...tag(1), image_count: 1.5}]) {
+        const rejected = createVocabularyStream({api: queued([tagPage([bad])]).api, kind: 'tags'});
+        await rejected.loadMore();
+        assert.ok(rejected.state.error instanceof TypeError, JSON.stringify(bad));
+        assert.deepEqual(rejected.state.items, []);
+    }
+    const withImages = {...impact, images: 2};
+    const api = {get: async () => ({success: true, library_epoch: EPOCH, impact: withImages})};
+    assert.deepEqual((await readTagImpact(api, {id: 4, name: 'mist'})).impact, withImages);
+    await assert.rejects(readTagImpact({get: async () => ({success: true, library_epoch: EPOCH, impact: {...impact, images: -2}})},
+        {id: 4, name: 'mist'}), TypeError);
+    const command = createVocabularyCommand({api: {
+        patch: async () => renameReceipt({tag: {...tag(1, 'dusk', 2), image_count: 1}, images_changed: 1}),
+        post: async () => ({success: true, library_epoch: EPOCH, deleted: true, components_changed: 0, pairs_changed: 0, images_changed: 2}),
+    }});
+    await command.renameTag({id: 1, name: 'dawn', prompt_count: 2}, 'dusk', EPOCH);
+    assert.equal(command.state.phase, 'done');
+    assert.equal(command.state.receipt.images_changed, 1);
+    command.reset();
+    await command.deleteTag({id: 1, name: 'dusk'}, EPOCH);
+    assert.equal(command.state.phase, 'done');
+    const malformed = createVocabularyCommand({api: {post: async () => ({success: true, library_epoch: EPOCH, deleted: true,
+        components_changed: 0, pairs_changed: 0, images_changed: 'two'})}});
+    await malformed.deleteTag({id: 1, name: 'dusk'}, EPOCH);
+    assert.equal(malformed.state.phase, 'unknown-outcome');
+    assert.equal(deleteTagText('mist', withImages),
+        'Deleting “mist” removes the name and its links from 3 positive prompts, 3 negative variants (1 archived), 1 other saved prompt and 2 images. The prompts, negative variants, images and history themselves are kept.');
+    assert.equal(deleteTagText('mist', {...zero, images: 1}),
+        'Deleting “mist” removes the name and its links from 1 image. The prompts, negative variants, images and history themselves are kept.');
+    assert.equal(deleteTagText('unused', {...zero, images: 0}),
+        '“unused” is not linked to any saved prompt or image. Deleting it removes only the name.');
+});
+
 test('delete text names the tag, its real links and what stays unchanged', async () => {
     const {deleteTagText} = await helpers;
     assert.equal(deleteTagText('mist', impact),
         'Deleting “mist” removes the name and its links from 3 positive prompts, 3 negative variants (1 archived) and 1 other saved prompt. The prompts, negative variants, images and history themselves are kept.');
     assert.equal(deleteTagText('unused', zero),
-        '“unused” is not linked to any saved prompt. Deleting it removes only the name.');
+        '“unused” is not linked to any saved prompt or image. Deleting it removes only the name.');
+});
+
+test('a category row counts prompts and images, and an image-only row browses Images (#332 D143)', async () => {
+    const {categoryRowText, categoryBrowseTarget, categoryPreviewText} = await import('../../web/js/workspace/vocabulary-state.mjs');
+    assert.equal(categoryRowText({value: 'L', prompt_count: 3}), '3 positive prompts');
+    assert.equal(categoryRowText({value: 'L', prompt_count: 1, image_count: 0}), '1 positive prompt');
+    assert.equal(categoryRowText({value: 'L', prompt_count: 3, image_count: 2}), '3 positive prompts · 2 images');
+    assert.equal(categoryRowText({value: 'S', prompt_count: 0, image_count: 1}), '1 image');
+    assert.equal(categoryBrowseTarget({value: 'L', prompt_count: 3, image_count: 2}), 'library');
+    assert.equal(categoryBrowseTarget({value: 'S', prompt_count: 0, image_count: 2}), 'images');
+    const impact = {positive_prompts: 3, other_prompts: 0, negative_variants: 0, archived_negative_variants: 0, images: 2};
+    assert.equal(categoryPreviewText({source: 'Landscapes', target: 'Landscape', target_exists: false, impact}),
+        '“Landscapes” is used by 3 positive prompts and 2 images. Apply renames it to “Landscape”.');
 });

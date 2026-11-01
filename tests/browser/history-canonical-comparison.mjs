@@ -1,5 +1,5 @@
 import { writeFile } from 'node:fs/promises';
-import { expect } from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import { expect } from './fixtures.mjs';
 
 // Content, row counts, and image bytes come from independent synthetic datasets.
 // Saved choices and actual executions are separate production sections. The concept's
@@ -10,13 +10,13 @@ import { expect } from '../../tools/vendor/node_modules/@playwright/test/index.m
 export const canonicalDifferences = {
     data: ['Independent synthetic text, image bytes, IDs, counts and text wrapping'],
     semantics: [
-    'Saved combinations are distinct from the additional chronological executions',
+    'Negative variants are saved combinations; Recorded runs list the chronological executions',
     'Recorded run exposes exact frozen evidence; Repeat run is illustrative',
     'Current-file candidates disclose unknown identity and context membership',
     ],
+    // Closed by #249: the gallery's checkbox is Images-only (#259) and the role blocks are the concept's (PR D, F); the
+    // exact history comparison is tests/browser/history-concept.spec.mjs.
     remainingApplicationPolish: [
-        'Gallery card select checkbox (#249 D8 follow-up) and tag button (#249 D9, image-annotations slice) remain outside #209',
-        'Shared role-block spacing, padding and glyph styling remain outside #209; exact role order/actions and evidence disclosure are covered',
         'Production keeps mobile toolbar inside media panel and readable scrolling details; the concept toolbar collision is not reproduced',
     ],
 };
@@ -33,29 +33,27 @@ export async function captureCanonicalState(page, testInfo, name, selector) {
     await testInfo.attach(name, { path, contentType: 'image/png' });
 }
 
+const CONCEPT_HISTORY_SELECTORS = Object.freeze({
+    surface: 'article.surface', timeline: '.timeline', positive: '.positive-lane', branch: '.variant-lane',
+    label: '.variant-lane > span', dot: '.variant-dot[aria-pressed="true"]', role: 'article.surface .prompt-section',
+    positiveLabel: '.positive-lane span',
+    prompt: 'article.surface .prompt-text', gallery: '.history-gallery',
+    heading: '.timeline-panel h2', intro: '.timeline-panel .panel-heading .small',
+    footer: '.timeline-lower', all: '.timeline-lower button',
+    repeat: '.timeline .run-dot:not([hidden])',
+});
+const RECORDED_HISTORY_SELECTORS = Object.freeze({
+    recordedPositiveLabel: '.history-positive-lane span', recordedBranch: '.history-context-branch',
+    recordedHeading: '.recorded-history h2', recordedTimeline: '.history-timeline', recordedCanvas: '.history-canvas',
+    recordedPositive: '.history-positive-lane', recordedLabel: '.history-context-label',
+    recordedAnchor: '.history-context-anchor', recordedRepeat: '.history-run-marker:not(.history-context-anchor)',
+    recordedMarker: '.history-run-marker', recordedColumn: '.history-run-column',
+});
+
 export async function historyGeometry(page, production) {
-    const selectors = production ? {
-        surface: '.library-surface', timeline: '.library-branches', positive: '.library-positive-lane',
-        branch: '.library-variant-lane', label: '.library-variant-lane span', dot: '.library-variant-dot[aria-pressed="true"]',
-        positiveLabel: '.library-positive-lane span',
-        role: '[aria-label="Saved prompt texts"] .prompt-block',
-        prompt: '[aria-label="Saved prompt texts"] pre', gallery: '.library-shared-gallery',
-        heading: '.library-variants h2', intro: '.library-variants > p.muted',
-        footer: '.library-variant-footer', all: '.library-variants button:last-child',
-        recordedPositiveLabel: '.history-positive-lane span', recordedBranch: '.history-context-branch',
-        recordedHeading: '.recorded-history h2', recordedTimeline: '.history-timeline', recordedCanvas: '.history-canvas',
-        recordedPositive: '.history-positive-lane', recordedLabel: '.history-context-label',
-        recordedAnchor: '.history-context-anchor', recordedRepeat: '.history-run-marker:not(.history-context-anchor)',
-        recordedMarker: '.history-run-marker', recordedColumn: '.history-run-column',
-    } : {
-        surface: '.surface', timeline: '.timeline', positive: '.positive-lane', branch: '.variant-lane',
-        label: '.variant-lane span', dot: '.variant-dot[aria-pressed="true"]', role: '.surface .prompt-section',
-        positiveLabel: '.positive-lane span',
-        prompt: '.surface .prompt-text', gallery: '.history-gallery',
-        heading: '.timeline-panel h2', intro: '.timeline-panel .panel-heading .small',
-        footer: '.timeline-lower', all: '.timeline-lower button',
-        repeat: '.timeline .run-dot',
-    };
+    // Production renders the concept's history classes (#249 PR F), so both documents use the concept's selectors;
+    // production adds the recorded executions (#209), which the concept does not have.
+    const selectors = production ? { ...CONCEPT_HISTORY_SELECTORS, ...RECORDED_HISTORY_SELECTORS } : CONCEPT_HISTORY_SELECTORS;
     return page.evaluate(selectors => ({ pointerCoarse: matchMedia('(pointer: coarse)').matches,
         ...Object.fromEntries(Object.entries(selectors).map(([key, selector]) => {
         const nodes = [...document.querySelectorAll(selector)];
@@ -106,10 +104,10 @@ export async function exerciseCurrentPairSend(page, roles) {
             } });
         });
         const viewer = page.locator('dialog#viewer-dialog');
-        const send = viewer.getByRole('button', { name: 'Send prompt pair', exact: true });await send.click();
+        const send = viewer.getByRole('button', { name: /^Send prompt pair to ComfyUI: / });await send.click();
         const sender = page.getByRole('dialog', { name: 'Send to ComfyUI', exact: true });await expect(sender).toBeVisible();
         await sender.getByRole('combobox', { name: 'ComfyUI window', exact: true }).selectOption({ label: 'Canonical ComfyUI' });
-        await sender.getByRole('combobox', { name: 'Destination node', exact: true }).selectOption({ label: 'Canonical destination' });
+        await sender.getByRole('combobox', { name: 'Destination node', exact: true }).selectOption({ label: '#canonical-pair Canonical destination' });
         await sender.getByRole('button', { name: 'Preview changes', exact: true }).click();
         await expect(sender).toContainText(roles.positive);await expect(sender).toContainText(roles.negative);
         await sender.getByRole('button', { name: 'Apply to ComfyUI', exact: true }).click();await expect(sender).toContainText('Sent to ComfyUI.');

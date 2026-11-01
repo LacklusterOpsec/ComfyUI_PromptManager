@@ -1,7 +1,11 @@
 """Physical-file prompt inspection is bounded, conservative and read-only."""
 
+import io
 import json
-from unittest.mock import patch
+import shutil
+import subprocess
+import unittest
+from unittest.mock import MagicMock, patch
 
 from PIL import Image, PngImagePlugin
 
@@ -15,6 +19,9 @@ except ImportError:
 from utils.pair_execution import EXECUTION_KEY, record_pair_execution
 from database.pair_ingestion import ingest_resolved_pair
 from utils.prompt_pair_resolver import resolve_prompt_pair
+from utils import video_metadata
+
+HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
 def graph(positive="portrait", negative="blurry"):
@@ -26,6 +33,54 @@ def graph(positive="portrait", negative="blurry"):
             "inputs": {"positive": ["1", 0], "negative": ["2", 0]},
         },
     }
+
+
+def write_video(path, metadata_tags=True, **tags):
+    """Tiny black clip carrying one container tag per keyword (needs ffmpeg).
+
+    MP4 keeps arbitrary keys only with ``use_metadata_tags`` (mdta atoms), the
+    movflag the core SaveVideo node sets; without it ffmpeg writes the legacy
+    ilst atoms that old VideoHelperSuite files carry. Matroska and WebM
+    upper-case the key names.
+    """
+    command = [
+        "ffmpeg",
+        "-v",
+        "quiet",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=16x16:d=0.2",
+    ]
+    if metadata_tags and path.suffix.lower() in (".mp4", ".mov", ".m4v"):
+        command += ["-movflags", "use_metadata_tags"]
+    for key, value in tags.items():
+        command += ["-metadata", f"{key}={value}"]
+    subprocess.run(command + ["-y", str(path)], check=True, timeout=60)
+    return path
+
+
+class ProbeOutput(io.BytesIO):
+    """ffprobe stdout that records the bounded read size asked of it."""
+
+    requested_size = None
+
+    def read(self, size=-1):
+        self.requested_size = size
+        return super().read(size)
+
+
+def probe_process(payload, poll=0, returncode=0):
+    """A fake ffprobe whose stdout is ``payload`` bytes."""
+    process = MagicMock()
+    process.stdout = ProbeOutput(payload)
+    process.poll.return_value = poll
+    process.returncode = returncode
+    return process
+
+
+def probe_payload(tags):
+    return json.dumps({"format": {"tags": tags}}).encode()
 
 
 def png(path, **metadata):
@@ -128,9 +183,15 @@ class TestPromptInspector(ImageAPITestCase):
         for expected in ("ambiguous", "unresolved"):
             source = graph()
             if expected == "ambiguous":
-                source["4"] = source["3"]
+                # Branches with different prompts (#249: identical ones resolve).
+                source["5"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "x"}}
+                source["4"] = {
+                    "class_type": "KSampler",
+                    "inputs": {"positive": ["5", 0], "negative": ["2", 0]},
+                }
             else:
-                source["1"]["class_type"] = "UnknownEncoder"
+                # No text and no links: nothing passes through it (#381).
+                source["1"] = {"class_type": "UnknownEncoder", "inputs": {"seed": 1}}
             png(
                 path,
                 prompt=source,
@@ -155,7 +216,7 @@ class TestPromptInspector(ImageAPITestCase):
             result["prompts"]["negative"], self.side("", "embedded-parameters")
         )
         source = graph()
-        source["2"]["class_type"] = "UnknownEncoder"
+        source["2"] = {"class_type": "UnknownEncoder", "inputs": {"seed": 1}}
         png(path, prompt=source)
         _, result = await self.inspect()
         self.assertEqual(result["prompts"]["positive"], self.side("portrait"))
@@ -307,7 +368,7 @@ class TestPromptInspector(ImageAPITestCase):
     async def test_corrupt_truncated_duplicate_and_expanding_metadata_fail_closed(self):
         import struct
         import zlib
-        from utils.prompt_inspector import MAX_METADATA_BYTES
+        from utils.prompt_inspector import VIDEO_REPROBE_BYTES
 
         path = self.output_dir / "image.png"
         base = png(path, prompt=graph()).read_bytes()
@@ -320,8 +381,8 @@ class TestPromptInspector(ImageAPITestCase):
         cases.append(bytes(broken))
         for kind, payload in (
             (b"tEXt", b"prompt\0{}"),
-            (b"zTXt", b"prompt\0\0" + zlib.compress(b"x" * (MAX_METADATA_BYTES + 1))),
-            (b"tEXt", b"prompt\0" + b"x" * (MAX_METADATA_BYTES + 1)),
+            (b"zTXt", b"prompt\0\0" + zlib.compress(b"x" * (VIDEO_REPROBE_BYTES + 1))),
+            (b"tEXt", b"prompt\0" + b"x" * (VIDEO_REPROBE_BYTES + 1)),
             (b"tEXt", b"bad-key-without-separator"),
             (b"zTXt", b"prompt\0\1bad-compression"),
             (b"iTXt", b"prompt\0\2\0\0\0text"),
@@ -380,9 +441,7 @@ class TestPromptInspector(ImageAPITestCase):
         self.assertEqual(result["prompts"]["positive"]["status"], "absent")
 
     async def test_video_inspection_uses_bounded_container_evidence(self):
-        import io
-        from unittest.mock import MagicMock
-        from utils.prompt_inspector import MAX_METADATA_BYTES
+        from utils.prompt_inspector import VIDEO_PROBE_BYTES, VIDEO_REPROBE_BYTES
 
         (self.output_dir / "clip.mp4").write_bytes(b"video fixture")
         metadata = {"prompt": graph("Video portrait", "")}
@@ -407,14 +466,25 @@ class TestPromptInspector(ImageAPITestCase):
         process.wait.assert_called()
         self.assertNotIn("shell", spawn.call_args.kwargs)
         self.assertIn(str(self.output_dir / "clip.mp4"), spawn.call_args.args[0])
-        process.stdout = io.BytesIO(b"x" * (MAX_METADATA_BYTES + 1))
+        # An envelope over the probe bound cannot be split: the role-only
+        # re-probe overflows too and the read fails instead of guessing.
+        processes = [
+            probe_process(b"x" * (VIDEO_PROBE_BYTES + 1)),
+            probe_process(b"x" * (VIDEO_REPROBE_BYTES + 1)),
+        ]
         with (
             patch("utils.prompt_inspector.ffprobe_path", return_value="/tool/ffprobe"),
-            patch("utils.prompt_inspector.subprocess.Popen", return_value=process),
+            patch(
+                "utils.prompt_inspector.subprocess.Popen", side_effect=processes
+            ) as spawn,
         ):
             _, result = await self.inspect("clip.mp4")
+        self.assertEqual(spawn.call_count, 2)
         self.assertEqual(result["prompts"]["positive"]["status"], "unresolved")
-        self.assertTrue(process.stdout.closed)
+        self.assertEqual(result["metadata"]["status"], "unreadable")
+        for process in processes:
+            self.assertTrue(process.stdout.closed)
+            process.wait.assert_called()
 
     async def test_video_missing_probe_and_timeout_preserve_uncertainty(self):
         import io
@@ -890,11 +960,9 @@ class TestPromptInspector(ImageAPITestCase):
         self.assertNotIn("\ufffd".encode(), body)
         self.assertLessEqual(len(body), 8 * 1024 * 1024)
 
-    async def video_inspect(self, comment=None, description=None):
-        import io
+    async def video_inspect(self, comment=None, description=None, **per_key):
         import threading
-        from unittest.mock import MagicMock
-        from utils.prompt_inspector import MAX_METADATA_BYTES
+        from utils.prompt_inspector import VIDEO_PROBE_BYTES
 
         path = self.output_dir / "clip.mp4"
         path.write_bytes(b"fixture")
@@ -903,17 +971,8 @@ class TestPromptInspector(ImageAPITestCase):
             for key, value in (("comment", comment), ("description", description))
             if value is not None
         }
-        payload = json.dumps({"format": {"tags": tags}}).encode()
-
-        class ProbeOutput(io.BytesIO):
-            def read(self, size=-1):
-                self.requested_size = size
-                return super().read(size)
-
-        process = MagicMock()
-        process.stdout = ProbeOutput(payload)
-        process.poll.return_value = 0
-        process.returncode = 0
+        tags.update(per_key)
+        process = probe_process(probe_payload(tags))
         timers = []
         timer_type = threading.Timer
 
@@ -932,10 +991,155 @@ class TestPromptInspector(ImageAPITestCase):
             response, result = await self.inspect("clip.mp4")
         self.assertEqual(spawn.call_count, 1)
         self.assertTrue(process.stdout.closed)
-        self.assertEqual(process.stdout.requested_size, MAX_METADATA_BYTES + 1)
+        self.assertEqual(process.stdout.requested_size, VIDEO_PROBE_BYTES + 1)
         self.assertEqual(len(timers), 1)
         self.assertTrue(timers[0].finished.is_set())
+        self.assertEqual(
+            spawn.call_args.args[0][spawn.call_args.args[0].index("-show_entries") + 1],
+            "format_tags=prompt,workflow,parameters,"
+            "comfyassets_prompt_pairs,comment,description",
+        )
         return response, result
+
+    async def test_video_separate_prompt_workflow_tags_are_read(self):
+        source = graph("per-key portrait", "per-key negative")
+        workflow = '{"nodes":[{"id":"per-key"}],"cfg":6.5000000000000000001}'
+        for tags in (
+            {"prompt": json.dumps(source), "workflow": workflow},
+            {"PROMPT": json.dumps(source), "WORKFLOW": workflow},
+        ):
+            _, result = await self.video_inspect(
+                json.dumps({"prompt": graph("comment must not win")}), **tags
+            )
+            self.assertEqual(
+                result["prompts"]["positive"], self.side("per-key portrait")
+            )
+            self.assertEqual(
+                result["prompts"]["negative"], self.side("per-key negative")
+            )
+            self.assertEqual(
+                result["metadata"]["record_formats"],
+                {"prompt": "original-text", "workflow": "original-text"},
+            )
+            self.assertEqual(result["metadata"]["raw"]["workflow"], workflow)
+            self.assertEqual(
+                result["metadata"]["workflow_graph"]["value"]["cfg"],
+                "6.5000000000000000001",
+            )
+            self.assertNotIn("must not win", json.dumps(result))
+        _, result = await self.video_inspect(
+            **{"PROMPT": json.dumps(source), "prompt": json.dumps(graph("other"))}
+        )
+        self.assertEqual(result["prompts"]["positive"]["status"], "unresolved")
+        self.assertEqual(result["metadata"]["status"], "unreadable")
+
+    @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg/ffprobe not installed")
+    async def test_video_per_key_and_comment_tags_read_from_real_containers(self):
+        video_metadata.ffprobe_path.cache_clear()
+        self.addCleanup(video_metadata.ffprobe_path.cache_clear)
+        source = json.dumps(graph("real portrait", ""))
+        workflow = '{"nodes":[{"id":"real"}]}'
+        for name in ("per_key.mp4", "per_key.mkv", "per_key.webm"):
+            write_video(self.output_dir / name, prompt=source, workflow=workflow)
+            response, result = await self.inspect(name)
+            self.assertEqual(response.status, 200, name)
+            self.assertEqual(
+                result["prompts"]["positive"], self.side("real portrait"), name
+            )
+            self.assertEqual(result["metadata"]["raw"]["workflow"], workflow, name)
+            self.assertEqual(
+                result["metadata"]["record_formats"],
+                {"prompt": "original-text", "workflow": "original-text"},
+                name,
+            )
+        # Old VideoHelperSuite envelope in the legacy ilst comment atom, unchanged.
+        write_video(
+            self.output_dir / "vhs.mp4",
+            metadata_tags=False,
+            comment=json.dumps({"prompt": json.loads(source), "workflow": {"v": 1}}),
+        )
+        _, result = await self.inspect("vhs.mp4")
+        self.assertEqual(result["prompts"]["positive"], self.side("real portrait"))
+        self.assertEqual(
+            result["metadata"]["record_formats"],
+            {"prompt": "reserialized-json", "workflow": "reserialized-json"},
+        )
+        self.assertEqual(result["metadata"]["workflow_graph"]["value"], {"v": 1})
+
+    async def test_video_oversize_workflow_reprobes_role_only_and_marks_limited(self):
+        from utils.prompt_inspector import VIDEO_PROBE_BYTES, VIDEO_REPROBE_BYTES
+
+        path = self.output_dir / "clip.mp4"
+        path.write_bytes(b"fixture")
+        source = json.dumps(graph("bounded portrait", ""))
+        processes = [
+            probe_process(b"x" * (VIDEO_PROBE_BYTES + 1)),
+            probe_process(probe_payload({"PROMPT": source})),
+        ]
+        with (
+            patch("utils.prompt_inspector.ffprobe_path", return_value="/tool/ffprobe"),
+            patch(
+                "utils.prompt_inspector.subprocess.Popen", side_effect=processes
+            ) as spawn,
+        ):
+            response, result = await self.inspect("clip.mp4")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(spawn.call_count, 2)
+        first, second = (call.args[0] for call in spawn.call_args_list)
+        self.assertEqual(
+            first[first.index("-show_entries") + 1],
+            "format_tags=prompt,workflow,parameters,"
+            "comfyassets_prompt_pairs,comment,description",
+        )
+        self.assertEqual(
+            second[second.index("-show_entries") + 1],
+            "format_tags=prompt,parameters,comfyassets_prompt_pairs,"
+            "comment,description",
+        )
+        self.assertEqual(processes[0].stdout.requested_size, VIDEO_PROBE_BYTES + 1)
+        self.assertEqual(processes[1].stdout.requested_size, VIDEO_REPROBE_BYTES + 1)
+        for process in processes:
+            self.assertTrue(process.stdout.closed)
+            process.wait.assert_called()
+        self.assertEqual(result["prompts"]["positive"], self.side("bounded portrait"))
+        self.assertEqual(result["metadata"]["status"], "available")
+        self.assertEqual(
+            result["metadata"]["record_formats"],
+            {"prompt": "original-text", "workflow": "limited"},
+        )
+        self.assertNotIn("workflow", result["metadata"]["raw"])
+        self.assertEqual(result["metadata"]["workflow_graph"]["status"], "limited")
+        # The dropped per-key workflow belonged to an unselected carrier when
+        # an envelope wins the re-probe: that envelope is whole, not limited.
+        envelope = json.dumps({"prompt": json.loads(source), "workflow": {"v": 2}})
+        processes = [
+            probe_process(b"x" * (VIDEO_PROBE_BYTES + 1)),
+            probe_process(probe_payload({"comment": envelope})),
+        ]
+        with (
+            patch("utils.prompt_inspector.ffprobe_path", return_value="/tool/ffprobe"),
+            patch("utils.prompt_inspector.subprocess.Popen", side_effect=processes),
+        ):
+            _, result = await self.inspect("clip.mp4")
+        self.assertEqual(result["prompts"]["positive"], self.side("bounded portrait"))
+        self.assertEqual(result["metadata"]["workflow_graph"]["value"], {"v": 2})
+        self.assertEqual(
+            result["metadata"]["record_formats"]["workflow"], "reserialized-json"
+        )
+        # A workflow-only per-key video over budget is limited, not absent.
+        processes = [
+            probe_process(b"x" * (VIDEO_PROBE_BYTES + 1)),
+            probe_process(probe_payload({})),
+        ]
+        with (
+            patch("utils.prompt_inspector.ffprobe_path", return_value="/tool/ffprobe"),
+            patch("utils.prompt_inspector.subprocess.Popen", side_effect=processes),
+        ):
+            _, result = await self.inspect("clip.mp4")
+        self.assertEqual(result["metadata"]["status"], "available")
+        self.assertEqual(result["metadata"]["record_formats"], {"workflow": "limited"})
+        self.assertEqual(result["metadata"]["workflow_graph"]["status"], "limited")
+        self.assertEqual(result["prompts"]["positive"]["status"], "absent")
 
     async def test_video_role_description_wins_over_workflow_only_comment(self):
         evidence = {}
@@ -1214,9 +1418,10 @@ class TestPromptInspector(ImageAPITestCase):
     async def test_root_scope_rotated_key_and_removed_index_skip_reader_and_db(self):
         png(self.output_dir / "image.png", prompt=graph())
         descriptor = await self.scoped_descriptor()
-        import py.api.images as images_module
+        from utils.workspace_keys import WorkspaceKeys
 
-        with patch.object(images_module, "_WORKSPACE_CURSOR_SECRET", b"new-key"):
+        rotated = WorkspaceKeys(b"n" * 32, b"m" * 32, False)
+        with patch.object(self.api, "_workspace_keys", return_value=rotated):
             await self.assert_scope_skips_access(descriptor.get("root_scope", "0" * 64))
         self.api._get_all_output_dirs = lambda: []
         await self.assert_scope_skips_access(descriptor.get("root_scope", "0" * 64))
@@ -1302,6 +1507,64 @@ class TestPromptInspector(ImageAPITestCase):
         )
         roots.assert_called_once_with()
 
+    async def test_recipe_link_falls_back_to_positive_category_and_tags_per_field(
+        self,
+    ):
+        # D39 ruling (2026-10-21): a recipe's own category and tags win when set;
+        # otherwise each field falls back to the linked positive's, separately, and
+        # the scopes say where each value came from (no merging of tag sets).
+        cases = (
+            ("Recipe cat", ["recipe"], "Recipe cat", "pair", ["recipe"], "pair"),
+            (None, [], "Positive cat", "positive", ["positive"], "positive"),
+            ("  ", [], "Positive cat", "positive", ["positive"], "positive"),
+            ("Recipe cat", [], "Recipe cat", "pair", ["positive"], "positive"),
+            (None, ["recipe"], "Positive cat", "positive", ["recipe"], "pair"),
+        )
+        for index, case in enumerate(cases):
+            recipe_category, recipe_tags = case[:2]
+            category, category_scope, tags, tags_scope = case[2:]
+            with self.subTest(case=index):
+                text = f"Fallback owner {index}"
+                positive = self._save_prompt(
+                    text, category="Positive cat", tags=["positive"]
+                )
+                pair = self.api.db.save_prompt_pair(
+                    text,
+                    f"Fallback noise {index}",
+                    category=recipe_category,
+                    tags=recipe_tags,
+                )
+                self.assertEqual(
+                    self.api.db.get_prompt_pair(pair)["positive_prompt_id"], positive
+                )
+                filename = f"fallback-{index}.png"
+                path = png(self.output_dir / filename)
+                image = self.api.db.link_image_to_prompt(positive, str(path))
+                self.api.db.link_image_to_pair(pair, image, {"source": "fixture"})
+                response, result = await self.inspect(filename)
+                self.assertEqual(response.status, 200)
+                library = result["library"]
+                self.assertEqual(library["status"], "linked")
+                self.assertEqual(library["pair_id"], pair)
+                self.assertEqual(library["category"], category)
+                self.assertEqual(library["category_scope"], category_scope)
+                self.assertEqual(library["tags"], tags)
+                self.assertEqual(library["tags_scope"], tags_scope)
+                self.assertNotIn("metadata_scope", library)
+
+    async def test_positive_only_link_keeps_positive_scopes(self):
+        positive = self._save_prompt("Solo owner", tags=["solo"])
+        path = png(self.output_dir / "solo.png")
+        self.api.db.link_image_to_prompt(positive, str(path))
+        response, result = await self.inspect("solo.png")
+        self.assertEqual(response.status, 200)
+        library = result["library"]
+        self.assertEqual(library["pair_id"], None)
+        self.assertEqual(library["category"], None)
+        self.assertEqual(library["category_scope"], "positive")
+        self.assertEqual(library["tags"], ["solo"])
+        self.assertEqual(library["tags_scope"], "positive")
+
     async def test_exact_saved_association_ambiguity_preserves_physical_file_evidence(
         self,
     ):
@@ -1340,8 +1603,9 @@ class TestPromptInspector(ImageAPITestCase):
                     if count == 1:
                         self.assertEqual(result["library"]["positive_id"], positive)
                         self.assertEqual(
-                            result["library"]["metadata_scope"], "positive"
+                            result["library"]["category_scope"], "positive"
                         )
+                        self.assertEqual(result["library"]["tags_scope"], "positive")
                         self.assertEqual(result["library"]["category"], "Category 1")
                         self.assertEqual(result["library"]["tags"], ["owner-1"])
                         if not readable:
@@ -1361,7 +1625,8 @@ class TestPromptInspector(ImageAPITestCase):
                         "title": None,
                         "category": None,
                         "tags": [],
-                        "metadata_scope": None,
+                        "category_scope": None,
+                        "tags_scope": None,
                     },
                 )
                 for field in (
@@ -1379,3 +1644,142 @@ class TestPromptInspector(ImageAPITestCase):
                     lookup.assert_called_once_with(
                         str(path), False, report_ambiguity=True
                     )
+
+    async def test_unhashable_workflow_node_type_is_skipped(self):
+        """A UI workflow node whose ``type`` is a list or dict is skipped (#286).
+
+        The R1 check looks each node's ``type`` up among subgraph IDs; an
+        unhashable ``type`` used to raise there and the route answered 500.
+        Such a node can be neither a subgraph instance nor a PromptManager
+        node, so the walk skips it and a prompt that resolves still resolves.
+        """
+        source = graph()
+        source["1"]["class_type"] = "PromptManager"
+        for kind in (["PromptManager"], {"name": "PromptManager"}):
+            with self.subTest(kind=type(kind).__name__):
+                workflow = json.dumps(
+                    {"nodes": [{"id": 1, "type": kind, "widgets_values": ["x"]}]}
+                )
+                png(
+                    self.output_dir / "image.png",
+                    prompt=json.dumps(source),
+                    workflow=workflow,
+                )
+                response, result = await self.inspect()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(result["resolution"]["state"], "resolved")
+                self.assertEqual(result["resolution"]["sampler_id"], "3")
+                self.assertEqual(result["prompts"]["positive"]["status"], "resolved")
+                self.assertEqual(result["prompts"]["positive"]["text"], "portrait")
+                self.assertEqual(result["prompts"]["negative"]["text"], "blurry")
+                self.assertNotIn("unhashable", json.dumps(result))
+
+    async def test_unhashable_graph_class_type_is_not_a_preview_output(self):
+        """A list or object ``class_type`` never names a preview output (#286).
+
+        With several samplers the inspector first drops stages that reach only
+        previews; looking such a ``class_type`` up among the preview classes
+        used to raise, and the route answered 500.
+        """
+        for kind in (["PreviewImage"], {"name": "PreviewImage"}):
+            with self.subTest(kind=type(kind).__name__):
+                source = graph()
+                source["9"] = {
+                    "class_type": "KSampler",
+                    "inputs": {"positive": ["8", 0], "negative": ["2", 0]},
+                }
+                source["8"] = {
+                    "class_type": "CLIPTextEncode",
+                    "inputs": {"text": "cat"},
+                }
+                source["10"] = {"class_type": kind, "inputs": {"images": ["9", 0]}}
+                png(self.output_dir / "image.png", prompt=json.dumps(source))
+                response, result = await self.inspect()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    result["resolution"]["reason"], "Multiple sampler branches"
+                )
+                self.assertEqual(result["resolution"]["state"], "ambiguous")
+
+
+class TestInspectorImageTags(ImageAPITestCase):
+    """B3: the inspector envelope's ``image_tags`` facet (spec amendment S1)."""
+
+    inspect = TestPromptInspector.inspect
+
+    def tag(self, path, tags):
+        import hashlib
+        import os
+
+        stat = path.stat()
+        return self.api.db.replace_image_tags(
+            locator=os.path.normcase(os.path.realpath(path)),
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            expected_epoch=self.api.db.get_execution_epoch(),
+            expected_tag_revision=0,
+            tags=tags,
+        )
+
+    async def test_inspector_reports_current_none_and_unavailable_image_tags(self):
+        import os
+
+        tagged = png(self.output_dir / "sub" / "tagged.png", prompt=graph())
+        changed = png(self.output_dir / "changed.png", prompt=graph())
+        png(self.output_dir / "untagged.png", prompt=graph())
+        empty = png(self.output_dir / "empty.png", prompt=graph())
+        self.tag(tagged, ["dunes", "warm_light"])
+        self.tag(changed, ["dunes"])
+        self.tag(empty, [])
+        stat = changed.stat()
+        os.utime(changed, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+        response, envelope = await self.inspect("sub/tagged.png")
+        self.assertEqual(response.status, 200, envelope)
+        self.assertEqual(
+            envelope.get("image_tags"),
+            {"state": "current", "tags": ["dunes", "warm_light"]},
+        )
+        # The tags never change the Library facts of the prompt link.
+        self.assertEqual(envelope["library"]["tags"], [])
+        _, changed_body = await self.inspect("changed.png")
+        self.assertEqual(changed_body.get("image_tags"), {"state": "none", "tags": []})
+        _, untagged = await self.inspect("untagged.png")
+        self.assertEqual(untagged.get("image_tags"), {"state": "none", "tags": []})
+        _, saved_empty = await self.inspect("empty.png")
+        self.assertEqual(
+            saved_empty.get("image_tags"), {"state": "current", "tags": []}
+        )
+        with patch.object(
+            self.api.db, "current_image_tags", side_effect=RuntimeError("boom")
+        ):
+            with self.assertLogs("prompt_manager", level="WARNING") as logged:
+                response, failed = await self.inspect("sub/tagged.png")
+        self.assertTrue(
+            any(r.exc_info and "image tags" in r.getMessage() for r in logged.records),
+            logged.output,
+        )
+        self.assertEqual(response.status, 200, failed)
+        self.assertEqual(failed.get("image_tags"), {"state": "unavailable", "tags": []})
+        self.assertEqual(failed["prompts"], envelope["prompts"])
+        self.assertNotIn(str(self.comfy_dir), json.dumps(envelope))
+
+    async def test_inspector_image_tags_use_the_inspection_stable_stat(self):
+        tagged = png(self.output_dir / "tagged.png", prompt=graph())
+        self.tag(tagged, ["dunes"])
+        stat = tagged.stat()
+        seen = []
+        real = self.api.db.current_image_tags
+
+        def spy(stats):
+            seen.append(dict(stats))
+            return real(stats)
+
+        with patch.object(self.api.db, "current_image_tags", side_effect=spy):
+            _, body = await self.inspect("tagged.png")
+        self.assertEqual(
+            body.get("image_tags"), {"state": "current", "tags": ["dunes"]}
+        )
+        self.assertEqual(list(seen[0].values()), [(stat.st_size, stat.st_mtime_ns)])
+        self.assertEqual(len(seen), 1)

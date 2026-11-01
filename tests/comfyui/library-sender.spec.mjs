@@ -22,10 +22,10 @@ test('native library sends the selected saved pair into a real ComfyUI destinati
     const workspace=await context.newPage();const errors=[];workspace.on('pageerror',error=>errors.push(error.message));
     try {
         await workspace.goto('/prompt_manager/workspace#/library');
-        await workspace.getByRole('searchbox',{name:'Search prompts',exact:true}).fill(positive);
-        await workspace.locator('article[data-prompt-id]').filter({has:workspace.getByText(positive,{exact:true})}).getByRole('link',{name:'Explore history',exact:true}).click();
+        await workspace.getByRole('searchbox',{name:'Search workspace',exact:true}).fill(positive);
+        await workspace.locator('article[data-prompt-id]').filter({has:workspace.getByText(positive,{exact:true})}).getByRole('button',{name:'Explore history',exact:true}).click();
         const history=workspace.getByRole('region',{name:'Prompt history',exact:true});
-        await history.getByRole('button',{name:'Select negative variant 1',exact:true}).click();
+        await history.getByRole('button',{name:'Select negative Host saved pair',exact:true}).click();
         await expect(history.getByRole('region',{name:'Saved prompt texts',exact:true}).getByRole('region',{name:'Negative prompt',exact:true})).toContainText(negative);
         // The pair send lives in the history heading, as in the approved concept.
         await workspace.locator('#workspace-main > .heading').getByRole('button',{name:`Send prompt pair to ComfyUI: ${positive}`,exact:true}).click();
@@ -67,7 +67,7 @@ test('native editor preview sends exact saved roles across renderer transitions'
         await expect(workspace).toHaveURL(/#\/library\/\d+$/);const positiveId=Number(new URL(workspace.url()).hash.split('/').at(-1));
         await expect(workspace.locator('#workspace-main h1')).toHaveText(title);
         const saved=workspace.getByRole('region',{name:'Saved prompt texts',exact:true});
-        await expect(saved.getByRole('region',{name:'Negative prompt',exact:true})).toContainText('Empty negative prompt');
+        await expect(saved.getByRole('region',{name:'Negative prompt',exact:true})).toContainText('No negative prompt (explicitly empty)');
         const evidence=async()=>{
             const history=await(await request.get(`/prompt_manager/library/${positiveId}/history`)).json();
             const detail=await(await request.get(`/prompt_manager/library/${positiveId}?archive=all`)).json();
@@ -117,10 +117,9 @@ test('native editor preview sends exact saved roles across renderer transitions'
         try {
             await send.click();
             const sender=workspace.getByRole('dialog',{name:'Send to ComfyUI',exact:true});
-            const hosts=sender.getByRole('combobox',{name:'ComfyUI window',exact:true});await expect(hosts.locator('option')).toHaveCount(2);await hosts.selectOption({index:1});
-            await sender.getByRole('combobox',{name:'Destination node',exact:true}).selectOption({index:1});
-            await sender.getByRole('button',{name:'Preview changes',exact:true}).click();
-            await expect(sender.getByRole('alert')).toContainText(/connected/i);
+            // #535: the linked node is not offered, and the status line says why.
+            await expect(sender).toContainText(/has its negative prompt linked to another node/);
+            await expect(sender.getByRole('button',{name:'Preview changes',exact:true})).toBeDisabled();
             await expect(sender.getByRole('button',{name:'Apply to ComfyUI',exact:true})).toBeDisabled();
             const rejected=await page.evaluate(async id=>{
                 const {app}=await import('/scripts/app.js');const node=app.graph.getNodeById(id);const serialized=node.serialize();

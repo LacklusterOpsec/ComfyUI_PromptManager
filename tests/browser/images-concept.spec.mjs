@@ -1,13 +1,13 @@
 import {writeFile} from 'node:fs/promises';
-import {test,expect} from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import {test,expect} from './fixtures.mjs';
 import {captureCanonicalState} from './history-canonical-comparison.mjs';
-import {SIZES,THEMES,MOTIONS,seedConcept,openConcept,openProduction,inventoryOf,diffInventory,mutate,stripExact,countCopy} from './concept-inventory.mjs';
+import {SIZES,THEMES,MOTIONS,seedConceptAt,openConcept,openProduction,inventoryOf,diffInventory,mutate,stripExact,countCopy,reflow,withoutItems} from './concept-inventory.mjs';
 
 // Task C7 of #249: the production Images page against the immutable concept, on the concept-shaped real fixture (24
 // images of the concept's six prompts, its seeds, sizes and favorites). Heading, toolbar, filter row, caption, grid,
 // the first six cards, the continuation and the panel box are compared at 1600x1100 and 390x844 in both themes, and the
 // page's behaviors under normal and reduced motion; grid, cards and panel also at 1200x900 and 1800x1100 (2 and 4
-// columns, the 275px and 310px panel). The topbar and sidebar (D5, D28, D29) are the shell spec's.
+// columns, the 275px and 310px panel). The topbar and sidebar (D28, D29, D52, D53) are the shell spec's.
 // Paired captures are artifacts only; there are no PNG baselines.
 test.use({locale:'en-US',timezoneId:'UTC'});
 
@@ -31,64 +31,15 @@ function captionDay(seconds,now=new Date()) {
 }
 
 /**
- * The row's flex lines laid out again from the concept's own item boxes, in order: an item breaks to a new line when its
- * hypothetical size (`flex-basis: 100%` → the row; a growing item → its min-width; otherwise its box) no longer fits
- * after the line's items and gaps; a growing item (the search field, `flex: 1`) takes its line's free space; items pack
- * from the start and centre in their line (`align-items: center`). The test proves this model on the concept rows first.
+ * D8 (amended by #249 PR D and #331): the selection bar's real actions only. Add to collection compares in place
+ * (D138). #480 D159: Remove links… returns as Delete…; OMITTED_BULK names the concept button it replaces.
  */
-export function reflow(row,items) {
-    const gap=parseFloat(row.columnGap)||0,rowGap=parseFloat(row.rowGap)||0;
-    // The unrounded boxes (`exact`); rounding happens once, on the result.
-    const rowWidth=row.exact?.width??row.width;
-    const exact=item=>item.exact??{left:item.left,width:item.width};
-    const grows=item=>parseFloat(item.flexGrow)>0;
-    const basis=item=>item.flexBasis==='100%'?rowWidth:grows(item)?parseFloat(item.minWidth)||0:exact(item).width;
-    const lines=[];
-    const order=row.items.filter(entry=>entry.shown);
-    for(const item of items.filter(entry=>entry.shown)) {
-        const line=lines.at(-1),used=line?line.reduce((sum,entry)=>sum+basis(entry)+gap,0):0;
-        // The slack is one layout unit (1/60px in Firefox), which float sums of the browser's boxes may exceed.
-        if(line&&used+basis(item)<=rowWidth+1/60)line.push(item);else lines.push([item]);
-    }
-    const placed=new Map();let top=0;
-    const sameLine=(a,b)=>a.top<b.top+b.height&&b.top<a.top+a.height;
-    const freeOf=line=>rowWidth-line.reduce((sum,item)=>sum+basis(item),0)-gap*(line.length-1);
-    for(const line of lines) {
-        const free=freeOf(line);
-        const growing=line.filter(grows);
-        const height=Math.max(...line.map(item=>item.height));
-        let x=0,previous=null;
-        for(const item of line) {
-            // A growing item keeps its concept width plus the space its line gained.
-            const width=growing.includes(item)?exact(item).width+(free-freeOf(order.filter(entry=>sameLine(entry,item))))/growing.length:exact(item).width;
-            // An item that followed the same neighbour on the same line in the concept keeps the concept's own spacing,
-            // moved by however much that neighbour grew; otherwise it follows the previous box and the gap.
-            const adjacent=previous&&order.indexOf(item)===order.indexOf(previous)+1&&sameLine(item,previous);
-            const before=previous&&placed.get(previous);
-            const left=line.indexOf(item)===0?0:adjacent?before.left+exact(item).left-exact(previous).left+before.width-exact(previous).width:x;
-            placed.set(item,{left,width,top:Math.round(top+(height-item.height)/2)});
-            x=left+width+gap;previous=item;
-        }
-        top+=height+rowGap;
-    }
-    const moved=item=>{
-        const box=placed.get(item);
-        if(!box)return item;
-        const grown=box.width-exact(item).width;
-        return {...item,left:Math.round(box.left),top:box.top,width:Math.round(box.width),
-            input:item.input&&{...item.input,width:Math.round((item.input.exact?.width??item.input.width)+grown)}};
-    };
-    return {...row,height:Math.round(top-rowGap),items:items.map(moved)};
-}
-
-/** A flex row without the items `isRemoved` picks; the remaining items flow again from the concept's boxes. */
-function withoutItems(row,isRemoved) {
-    return reflow(row,row.items.filter(item=>!isRemoved(item)));
-}
-
-/** D8: the selection bar's real actions only; Add tags, Add to collection and Remove links… are left out. */
-const OMITTED_BULK=Object.freeze(['Add tags','Add to collection','Remove links…']);
-const OMITTED_BULK_SELECTORS=Object.freeze(['bulk-tags','bulk-collection','bulk-remove'].map(action=>`#bulkbar [data-action="${action}"]`));
+const OMITTED_BULK=Object.freeze(['Remove links…']);
+const OMITTED_BULK_SELECTORS=Object.freeze(['bulk-remove'].map(action=>`#bulkbar [data-action="${action}"]`));
+/** D85: Auto-tag selected follows the concept's Add tags, a concept button of its own text. */
+const AUTO_TAG_CLONE=Object.freeze([{selector:'#bulkbar [data-action="bulk-tags"]',text:'Auto-tag selected'}]);
+/** #480 D159: Delete… takes the place of Remove links… (the concept's `danger` button, under another text). */
+const DELETE_CLONE=Object.freeze([{selector:'#bulkbar [data-action="bulk-remove"]',text:'Delete…'}]);
 
 /**
  * `withoutItems` for a row with padding and a border (the `.bulkbar`): its items flow again inside the content box,
@@ -115,12 +66,12 @@ function mapBulkbar(bulkbar,rise) {
 }
 
 /**
- * A list row's info once D9 narrows its actions to `actionsWidth`, from the concept's boxes:
+ * A list row's info with its actions `actionsWidth` wide, from the concept's boxes:
  * - D3 (the measurable list row, `.list-grid .media-info` in the overlay): the info fills the row beside the art and may
  *   shrink below a long nowrap title (`min-width: 0`), so it is the card's inner width less the art, and the actions
  *   end at its right padding; it keeps its own height (text or actions plus padding), centred in the row the concept
  *   stretches it across, so the text, centred in either, moves only by half the lines it lost;
- * - D9: the wider text column fits a subtitle the concept wrapped when its one-line width (`maxContent`) now fits.
+ * - the text column fits a subtitle the concept wrapped when its one-line width (`maxContent`) now fits.
  */
 function listInfo(card,actionsWidth) {
     const {info}=card,{copy,p}=info;
@@ -139,15 +90,18 @@ function listInfo(card,actionsWidth) {
 /** Recorded Images deviations only (spec §8); everything else in the concept inventory must equal production. */
 const nocase=(a,b)=>{const x=a.toLowerCase(),y=b.toLowerCase();return x<y?-1:x>y?1:a<b?-1:a>b?1:0;};
 
-export function mapImagesConcept(reference,{manifest,now=new Date()}) {
+export function mapImagesConcept(reference,{manifest,now=new Date(manifest.now*1000),imageCategories=[]}) {
     const paths=new Map(manifest.images.map(image=>[image.filename,image.path]));
-    const toolbar=withoutItems(reference.toolbar,item=>item.text==='Save view');
-    // D16 (follow-up PR): no Save view until the saved-views store ships. D14: the sort appends production's two sorts.
-    toolbar.items=toolbar.items.map(item=>item.id==='sort'?{...item,options:[...item.options,'Oldest first','Name Z–A']}:item);
+    // D14: the sort appends production's two sorts. Save view is the concept's own (saved views, #249 D16 retired).
+    const toolbar={...reference.toolbar};
+    // D153 (#447): production offers no "Highest rated".
+    toolbar.items=toolbar.items.map(item=>item.id==='sort'?{...item,options:[...item.options.filter(option=>option!=='Highest rated'),'Oldest first','Name Z–A']}:item);
     // D36: the category list is the Library's real list, sorted alphabetically (database/library.py `ORDER BY category
     // COLLATE NOCASE, category`); the concept lists its samples in prompt order (app.js 348). Only the order is mapped.
+    // D141 (#332): the list also holds the listed images' own categories (`GET /prompt_manager/images/categories`),
+    // sorted in with the Library's.
     toolbar.items=toolbar.items.map(item=>item.id==='category-filter'
-        ?{...item,options:[item.options[0],...item.options.slice(1).sort(nocase)]}:item);
+        ?{...item,options:[item.options[0],...[...item.options.slice(1),...imageCategories].sort(nocase)]}:item);
     // D29: no "Illustrative previews" sample tag.
     const filterRow=withoutItems(reference.filterRow,item=>String(item.className).includes('sample-tag'));
     filterRow.items=filterRow.items.map(item=>{
@@ -165,21 +119,16 @@ export function mapImagesConcept(reference,{manifest,now=new Date()}) {
     const cards=reference.cards.map(card=>{
         const filename=card.open.label.replace(/^Open /,'');
         const actions=card.info.actions;
-        const tag=actions.buttons.find(button=>button.label?.startsWith('Tag or auto-tag '));
-        // D9: no Tag button until the image-annotations slice; the actions group narrows by its box and gap.
-        const freed=tag?tag.width+parseFloat(actions.columnGap):0;
         // D3: a list row's info keeps its own height (text or actions plus its padding) so bounded rendering can measure
         // it, centred in the row the concept stretches it across; the text and the actions keep their place.
-        const actionsWidth=actions.width-freed;
-        const listRow=list?listInfo(card,actionsWidth):{};
+        const listRow=list?listInfo(card,actions.width):{};
         return {...card,
             // D29: the concept's alt adds its demo-only " · sample illustration N" to the card title.
             img:{...card.img,alt:card.img.alt.replace(/ · sample illustration \d+$/,'')},
             info:{...card.info,...listRow.info,copy:{...card.info.copy,...listRow.copy},p:{...card.info.p,...listRow.p},
                 // D10: the title keeps the file's relative path (the fixture manifest's) in `title`.
                 h3:{...card.info.h3,title:paths.get(filename)??null},
-                actions:{...actions,width:actionsWidth,left:listRow.actionsLeft??actions.left+freed,
-                    buttons:actions.buttons.filter(button=>button!==tag)}}};
+                actions:{...actions,left:listRow.actionsLeft??actions.left}}};
     });
     // D17: the right-hand date is the newest result's day under Recently added, here the fixture's newest mtime.
     // D35: the count line uses the singular for one.
@@ -205,12 +154,15 @@ function compareLoadingRow(reference,actual,count) {
     return diffInventory(unplaced(mapContinuation(reference,{loaded,total})),unplaced(actual));
 }
 
-/** D15: the Import dialog's two real operations, with the ruled intro and the Rescan wording. */
+/**
+ * D15: the Import dialog's real operations, with the ruled intro and the Rescan wording. D55: the concept's own "Scan an
+ * output folder → Review scan" row follows Rescan as "Scan for metadata", opening the concept's "Review metadata scan".
+ */
 function mapImportConcept(reference) {
     return {...reference,
         intro:{...reference.intro,text:'Image inspection and output scanning have different effects. Choose the workflow you want.'},
-        rows:reference.rows.filter(row=>row.title!=='Import portable recipes').map(row=>row.title==='Scan an output folder'
-            ?{...row,description:'Find files added or removed in the output folders.',buttons:['Rescan']}:row)};
+        rows:reference.rows.filter(row=>row.title!=='Import portable recipes').flatMap(row=>row.title==='Scan an output folder'
+            ?[{...row,description:'Find files added or removed in the output folders.',buttons:['Rescan']},{...row,title:'Scan for metadata'}]:[row])};
 }
 
 const SECTIONS=['heading','toolbar','filterRow','bulkbar','caption','grid','cards','continuation','panel','noPageScroll'];
@@ -219,9 +171,9 @@ const pick=inventory=>stripExact(inventory);
 // The concept's own sample categories, in its first-appearance order (app.js 348): what D36 reorders.
 const CONCEPT_CATEGORIES=['All categories','Landscapes','Architecture','Environments','Illustration'];
 
-function compare(reference,actual,manifest,sections=SECTIONS) {
+function compare(reference,actual,manifest,sections=SECTIONS,imageCategories=[]) {
     const only=inventory=>Object.fromEntries(sections.map(key=>[key,inventory[key]]));
-    return diffInventory(pick(only(mapImagesConcept(reference,{manifest}))),pick(only(actual)));
+    return diffInventory(pick(only(mapImagesConcept(reference,{manifest,imageCategories}))),pick(only(actual)));
 }
 
 /** The comparison as a gate: throws, naming every differing path, unless production equals the mapped concept. */
@@ -342,7 +294,8 @@ const continuationText=page=>page.locator('.infinite-continuation > p').first().
 async function searchOf(page,term) {
     const before=await countText(page);
     await page.locator('#search').fill(term);
-    await expect.poll(()=>countText(page)).not.toBe(before);
+    // Production's caption reads "Loading images…" until the search's listing answers (#391); the concept's is instant.
+    await expect.poll(async()=>{const text=await countText(page);return text!==before&&text!=='Loading images…';}).toBe(true);
     await expect.poll(()=>page.locator(CARDS).count()).toBeLessThan(FIXTURE_IMAGES);
     await settle(page);
     const result={count:await countText(page),continuation:await continuationText(page),cards:await page.locator(`${CARDS} .image-open`).evaluateAll(nodes=>nodes.map(node=>node.getAttribute('aria-label')))};
@@ -374,7 +327,7 @@ async function behaviorsOf(page,scope) {
     return {hover,opened,viewerTitle,focusAfterViewer,selected,layouts,search,single};
 }
 
-test.beforeEach(async({request},testInfo)=>{testInfo.manifest=await seedConcept(request);});
+test.beforeEach(async({page,request},testInfo)=>{testInfo.manifest=await seedConceptAt(page,request);});
 
 for(const [width,height] of SIZES)for(const theme of THEMES)test(`images page geometry, tokens, controls and behaviors match the concept ${width}x${height} ${theme}`,async({page,request},testInfo)=>{
     test.setTimeout(240_000);
@@ -385,9 +338,9 @@ for(const [width,height] of SIZES)for(const theme of THEMES)test(`images page ge
         const conceptLoad=await openConceptLoaded(page,theme,motion);
         const reference=await inventoryOf(page,'#main');
         if(capture)await captureCanonicalState(page,testInfo,`concept-images-${width}-${theme}`);
-        // The browser as the re-layout's oracle: the concept page itself without Save view, then without the sample tag.
+        // The browser as the re-layout's oracle: the concept page itself without the sample tag.
         const removed={};
-        for(const [key,selector] of [['toolbar','.toolbar > [data-action="save-view"]'],['filterRow','.filter-row > .sample-tag']]) {
+        for(const [key,selector] of [['filterRow','.filter-row > .sample-tag']]) {
             const restore=await mutate(page,{remove:[selector]});
             removed[key]=(await inventoryOf(page,'#main'))[key];
             await restore();
@@ -404,13 +357,18 @@ for(const [width,height] of SIZES)for(const theme of THEMES)test(`images page ge
             importDiff:diffInventory(mapImportConcept(referenceImport),actualImport),referenceBehaviors,actualBehaviors};
     }
     // Load more in production: a fixture past one listing page appends one batch and shows the concept's toast.
-    testInfo.manifest=await seedConcept(request,{extra_images:LOAD_MORE_EXTRA});
+    testInfo.manifest=await seedConceptAt(page,request,{extra_images:LOAD_MORE_EXTRA});
     for(const motion of MOTIONS) {
         const total=FIXTURE_IMAGES+LOAD_MORE_EXTRA;
         await openProductionLoaded(page,theme,motion,total);
         const before=await page.locator(CARDS).count();
         const loadingRow=(await inventoryOf(page,'#workspace-main')).continuation,loadingCount=await countText(page);
-        await page.getByRole('button',{name:'Load more images',exact:true}).click();
+        // A dispatched press, as on the concept side: a pointer click scrolls the row into view first, and the page's
+        // own observer (rootMargin 250px) can append the final batch and hide the button before the click lands
+        // (WebKit, run 39512528039). The button must still be the enabled one the user would press.
+        const more=page.getByRole('button',{name:'Load more images',exact:true});
+        await expect(more).toBeVisible();await expect(more).toHaveAttribute('aria-disabled','false');
+        await more.dispatchEvent('click');
         await expect(page.locator('#result-count')).toHaveText(new RegExp(`^${total} of ${total} images`));
         result[motion].productionLoad={before,after:await page.locator(CARDS).count(),toast:await toastText(page),count:await countText(page)};
         result[motion].loadingDiff=compareLoadingRow(result[motion].conceptLoad.loadingRow,loadingRow,loadingCount);
@@ -436,12 +394,10 @@ for(const [width,height] of SIZES)for(const theme of THEMES)test(`images page ge
         expect.soft(reference.cards[0].info.p.text,`${motion} concept subtitle`).toBe(`${first.width} × ${first.height} · PNG · Seed ${first.seed}`);
         expect.soft(reference.cards[0].info.h3.fontSize,`${motion} concept h3 size`).toBe('11px');
         expect.soft(referenceImport.rows.map(row=>row.title),`${motion} concept Import rows`).toEqual(['Inspect a local image','Scan an output folder','Import portable recipes']);
-        // The row model reproduces the concept's own rows, and the concept page itself once Save view (D16) or the
-        // sample tag (D29) is removed from it at runtime: the browser is the oracle for the remainders the mapping uses.
+        // The row model reproduces the concept's own rows, and the concept page itself once the sample tag (D29) is
+        // removed from it at runtime: the browser is the oracle for the remainders the mapping uses.
         expect.soft(diffInventory(stripExact(reflow(reference.toolbar,reference.toolbar.items)),stripExact(reference.toolbar)),`${motion} toolbar model`).toEqual([]);
         expect.soft(diffInventory(stripExact(reflow(reference.filterRow,reference.filterRow.items)),stripExact(reference.filterRow)),`${motion} filter row model`).toEqual([]);
-        expect.soft(diffInventory(stripExact(withoutItems(reference.toolbar,item=>item.text==='Save view')),stripExact(removed.toolbar)),
-            `${motion} toolbar without Save view`).toEqual([]);
         expect.soft(diffInventory(stripExact(withoutItems(reference.filterRow,item=>String(item.className).includes('sample-tag'))),stripExact(removed.filterRow)),
             `${motion} filter row without the sample tag`).toEqual([]);
         expect.soft(reference.toolbar.items.find(item=>item.id==='category-filter').options,`${motion} concept categories`).toEqual(CONCEPT_CATEGORIES);
@@ -498,6 +454,12 @@ for(const [width,height] of SIZES)for(const theme of THEMES)test(`images selecti
     const restore=await mutate(page,{remove:[...OMITTED_BULK_SELECTORS]});
     const removed=(await inventoryOf(page,'#main')).bulkbar;
     await restore();
+    // The oracle for production's bar: the concept page itself with D85's button and D159's Delete… in place of
+    // Remove links….
+    const restoreClones=await mutate(page,{clone:[...AUTO_TAG_CLONE,...DELETE_CLONE]});
+    const restoreRemoved=await mutate(page,{remove:[...OMITTED_BULK_SELECTORS]});
+    const oracle=await inventoryOf(page,'#main');
+    await restoreRemoved();await restoreClones();
     await captureCanonicalState(page,testInfo,`concept-images-selected-${width}-${theme}`);
     await openProductionLoaded(page,theme,'no-preference');
     const emptyActual=await inventoryOf(page,'#workspace-main');
@@ -509,12 +471,169 @@ for(const [width,height] of SIZES)for(const theme of THEMES)test(`images selecti
     expect.soft(reference.bulkbar.bar.items.map(item=>item.text),'concept bar').toEqual(['1 selected','Add tags','Set category',
         'Add to collection','Export metadata','Remove links…','Clear']);
     expect.soft(diffInventory(stripExact(mapBulkbar(reference.bulkbar,0).bulkbar.bar),stripExact(removed.bar)),'bar without the omitted actions').toEqual([]);
-    expect.soft(actual.bulkbar.bar.items.map(item=>item.text),'production bar').toEqual(['1 selected','Set category','Export metadata','Clear']);
+    expect.soft(actual.bulkbar.bar.items.map(item=>item.text),'production bar').toEqual(['1 selected','Add tags','Auto-tag selected',
+        'Set category','Add to collection','Export metadata','Delete…','Clear']);
     expect.soft(compare(empty,emptyActual,manifest,['bulkbar','cards','panel']),'nothing checked').toEqual([]);
-    expect.soft(compare(reference,actual,manifest,['bulkbar','cards','panel']),'one card checked').toEqual([]);
+    // D186: the panel's sticky offset clears the shown bar; at one column the bar is one sideways row (its items are checked above).
+    const stuckPanel={...oracle,panel:{...oracle.panel,...(width<=700?{top:actual.panel.top}:{}),box:{...oracle.panel.box,top:actual.panel.box.top}}};
+    expect(parseFloat(actual.panel.box.top)).toBeGreaterThanOrEqual(20);
+    expect.soft(compare(stuckPanel,actual,manifest,width<=700?['panel']:['bulkbar','cards','panel']),'one card checked').toEqual([]);
     // The bar comparison notices a change to the production bar.
     await mutate(page,{css:'.bulkbar { padding: 4px }'});
-    expect(compare(reference,await inventoryOf(page,'#workspace-main'),manifest,['bulkbar']).map(item=>item.path)).toContain('bulkbar.bar.paddingTop');
+    expect(compare(oracle,await inventoryOf(page,'#workspace-main'),manifest,['bulkbar']).map(item=>item.path)).toContain('bulkbar.bar.paddingTop');
+});
+
+/**
+ * #331 D137: the collection page's Edit leads the heading actions, drawn in the concept as a plain copy of its Import
+ * button reading "Edit" (no icon, no action), so the browser lays out what follows it; returns an undo.
+ */
+async function drawCollectionEdit(page) {
+    await page.evaluate(()=>{
+        const actions=document.querySelector('#main .heading-actions');
+        const edit=actions.querySelector('button').cloneNode(false);
+        for(const key of Object.keys(edit.dataset))delete edit.dataset[key];
+        edit.textContent='Edit';actions.prepend(edit);window.__collectionEdit=edit;
+    });
+    await settle(page);
+    return ()=>page.evaluate(()=>{window.__collectionEdit.remove();delete window.__collectionEdit;});
+}
+
+// #331 D137: `#/collection/<id>` against the concept's `#collection-landscapes` (app.js a1152–1157, a1186–1189): the
+// collection's name as the h1, "Collection" as the breadcrumb, the Images description, toolbar and filter row. The grid
+// is not compared: the concept's members come from its categories, production's from the stored collection.
+for(const [width,height] of SIZES)for(const theme of THEMES)test(`collection page heading, toolbar and filter row match the concept ${width}x${height} ${theme}`,async({page},testInfo)=>{
+    await page.setViewportSize({width,height});
+    const manifest=testInfo.manifest;
+    await openConcept(page,'collection-landscapes',theme);await page.mouse.move(0,0);await settle(page);
+    await expect(page.locator('#main #page-title')).toHaveText('Landscapes');
+    await expect(page.locator('#breadcrumb')).toHaveText('Collection');
+    const restore=await drawCollectionEdit(page);
+    const reference=await inventoryOf(page,'#main');
+    await restore();
+    await openProduction(page,`collection/${manifest.collections.Landscapes}`,theme);await page.mouse.move(0,0);
+    await expect(page.locator(CARDS)).toHaveCount(12);
+    await expect(page.locator('#workspace-main #page-title')).toHaveText('Landscapes');
+    await expect(page.locator('#workspace-breadcrumb')).toHaveText('Collection');
+    await expect(page).toHaveTitle('Collection · Prompt Manager');
+    await settle(page);
+    const actual=await inventoryOf(page,'#workspace-main');
+    expect.soft(actual.heading.actions.buttons.map(item=>item.text),'production heading actions').toEqual(['Edit','Import','New prompt']);
+    expect.soft(reference.heading.actions.buttons.map(item=>item.text),'mapped concept heading actions').toEqual(['Edit','Import','New prompt']);
+    expect.soft(compare(reference,actual,manifest,['heading','toolbar','filterRow']),'collection page').toEqual([]);
+    // The comparison notices a lost Edit.
+    await mutate(page,{remove:['#workspace-main .heading-actions > button:first-child']});
+    expect(compare(reference,await inventoryOf(page,'#workspace-main'),manifest,['heading']).length).toBeGreaterThan(0);
+});
+
+/** #332: an own category on one listed image, set through the real route (PUT /prompt_manager/images/category). */
+const IMAGE_CATEGORY='Portraits';
+async function setImageCategory(request,path,category) {
+    const listing=await (await request.get('/prompt_manager/images/output?mode=workspace&limit=40')).json();
+    const root_scope=listing.images.find(item=>item.root_index===0).root_scope;
+    const response=await request.put('/prompt_manager/images/category',{data:{items:[{root_index:0,root_scope,path}],category}});
+    await expect(response).toBeOK();
+    expect(await response.json()).toMatchObject({success:true,category,updated:1});
+}
+
+/**
+ * Runs in the page: the open Set category dialog (the concept's `simpleInput`, app.js 1384-1390 and 1138): its title,
+ * the body's tree, the field, the input and its suggestions (`datalist`), and the actions with every button's box,
+ * all relative to the dialog, with the concept's geometry and tokens.
+ */
+function measureCategoryDialog() {
+    const dialog=document.querySelector('dialog#modal[open]');
+    const css=(node,...keys)=>node?Object.fromEntries(keys.map(key=>[key,getComputedStyle(node)[key]])):null;
+    const name=node=>[node.localName,...[...node.classList].sort()].join('.');
+    const text=node=>node?.textContent.trim()??null;
+    const origin=dialog.getBoundingClientRect();
+    const box=node=>{const rect=node.getBoundingClientRect();return {left:Math.round(rect.left-origin.left),top:Math.round(rect.top-origin.top),
+        width:Math.round(rect.width),height:Math.round(rect.height)};};
+    const body=dialog.querySelector('#modal-body');
+    const field=body.querySelector(':scope > .field');
+    const label=field?.querySelector(':scope > label'),input=field?.querySelector(':scope > input');
+    const list=body.querySelector(':scope > datalist');
+    const actions=body.querySelector(':scope > .dialog-actions');
+    return {
+        title:text(dialog.querySelector('#modal-title')),
+        tree:[...body.children].map(name),
+        field:field&&{tree:[...field.children].map(name),...css(field,'display','flexDirection','rowGap','marginBottom'),...box(field)},
+        label:label&&{text:text(label),for:label.htmlFor,...css(label,'fontSize','fontWeight','color')},
+        input:input&&{id:input.id,type:input.type,value:input.value,list:input.getAttribute('list'),
+            ...css(input,'height','paddingLeft','fontSize','color','backgroundColor','borderTopColor','borderTopLeftRadius'),...box(input)},
+        suggestions:list&&{id:list.id,shown:list.getClientRects().length>0,options:[...list.options].map(option=>option.value)},
+        actions:{tree:[...actions.children].map(name),...css(actions,'display','justifyContent','columnGap','rowGap','flexWrap','marginTop'),...box(actions),
+            buttons:[...actions.children].map(button=>({text:text(button),className:button.className,
+                ...css(button,'backgroundColor','color','fontSize','paddingTop','paddingLeft','borderTopColor','minHeight'),...box(button)}))},
+        width:Math.round(origin.width),height:Math.round(origin.height),
+    };
+}
+
+/**
+ * The concept's own open dialog as production records it, changed at runtime so the browser lays it out: D140 (#332)
+ * empties the field (the concept pre-fills its demo "Landscapes"), lists the toolbar's categories as the field's
+ * suggestions (`datalist#workspace-input-suggestions`) and adds "Use prompt category", a plain button of the concept's
+ * own Cancel, between Cancel and the primary action; D8 names the primary action "Apply" ("Apply in prototype").
+ */
+async function categoryDialogAsRecorded(page,suggestions) {
+    await mutate(page,{clone:[{selector:'dialog#modal[open] .dialog-actions > button:first-child',text:'Use prompt category'}]});
+    await page.evaluate(suggestions=>{
+        const body=document.querySelector('dialog#modal[open] #modal-body');
+        const input=body.querySelector('#action-input');input.value='';input.setAttribute('list','workspace-input-suggestions');
+        const list=document.createElement('datalist');list.id='workspace-input-suggestions';
+        for(const value of suggestions){const option=document.createElement('option');option.value=value;list.append(option);}
+        body.querySelector(':scope > .field').after(list);
+        body.querySelector('.dialog-actions > .ca-primary').textContent='Apply';
+    },suggestions);
+    await settle(page);
+    return page.evaluate(measureCategoryDialog);
+}
+
+async function openCategoryDialog(page,scope) {
+    await page.locator(scope).locator(CARDS).first().locator('.image-overlays > label > input[type="checkbox"]').check();
+    await expect(page.locator('#bulkbar > .bulkbar > strong')).toHaveText('1 selected');
+    await page.locator('#bulkbar').getByRole('button',{name:'Set category',exact:true}).click();
+    await expect(page.locator('dialog#modal[open] #modal-title')).toHaveText('Categorize selected images');
+    await page.mouse.move(0,0);await settle(page);
+    return page.evaluate(measureCategoryDialog);
+}
+
+// D140 and D141 (#332): with one image's own category set, the toolbar's category options and the Set category dialog
+// against the concept's (app.js 348 and 1384-1390). The dialog is compared with the concept page itself changed at
+// runtime as recorded (`categoryDialogAsRecorded`); unmapped, it differs only in the recorded parts.
+for(const [width,height] of SIZES)for(const theme of THEMES)test(`images category options and Set category dialog match the concept ${width}x${height} ${theme}`,async({page,request},testInfo)=>{
+    await page.setViewportSize({width,height});
+    const manifest=testInfo.manifest;
+    await setImageCategory(request,manifest.images.at(-1).path,IMAGE_CATEGORY);
+    await openConceptLoaded(page,theme,'no-preference');
+    const reference=await inventoryOf(page,'#main');
+    const referenceDialog=await openCategoryDialog(page,'#main');
+    await captureCanonicalState(page,testInfo,`concept-images-category-${width}-${theme}`,'dialog#modal');
+    const suggestions=[...CONCEPT_CATEGORIES.slice(1),IMAGE_CATEGORY].sort(nocase);
+    const oracle=await categoryDialogAsRecorded(page,suggestions);
+    await page.keyboard.press('Escape');await expect(page.locator('dialog#modal[open]')).toHaveCount(0);
+
+    await openProductionLoaded(page,theme,'no-preference');
+    await expect(page.locator('#category-filter option')).toHaveText(['All categories',...suggestions]);
+    const actual=await inventoryOf(page,'#workspace-main');
+    const actualDialog=await openCategoryDialog(page,'#workspace-main');
+    await captureCanonicalState(page,testInfo,`production-images-category-${width}-${theme}`,'dialog#modal');
+    const path=testInfo.outputPath('images-category-geometry.json');
+    await writeFile(path,JSON.stringify({referenceDialog,oracle,actualDialog,reference:reference.toolbar,actual:actual.toolbar},null,2));
+    await testInfo.attach('images-category-geometry',{path,contentType:'application/json'});
+
+    // The concept itself: its sample categories and its pre-filled simpleInput with Cancel / Apply in prototype.
+    expect.soft(reference.toolbar.items.find(item=>item.id==='category-filter').options,'concept categories').toEqual(CONCEPT_CATEGORIES);
+    expect.soft(referenceDialog,'concept dialog').toMatchObject({title:'Categorize selected images',label:{text:'Category'},
+        input:{id:'action-input',value:'Landscapes',list:null},suggestions:null});
+    expect.soft(referenceDialog.actions.buttons.map(button=>button.text),'concept actions').toEqual(['Cancel','Apply in prototype']);
+    // D141: the toolbar options add the image's own category, sorted in (D36).
+    expect.soft(compare(reference,actual,manifest,['toolbar'],[IMAGE_CATEGORY]),'toolbar differences after D14, D36, D141').toEqual([]);
+    // D140 and D8: the dialog equals the concept page laid out as recorded.
+    expect.soft(diffInventory(oracle,actualDialog),'dialog differences after D8, D140').toEqual([]);
+    // Unmapped, the concept differs only in the field's value and suggestions, the body's datalist and the actions.
+    const recorded=/^(input\.(value|list)|tree\.|suggestions|actions\.)/;
+    expect.soft(diffInventory(referenceDialog,actualDialog).map(item=>item.path).filter(item=>!recorded.test(item)),'unrecorded dialog differences').toEqual([]);
+    expect.soft(actualDialog.suggestions,'suggestions').toEqual({id:'workspace-input-suggestions',shown:false,options:suggestions});
 });
 
 // The comparison is only worth something if it notices a change (spec §7 mutation check): one CSS mutation (the
@@ -562,7 +681,7 @@ test('one appended image reads in the singular',async({page,request})=>{
     test.setTimeout(120_000);
     await page.setViewportSize({width:1600,height:1100});
     const total=PRODUCTION_BATCH+1;
-    await seedConcept(request,{extra_images:total-FIXTURE_IMAGES});
+    await seedConceptAt(page,request,{extra_images:total-FIXTURE_IMAGES});
     await openProductionLoaded(page,'dark','no-preference',total);
     await expect(page.locator('.infinite-continuation > p').first()).toHaveText(countCopy(`${PRODUCTION_BATCH} of ${total} images · more load as you scroll`));
     // A dispatched press: scrolling the button into view lets the page's own observer load the one image first.
@@ -578,7 +697,7 @@ test('one image appended by scrolling reads in the singular',async({page,request
     test.setTimeout(120_000);
     await page.setViewportSize({width:1600,height:1100});
     const total=PRODUCTION_BATCH+1;
-    await seedConcept(request,{extra_images:total-FIXTURE_IMAGES});
+    await seedConceptAt(page,request,{extra_images:total-FIXTURE_IMAGES});
     await openProductionLoaded(page,'dark','no-preference',total);
     await expect(page.locator('#result-count')).toHaveText(new RegExp(`^${PRODUCTION_BATCH} of ${total} images`));
     await page.locator('.infinite-continuation').scrollIntoViewIfNeeded();
@@ -588,8 +707,9 @@ test('one image appended by scrolling reads in the singular',async({page,request
 });
 
 // D3 (one footer height for the collection): bounded rendering cannot measure unrendered cards, so every row reserves
-// the tallest measured footer. Two seedless files (D11 "W × H · PNG", one line) form the first row at 390px, where
-// every concept subtitle wraps: their row is as tall as the wrapped rows, and every concept row moves down by one.
+// the tallest measured footer. Two seedless files (D11 "W × H · PNG", one line: a short "96 × 72" beside Info and Tag)
+// form the first row at 390px, where every concept subtitle wraps: their row is as tall as the wrapped rows, and every
+// concept row moves down by one.
 test('one footer height for the collection (D3)',async({page,request})=>{
     // A second fixture seed (dozens of PNGs and their thumbnails) runs inside the test.
     test.setTimeout(120_000);
@@ -598,7 +718,7 @@ test('one footer height for the collection (D3)',async({page,request})=>{
     const reference=await inventoryOf(page,'#main');
     expect(reference.grid.columns).toBe(2);
     expect(reference.cards.every(card=>card.info.p.height>parseFloat(card.info.p.lineHeight))).toBe(true);
-    const manifest=await seedConcept(request,{seedless_images:2});
+    const manifest=await seedConceptAt(page,request,{seedless_images:2,short_seedless:true});
     await openProductionLoaded(page,'dark','no-preference',FIXTURE_IMAGES+2);
     const actual=await inventoryOf(page,'#workspace-main');
     const box=card=>({left:card.left,top:card.top,width:card.width,height:card.height});
@@ -607,7 +727,10 @@ test('one footer height for the collection (D3)',async({page,request})=>{
         ...reference.cards.slice(0,4).map(card=>({...box(card),top:card.top+pitch}))]);
     const seedless=actual.cards.slice(0,2);
     expect(seedless.map(card=>card.open.label)).toEqual(manifest.seedless.map(image=>`Open ${image.filename}`));
-    expect(seedless.map(card=>card.info.p.text)).toEqual(['1536 × 1152 · PNG','1536 × 1152 · PNG']);
+    expect(seedless.map(card=>card.info.p.text)).toEqual(['96 × 72 · PNG','96 × 72 · PNG']);
     // Their own footer is one line shorter than the row it reserves.
-    for(const card of seedless)expect(card.info.height).toBeLessThan(reference.cards[0].info.height);
+    for(const card of seedless) {
+        expect(card.info.p.height).toBeLessThanOrEqual(parseFloat(card.info.p.lineHeight)+0.5);
+        expect(card.info.height).toBeLessThan(reference.cards[0].info.height);
+    }
 });

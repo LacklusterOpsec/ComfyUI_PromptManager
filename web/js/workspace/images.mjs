@@ -1,19 +1,39 @@
 import { createScope, createButton } from '../shared/toolkit/core.js';
-import { createImageStream, withItem, imageKey, countLine, captionDate, scopeLabel, cardTitle, cardSubtitle, mediaRatio } from './images-state.mjs';
-import { layoutImages, visibleImages, gridMetrics, MINIMUM_CARD_WIDTH } from './image-layout.mjs';
+import { createImageStream, withItem, imageKey, countLine, captionDate, scopeLabel, activeRefinements, initialImagesView, visitDefaults, listingFilter } from './images-state.mjs';
+import { createImageCard } from './image-card.mjs';
+import { layoutImages, visibleImages, gridMetrics, stacksCardInfo } from './image-layout.mjs';
 import { mountFileInspector } from './file-inspector.mjs';
 import { createInspectionController } from './inspection-state.mjs';
 import { mountSelectionBar } from './images-selection.mjs';
+import { scrollToPageTop } from './sticky-chrome.mjs';
 import { createPromptSender } from './prompt-sender.mjs';
 import { promptRoles } from './prompt-blocks.mjs';
 import { createWorkspaceIcon } from './icons.mjs';
 import { createMediaViewer } from './media-viewer.mjs';
+import { openDeleteImages } from './images-delete.mjs';
+import { removedCaption, removedEmpty, returnImages, toggleLabel } from './images-return.mjs';
 import { noun } from './plural.mjs';
 import { pageHeading } from './heading.mjs';
 import { mountToolbar } from './toolbar.mjs';
-import { openImportDialog, openRefineDialog } from './workspace-dialogs.mjs';
+import { RESCAN_FAILED, RESCAN_STARTED, openImportDialog, openRefineDialog, rescanFinished } from './workspace-dialogs.mjs';
+import { openMetadataScan } from './activity-scan.mjs';
 import { showWorkspaceToast } from './toast.mjs';
+import { imagesFilters, imagesViewState } from './saved-views.mjs';
+import { VIEW_COLLECTION_DELETED, isCollectionGone } from './collections.mjs';
+import { IMAGE_CATEGORIES_URL, mergeCategories } from './images-category.mjs';
+import { displayPreferences } from './preferences.mjs';
+import { onImageTagsSaved } from './image-tagging.mjs';
+import { followImageTagSaves, openCardTagging } from './images-tagging.mjs';
+import { favoriteBusy, paintStar, receiveFavorites, setFavoriteVisitTarget, toggleFavorite } from './images-favorites.mjs';
+import { createSourceRecovery, recoveredSource } from './images-source-recovery.mjs';
+export { onFavoriteChange } from './images-favorites.mjs';
 
+/** The concept's panel without an image (app.js updateImages a456–458). */
+function noSelection() {
+    const inner = el('div', undefined, 'detail-inner');
+    inner.append(el('h2', 'No image selected'), el('p', 'Clear the filters or choose a matching image.', 'small'));
+    return inner;
+}
 function el(tag, text, className) {
     const element = document.createElement(tag);
     if (text !== undefined) element.textContent = text;
@@ -44,94 +64,165 @@ function selectOf(id, options, value) {
     return select;
 }
 
-// The concept's three sorts first, then the production ones it lacks (D14); values are the listing's sorts (B3).
-const IMAGE_SORT_OPTIONS = Object.freeze([['newest', 'Recently added'], ['name', 'Name A–Z'], ['rating', 'Highest rated'],
+// The concept's sorts first, then the production ones it lacks (D14); values are the listing's sorts (B3). D153 (#447)
+// drops the concept's "Highest rated".
+const IMAGE_SORT_OPTIONS = Object.freeze([['newest', 'Recently added'], ['name', 'Name A–Z'],
     ['oldest', 'Oldest first'], ['name-desc', 'Name Z–A']]);
 const MEDIA_OPTIONS = Object.freeze([['all', 'All media'], ['image', 'Images'], ['video', 'Videos']]);
 const RETRY_RESCAN = 'Rescan from Import to retry.';
+// The concept's empty collection (app.js updateImages).
+const NO_MATCHES = 'No matching images. Try another search or category.';
 const RETRY_REFRESH = 'Refresh image collection to retry.';
+const CURSOR_STALE = 'The image collection changed. Refresh image collection to continue.';
 /** One alert for whichever of the source discovery and the categories failed, so two failures announce once. */
 function loadFailure(sourcesRetry, categoriesFailed) {
     if (sourcesRetry && categoriesFailed) return `Sources, folders and categories could not be loaded. ${sourcesRetry}`;
     if (sourcesRetry) return `Sources and folders could not be loaded. ${sourcesRetry}`;
     return categoriesFailed ? `Categories could not be loaded. ${RETRY_RESCAN}` : '';
 }
-// Import → Rescan (D15): the concept has no rescan copy, so its toasts follow the workspace pattern. The answer
-// counts every listed file across the output roots it walked.
-const RESCAN_STARTED = 'Rescanning output folders…';
-const RESCAN_FAILED = 'Rescan could not finish. Try again.';
-function rescanFinished(result) {
-    const {total, roots} = result ?? {};
-    if (![total, roots].every(value => Number.isSafeInteger(value) && value >= 0)) return 'Rescan finished.';
-    return `Rescan finished. ${total.toLocaleString('en-US')} ${noun(total, 'file')} in ${roots.toLocaleString('en-US')} output ${noun(roots, 'folder')}.`;
-}
-// D7 = A: the concept's star (app.js actions.favorite) against the favorites store; its toasts without the demo's
-// "in this tab". The concept has no failure copy, so a failure follows the workspace "could not be …" pattern.
-const FAVORITE_URL = '/prompt_manager/images/favorite';
-const FAVORITE_DONE = Object.freeze({true:'Added to favorites.', false:'Removed from favorites.'});
-const FAVORITE_FAILED = Object.freeze({true:'Favorite could not be added. Try again.', false:'Favorite could not be removed. Try again.'});
 // The concept card's first `.media-info` reservation and list row (image-layout.mjs); real rows are measured.
 const INITIAL_METRICS = Object.freeze({columns:1, gap:13, footerHeight:54, listHeight:97});
 
 let lastVisit = null;
-// One favorite request per file at a time (TESTING.md): the requests outlive the Images page that sent them, so the keys
-// in flight and the page that receives each answer live here, beside the saved visit.
-const favoritePending = new Set();
-let favoriteTarget = null;
-/** Give a favorite state to the mounted Images page, or to the saved visit while none is mounted. */
-function deliverFavorite(key, favorite) {
-    if (favoriteTarget) favoriteTarget(key, favorite);
-    else if (lastVisit?.state) lastVisit = {...lastVisit, state: withItem(lastVisit.state, key, {favorite})};
+// The star's answers patch the saved visit while no Images page is mounted (D7).
+setFavoriteVisitTarget((key, favorite) => {
+    if (lastVisit?.state) lastVisit = {...lastVisit, state: withItem(lastVisit.state, key, {favorite})};
+});
+
+// A tag save made while Images is left (Tags › Auto-tag images) may change what a filtered visit lists: it reloads (M6).
+onImageTagsSaved(() => { if (lastVisit?.filters.tags.length || lastVisit?.filters.q) lastVisit = {...lastVisit, stale: true}; });
+// The filter state a Tags & categories Browse hands to the next Images mount (#332 MC10).
+let browseState = null;
+/**
+ * Open Images filtered by `category` only (every other filter at its default), as Browse opens the Library: Tags &
+ * categories' Browse of a category only images use (#332 MC10, D143).
+ */
+export function browseImages({category} = {}) {
+    if (typeof category !== 'string' || !category) throw new TypeError('browseImages needs a category');
+    browseState = {category};
+    window.location.hash = '#/images';
+}
+/** Forget the last Images visit (its listing, scroll and selection): the next visit reads everything again (S9). */
+export function forgetImagesVisit() {
+    lastVisit = null;
+}
+/** The image selected in Images when it was last left (the concept's `state.selectedImage`, for Tags › Auto-tag images). */
+export function selectedImage() {
+    const key = lastVisit?.selection;
+    return key ? lastVisit.state?.items.find(item => imageKey(item) === key) ?? null : null;
 }
 
-export function mountImages(main, api, parentScope, {embedded = false, fetchPage} = {}) {
+/**
+ * An embedded collection (the history page's shared gallery and its All images and Repeat run dialogs, D47) has no
+ * caption: its page heading or dialog title already names it, and `focusTarget` takes a stranded focus.
+ * `savedState` opens a saved view (#249 D16) instead of the last visit; `onSaveView(trigger, state)` is Save view.
+ * `favorites` is the Favorites page (#249 D51): only favorites are listed, and it neither restores nor replaces the
+ * Images last visit. `collection` (an id) is a collection page (#331 D137): only its members are listed, favorites is
+ * off, and it neither restores nor replaces the last visit either. A listing that answers `collection-not-found` calls
+ * `onCollectionMissing()` when given (the shell shows its deleted-collection page); otherwise (a saved view on a
+ * deleted collection, D140) the page lists nothing and says so. `collections` (the shell's client store) adds the
+ * selection bar's Add to collection, and Remove from collection while a collection is open (D138).
+ */
+export function mountImages(main, api, parentScope, {embedded = false, fetchPage, emptyText, focusTarget = null, savedState = null,
+    favorites = false, collection: collectionId = null, onCollectionMissing = null, onSaveView = () => {}, activity = null,
+    collections = null} = {}) {
     const scope = createScope();
     const dispose = () => scope.dispose();
     parentScope.signal.addEventListener('abort', dispose, {once:true});
     scope.cleanup(() => parentScope.signal.removeEventListener('abort', dispose));
     if (parentScope.signal.aborted) { scope.dispose(); return {dispose}; }
-    const { resolveUrl } = window.ApiClient;
     const sender = createPromptSender({scope});
     let detailInspector;
-    const inspection = createInspectionController({api});
-    scope.cleanup(inspection.subscribe(next => detailInspector?.setState(next)));
+    // System › Appearance: the display defaults this visit starts from (preferences.mjs); null without gallery-settings.js.
+    const preferences = displayPreferences();
+    const inspection = createInspectionController({api, autoLoad:preferences?.autoLoadMetadata !== false, cache:preferences?.cacheMetadata !== false});
+    // The panel's listed file: a changed source is looked up once, the panel's Refresh stays the fallback (#430).
+    let selectedImage = null;
+    scope.cleanup(inspection.subscribe(next => {
+        detailInspector?.setState(next);
+        if (next.refreshRequired && next.code === 'source-changed' && selectedImage && imageKey(selectedImage) === selection) {
+            recovery.recover(selectedImage);
+        }
+    }));
     scope.cleanup(() => inspection.dispose());
     scope.cleanup(() => detailInspector?.dispose());
-    const visit = embedded ? null : lastVisit;
-    let density = visit?.density || 'comfortable';
+    // A Tags & categories Browse (browseImages) is handed to this mount once: a fresh Images visit filtered by its
+    // category, which becomes the Images return state like any plain visit (as Browse does for the Library).
+    const imagesPage = !embedded && !favorites && collectionId === null;
+    const handed = imagesPage && !savedState ? browseState : null;
+    if (imagesPage) browseState = null;
+    const saved = embedded || !savedState ? null : imagesFilters(savedState);
+    // The open collection: the route's, else a saved view's (D140); '' on every other page.
+    const openCollection = embedded ? '' : collectionId !== null ? String(collectionId) : saved?.collection || '';
+    const prior = embedded || saved || favorites || openCollection || handed ? null : lastVisit;
+    // A stale visit keeps its filters, layout and size, and lists again instead of restoring (M6).
+    const visit = prior?.stale ? null : prior;
+    // The layout and size defaults are the Images page's: an embedded gallery (a prompt history's, its dialogs) has no
+    // toolbar to change them, so it keeps its fixed Grid/Comfortable. The metadata and card defaults apply everywhere.
+    const start = initialImagesView({prior, saved, preferences:embedded ? null : preferences});
+    // The defaults this visit started from: a return follows defaults saved since unless the toolbar changed a value (#451).
+    const startDefaults = visitDefaults(embedded ? null : preferences);
+    let density = start.density;
     let metrics = {...INITIAL_METRICS};
-    let layout = visit?.layout || 'grid', selection = visit?.selection || null, frame = 0, loadFrame = 0, restoreFrame = 0, observer;
+    let layout = start.layout, selection = visit?.selection || null, frame = 0, loadFrame = 0, restoreFrame = 0, observer;
     let state, geometry = { positions: [], columns: 1, height: 0, maxHeight: 0 }, galleryWidth = 0, optionsRequest, categoryRequest, recovering = false, rescanning = false;
     // Discovered sources (each with its own folders) and every folder, for "Refine this view" and the scope chip.
     let roots = [], folders = [];
+    // The toolbar's current category list (loadCategories), also the Set category suggestions.
+    let categoryNames = [];
+    // The open "Refine this view", so a discovery that settles after it opened still lists its sources and folders.
+    let refine = null;
     const rendered = new Map();
     const itemIndexes = new Map();
-    const filters = { root: 'all', q: '', category: '', tags: [], subfolder: '', media: 'all', sort: 'newest', ...visit?.filters };
+    const filters = { root: 'all', q: '', category: '', tags: [], subfolder: '', media: 'all', sort: 'newest', ...prior?.filters, ...saved,
+        ...(handed ? {category: handed.category} : {}),
+        // A collection and favorites are never both the filter (DC10).
+        favorites: !openCollection && (favorites || saved?.favorites === true), collection: openCollection };
     filters.tags = [...filters.tags];
+    // #498 (D162): Show removed images belongs to this visit only: never restored, saved or handed on.
+    filters.removed = false;
+    if (!IMAGE_SORT_OPTIONS.some(([value]) => value === filters.sort)) filters.sort = 'newest';
+    // A saved Source or Folder is only listed once discovery confirms it still exists; until then nothing is fetched.
+    let savedScopePending = Boolean(saved) && (filters.root !== 'all' || filters.subfolder !== '');
+    // The first discovery settled (found or failed): only then may a pending saved scope be kept or dropped (#249 M3).
+    let discoverySettled = false;
     scope.cleanup(() => {
         // A Set category write still in flight may change what the saved collection shows: the return reloads instead.
-        if (!embedded) lastVisit = state && !bar.writing() ? { filters: {...filters, tags: [...filters.tags]}, state, layout, density, selection, checked: bar.checked(), scrollY: window.scrollY } : null;
+        // A favorites-only collection or a saved view is not the plain Images collection, so it never becomes the
+        // Images return state (#249 D51, and M2 for saved views).
+        if (!embedded && !filters.favorites && !filters.collection && !saved && !filters.removed) lastVisit = state && !bar.writing() ? { filters: {...filters, tags: [...filters.tags]}, state, layout, density, defaults: startDefaults, selection, checked: bar.checked(), scrollY: window.scrollY } : null;
         cancelAnimationFrame(restoreFrame);
     });
     main.classList.add('images-main');
     scope.cleanup(() => main.classList.remove('images-main'));
     // The concept's Images heading (app.js renderImages): description, then Import before the shell's New prompt.
     const heading = embedded ? null : pageHeading(main);
-    let importButton = null, importDialog = null;
+    let importButton = null, importDialog = null, showRemoved = null;
     if (heading) {
         heading.description.textContent = 'Your generations, their prompts, and the next idea.';
         importButton = createButton('');
         importButton.append(createWorkspaceIcon('upload'), el('span', 'Import'));
         heading.actions.prepend(importButton);
         scope.cleanup(() => importButton.remove());
+        // #498 (D162): Show removed images (N), before Import, only on the Images page and only while there are any.
+        if (imagesPage) {
+            // Attached only while shown, so a library without removals keeps the concept's heading exactly.
+            showRemoved = createButton(toggleLabel(null));
+            showRemoved.setAttribute('aria-pressed', 'false');
+            scope.cleanup(() => showRemoved.remove());
+            scope.listen(showRemoved, 'click', () => setRemovedView(!filters.removed));
+        }
         scope.listen(importButton, 'click', () => {
             importDialog = openImportDialog({scope, trigger:importButton, rescanBusy:rescanning,
-                onInspect:() => { window.location.hash = '#/inspect'; }, onRescan:rescan});
+                onInspect:() => { window.location.hash = '#/inspect'; }, onRescan:rescan,
+                // D55: Scan for metadata reviews the session scan job over every discovered source.
+                onMetadataScan:activity ? trigger => openMetadataScan({scope, store:activity, sources:roots.length, trigger}) : null});
         });
     }
     // The shared concept toolbar: search (filename, linked prompt text, title and tags), category and sort (D12–D14).
     const toolbar = embedded ? null : mountToolbar(main, {scope, categories:filters.category ? [filters.category] : [],
         sorts:IMAGE_SORT_OPTIONS, value:{q:filters.q, category:filters.category, sort:filters.sort},
+        activeFilters:activeRefinements(filters),
         onChange:value => {
             if (recovering) return;
             const next = {q:value.q.trim(), category:value.category, sort:value.sort};
@@ -140,7 +231,10 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
             if (Object.entries(next).every(([key, item]) => filters[key] === item)) return;
             Object.assign(filters, next);
             reset();
-        }, onFilters:openFilters});
+        }, onFilters:openFilters, onSaveView:trigger => {
+            const value = toolbar.value();
+            onSaveView(trigger, imagesViewState({...filters, q:value.q.trim(), category:value.category, sort:value.sort}));
+        }});
     const toolbarControls = toolbar ? [...toolbar.element.querySelectorAll('input, select, button')] : [];
     const optionsStatus = el('p', '', 'options-status muted');
     optionsStatus.hidden = true; optionsStatus.setAttribute('role', 'alert');
@@ -179,17 +273,14 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
     const body = el('div', undefined, 'gallery-layout image-workspace');
     const collection = el('section', undefined, 'gallery-body');
     collection.setAttribute('aria-label', 'Images');
-    // The concept's caption replaces the old "All images" heading; the embedded gallery keeps its own heading.
+    // The concept's caption replaces the old "All images" heading.
     const caption = el('div', undefined, 'section-caption');
-    const collectionHeading = embedded ? el('h2', 'Linked images') : null;
-    if (collectionHeading) { collectionHeading.tabIndex = -1; caption.append(collectionHeading); }
     const count = el('span', 'Loading images…');
-    if (!embedded) count.id = 'result-count';
+    count.id = 'result-count';
     const captionDay = el('span');
     captionDay.hidden = true;
-    caption.append(count);
-    if (!embedded) caption.append(captionDay);
-    const focusFallback = collectionHeading || heading?.h1 || main;
+    caption.append(count, captionDay);
+    const focusFallback = focusTarget || heading?.h1 || main;
     const grid = el('div', undefined, 'image-grid');
     grid.setAttribute('role', 'list'); grid.setAttribute('aria-label', 'Image collection');
     const continuation = el('div', undefined, 'infinite-continuation');
@@ -200,54 +291,79 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
     const retry = createButton('Retry');
     continuation.append(message, more, retry);
     // The concept's empty collection (app.js updateImages), beside the grid because the grid only holds positioned cards.
-    const empty = el('div', 'No matching images. Try another search or category.', 'empty');
+    // An embedded gallery shows one only when its page names the concept's copy (the history gallery, app.js a620).
+    const showsEmpty = !embedded || typeof emptyText === 'string';
+    const empty = el('div', embedded ? emptyText : NO_MATCHES, 'empty');
     empty.hidden = true;
-    collection.append(caption, grid);
-    if (!embedded) collection.append(empty);
+    // D47: the history page's shared gallery and dialogs are named by their own heading or title, so they have no caption.
+    if (!embedded) collection.append(caption);
+    collection.append(grid);
+    if (showsEmpty) collection.append(empty);
     collection.append(continuation);
     // After a Load more or Retry press, the index of the first image that batch appends (concept: focus it).
     let focusAfterLoad = null;
-    const details = el('section', undefined, 'image-details panel');
-    details.setAttribute('aria-label', 'Image details');
-    details.append(el('h2', 'Image details'), el('p', 'Select an image to inspect it.'));
+    let panelHold = false;
+    // The concept's side panel (app.js a426, D20); the Library-embedded gallery has its own page around it.
+    const details = el('aside', undefined, 'detail-panel');
+    if (!embedded) details.id = 'image-inspector';
+    details.setAttribute('aria-label', 'Selected image details');
+    details.append(noSelection());
     body.append(collection, details);
     // The checked cards and the concept's selection bar (#249 D8), between the filter row and the gallery layout. The
     // selection is kept across appended batches and cleared with the collection; the Library-embedded gallery has none.
-    const bar = embedded ? null : mountSelectionBar({scope, api, grid, getItems:() => state.items, focusFallback,
-        checked:visit?.checked, onCategorySet:() => { loadCategories(); reset(); }});
+    const bar = embedded ? null : mountSelectionBar({scope, api, grid, getItems:() => state?.items ?? [], focusFallback,
+        checked:visit?.checked, onCategorySet:() => { loadCategories(); reset(); scrollToPageTop(); }, activity,
+        // #531: a finished bulk action shows its result from the top. Tagging and collections keep the selection (D85, D138).
+        onTagged:keys => { refreshTagged(keys); bulkRefreshed(); },
+        onDeleted:() => { deleted(); scrollToPageTop(); },
+        // #498: the removed view's bar holds only Return to library and Clear.
+        removedView:() => filters.removed,
+        onReturn:(images, extra, trigger) => returnSome({images, ...extra, trigger, onDone:scrollToPageTop}),
+        // The Set category field suggests the toolbar's categories (#332 MC13).
+        getCategories:() => categoryNames,
+        // #392 "Select all N matching": the listing's total and its filter, as the server lists them.
+        getListing:() => ({total:state?.total ?? 0, hasMore:Boolean(state?.hasMore), positiveCount:state?.positiveCount ?? null}),
+        // A Source filter carries its root's scope, so a renumbered source is refused (source-changed), not acted on.
+        getFilter:() => {
+            const filter = listingFilter(filters), scope = state?.items[0]?.root_scope;
+            return filter.root !== undefined && typeof scope === 'string' ? {...filter, root_scope:scope} : filter;
+        },
+        // #331 D138: Add to collection, and Remove from collection on an open collection, which then lists it again.
+        collections, collection:filters.collection || null, onCollectionsChanged:() => { collectionChanged(); scrollToPageTop(); }, onCollectionAdded:bulkRefreshed,
+        onSourceChanged:refreshInspectionCollection});
     if (bar) main.append(bar.element);
     main.append(body);
-    const mediaViewer = createMediaViewer({container:main,parentScope:scope,inspectionController:inspection,sender,
+    // #331 D139: a change the inspector or the viewer confirmed that touches the open collection lists it again; the
+    // viewer reports only once it closes.
+    const inspectorCollections = embedded ? null : collections;
+    const collectionsChangedBy = ({added, removed}) => {
+        if (filters.collection && [...added, ...removed].includes(Number(filters.collection))) collectionChanged();
+    };
+    const mediaViewer = createMediaViewer({api,container:main,parentScope:scope,inspectionController:inspection,sender,
+        collections:inspectorCollections,onCollectionsChanged:collectionsChangedBy,
+        onDelete:embedded ? null : (item,button) => deleteOne(item,button,() => mediaViewer.close()),
         onSelect:image => {if (selection !== imageKey(image)) inspect(image);else inspection.select(image);},
-        onRefresh:refreshInspectionCollection,onClose:scheduleLoad,onRestoreFocus:image => {
+        onRefresh:refreshInspectionCollection,onClose:scheduleLoad,onMediaError:image => recovery.recover(image),onRestoreFocus:image => {
             const index = state?.items.findIndex(entry => imageKey(entry) === imageKey(image));
             if (index >= 0) focusImage(index);else focusFallback.focus({preventScroll:true});
         }});
     scope.cleanup(() => mediaViewer.dispose());
 
-    function mediaElement(image, lazy = false) {
-        const video = image.is_video && !image.thumbnail_url;
-        const node = el(video ? 'video' : 'img');
-        node.src = resolveUrl(image.thumbnail_url || image.url);
-        if (video) { node.muted = true; node.playsInline = true; node.preload = 'metadata'; }
-        else {
-            // The concept card image: alt is the card title, with the listing's intrinsic size when known.
-            node.alt = cardTitle(image); node.decoding = 'async'; if (lazy) node.loading = 'lazy';
-            if ([image.width, image.height].every(value => Number.isFinite(value) && value > 0)) {
-                node.width = image.width; node.height = image.height;
-            }
-        }
-        return node;
-    }
     function releaseVideo(video) {
         video.pause(); video.removeAttribute('src'); video.load();
     }
     function inspect(image) {
         detailInspector?.dispose();
         selection = imageKey(image);
+        selectedImage = image;
         for (const video of details.querySelectorAll('video')) releaseVideo(video);
-        detailInspector = mountFileInspector(details, {sender, parentScope:scope, inline:true,
-            onPreview:() => previewImage(image), onRetry:() => inspection.retry(), onRefresh:refreshInspectionCollection});
+        // #498: a removed file's panel offers Return to library and nothing that writes (Collections…, Delete…, tag chips).
+        const removedView = filters.removed;
+        detailInspector = mountFileInspector(details, {sender, parentScope:scope, variant:'panel',
+            onTagFilter:embedded || removedView ? undefined : filterByTag, onRetry:() => inspection.retry(), onLoad:() => inspection.load(), onRefresh:refreshInspectionCollection,
+            collections:removedView ? null : inspectorCollections, onCollectionsChanged:collectionsChangedBy,
+            onDelete:embedded || removedView ? null : (target, button) => deleteOne(target, button),
+            onReturn:removedView ? (target, button) => returnSome({images:[target], trigger:button}) : null});
         detailInspector.setState(inspection.state);
         inspection.select(image);
         for (const [key, card] of rendered) markSelected(card, key === selection);
@@ -260,92 +376,40 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
         if (!image) return;
         mediaViewer.open({items:state.items,selectedKey:imageKey(image),trigger:document.activeElement});
     }
-    /** The concept media card (app.js mediaCard): the image opens the viewer, Info inspects (D7–D11, D19). */
+    /** The concept media card (image-card.mjs): the image opens the viewer, Info inspects (D7–D11, D19). */
     function cardFor(image) {
         const key = imageKey(image);
-        const card = el('article', undefined, 'media-card');
-        card.dataset.imageKey = key; card.setAttribute('role', 'listitem');
-        card.style.setProperty('--media-ratio', mediaRatio(image));
-        const art = el('div', undefined, 'media-art');
-        const open = createButton('', 'image-open');
-        open.setAttribute('aria-label', `Open ${image.filename}`);
-        open.append(mediaElement(image, true));
-        // D8: the selection checkbox, then D7: the star, wherever the listing reports favorites (neither on
-        // Library-embedded media, which has no selection bar).
-        const overlays = el('div', undefined, 'image-overlays');
-        if (bar) {
-            const label = el('label'), box = el('input');
-            box.type = 'checkbox'; box.checked = bar.isChecked(key);
-            box.setAttribute('aria-label', `Select ${image.filename}`);
-            label.append(box);
-            overlays.append(label);
-        }
-        if (typeof image.favorite === 'boolean') {
-            const star = createButton('', 'star-button');
-            star.setAttribute('aria-label', `Favorite ${image.filename}`);
-            paintStar(star, image.favorite, favoritePending.has(key));
-            overlays.append(star);
-        }
-        art.append(open, overlays);
-        const info = el('div', undefined, 'media-info');
-        const text = el('div');
-        const title = el('h3', cardTitle(image)); title.title = image.path;
-        text.append(title, el('p', cardSubtitle(image)));
-        const actions = el('div', undefined, 'image-card-actions');
-        // D9: the tag button waits for the image-annotations slice.
-        const inspectButton = createButton('', 'icon-btn');
-        inspectButton.append(createWorkspaceIcon('info'));
-        inspectButton.setAttribute('aria-label', `Inspect ${image.filename}`);
-        actions.append(inspectButton);
-        info.append(text, actions);
-        card.append(art, info);
+        const card = createImageCard(image, {checked:bar ? bar.isChecked(key) : null, favoriteBusy:favoriteBusy(key),
+            // D97: "Show image details on cards" off hides the title and file line; Info and Tag stay.
+            showInfo:preferences?.showImageInfo !== false,
+            // #498: a removed file has no records; its star and Tag would write and show it again.
+            removed:filters.removed});
         markSelected(card, key === selection);
         return card;
-    }
-    /** A star whose request is still in flight is marked busy: pressing it again does nothing until the answer. */
-    function paintStar(button, favorite, pending) {
-        button.textContent = favorite ? '★' : '☆';
-        button.setAttribute('aria-pressed', String(favorite));
-        if (pending) button.setAttribute('aria-disabled', 'true'); else button.removeAttribute('aria-disabled');
     }
     function setFavorite(key, favorite) {
         if (scope.signal.aborted) return;
         stream.updateItem(key, {favorite});
         const button = rendered.get(key)?.querySelector('.star-button');
-        if (button) paintStar(button, favorite, favoritePending.has(key));
+        if (button) paintStar(button, favorite, favoriteBusy(key));
     }
-    // Only the Images page receives favorite answers; Library-embedded media has no star (#249 D7).
-    if (!embedded) {
-        favoriteTarget = setFavorite;
-        scope.cleanup(() => { if (favoriteTarget === setFavorite) favoriteTarget = null; });
-    }
-    /** Optimistic toggle: the star changes at once and returns to its previous state if the store refuses. */
-    async function toggleFavorite(image) {
-        const key = imageKey(image);
-        if (favoritePending.has(key)) return;
-        const favorite = !image.favorite;
-        favoritePending.add(key);
-        deliverFavorite(key, favorite);
-        const body = {root_index: image.root_index, path: image.path};
-        let saved = false;
-        try {
-            await (favorite ? api.put(FAVORITE_URL, body) : api.del(FAVORITE_URL, {body}));
-            saved = true;
-        } catch {
-            // Announced below; the star returns to its previous state.
-        }
-        favoritePending.delete(key);
-        deliverFavorite(key, saved ? favorite : !favorite);
-        showWorkspaceToast(saved ? FAVORITE_DONE[favorite] : FAVORITE_FAILED[favorite]);
-    }
+    // The Images page and every Library-embedded gallery receive favorite answers (#249 D7, PR E).
+    receiveFavorites({scope, embedded, setFavorite});
     scope.listen(grid, 'click', event => {
         const card = event.target.closest('article[data-image-key]');
         if (!card) return;
         const image = state.items.find(item => imageKey(item) === card.dataset.imageKey);
         if (!image) return;
-        if (event.target.closest('.star-button')) toggleFavorite(image);
+        const action = event.target.closest('.image-card-actions button');
+        // #498: in the removed view a card only inspects (the viewer's writes would show the file again).
+        if (filters.removed) { if (event.target.closest('.image-open, .image-card-actions button')) inspect(image); return; }
+        if (event.target.closest('.star-button')) toggleFavorite(api, image);
         else if (event.target.closest('.image-open')) previewImage(image);
-        else if (event.target.closest('.image-card-actions button')) inspect(image);
+        else if (action && !openCardTagging({api, scope, image, action, embedded, onSourceChanged:recovery.recover,
+            onRefresh:refreshInspectionCollection})) {
+            inspect(image);
+            bringPanelIntoView();
+        }
     });
 
     function renderVisible() {
@@ -419,8 +483,19 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
         const columns = geometry.columns;
         const target = { Home: 0, End: state.items.length - 1, ArrowRight: index + 1,
             ArrowLeft: index - 1, ArrowDown: index + columns, ArrowUp: index - columns }[event.key];
-        if (target !== undefined) { event.preventDefault(); focusImage(Math.max(0, Math.min(state.items.length - 1, target))); }
-        else if (event.key === 'Tab') {
+        if (target !== undefined) {
+            event.preventDefault();
+            const next = Math.max(0, Math.min(state.items.length - 1, target));
+            focusImage(next);
+            // D135: Shift extends the selection from the anchor (this card when there is none) to the new card.
+            if (event.shiftKey && bar) bar.extend(card.dataset.imageKey, imageKey(state.items[next]));
+        } else if (bar && (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'a') {
+            event.preventDefault();
+            bar.selectAll();
+        } else if (bar && event.key === 'Escape' && bar.hasSelection()) {
+            event.preventDefault();
+            bar.clear();
+        } else if (event.key === 'Tab') {
             const backward = event.shiftKey && event.target.matches('.image-open');
             const forward = !event.shiftKey && event.target.closest('.image-card-actions');
             const adjacent = backward ? index - 1 : index + 1;
@@ -433,7 +508,7 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
     function updateGeometry() {
         geometry = layoutImages(state.items, galleryWidth, layout, metrics);
         // Below the narrowest bounded card (extreme zoom) the info row stacks (the production overlay, #249 D31).
-        grid.classList.toggle('narrow-cards', galleryWidth < MINIMUM_CARD_WIDTH);
+        grid.classList.toggle('narrow-cards', stacksCardInfo(galleryWidth, layout));
         grid.style.height = `${geometry.height}px`;
         grid.style.setProperty('--image-footer-height', `${metrics.footerHeight}px`);
     }
@@ -472,8 +547,17 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
         if (!resizeFrame) resizeFrame = requestAnimationFrame(() => { resizeFrame = 0; updateLayout(); });
     });
     scope.cleanup(() => { resize.disconnect(); observer?.disconnect(); cancelAnimationFrame(resizeFrame); cancelAnimationFrame(frame); cancelAnimationFrame(loadFrame); });
+    /**
+     * The listing refused the open collection: it was deleted. A saved view says so in place (MC6, D140); a collection
+     * page reports it (`onCollectionMissing`) once per failed read and meanwhile shows the listing's error and Retry,
+     * so a page whose shell cannot confirm the deletion is never left blank.
+     */
+    const collectionGone = next => Boolean(filters.collection) && !onCollectionMissing && isCollectionGone(next.error);
+    let reportedMissing = null;
     function continuationText(next) {
         if (recovering) return 'Images paused until sources and folders are available.';
+        if (collectionGone(next)) return '';
+        if (next.error?.code === 'cursor-stale') return CURSOR_STALE;
         if (next.error) return 'Images could not be loaded. Retry or rescan the collection.';
         if (next.loading && !next.loaded) return 'Loading images…';
         if (next.hasMore) return `${next.loaded.toLocaleString('en-US')} of ${next.total.toLocaleString('en-US')} ${noun(next.total, 'image')} · more load as you scroll`;
@@ -481,43 +565,64 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
         // The concept's end of the collection (app.js updateImageContinuation).
         return `${next.loaded ? 'You’re all caught up' : 'No matching images'} · ${next.total.toLocaleString('en-US')} ${noun(next.total, 'image')}`;
     }
-    function renderState(next, {patch} = {}) {
+    function renderState(next, {patch, replaced = false} = {}) {
         const previous = state;
         // A patched item (a favorite) keeps every card's size and place; setFavorite repaints its card.
         const changed = !patch && state?.items !== next.items;
         if (changed) {
-            if (!next.items.length) itemIndexes.clear();
-            for (let index = state?.items.length || 0; index < next.items.length; index++) itemIndexes.set(imageKey(next.items[index]), index);
+            // A refreshed collection (`replaced`) is indexed again from its start; a loaded page only appends.
+            if (!next.items.length || replaced) itemIndexes.clear();
+            for (let index = replaced ? 0 : state?.items.length || 0; index < next.items.length; index++) itemIndexes.set(imageKey(next.items[index]), index);
         }
+        // The selected file left the refreshed result: the panel follows the collection, as after a reload; the
+        // selection bar keeps only the checked files still listed (I7).
+        if (replaced && selection !== null && !itemIndexes.has(selection)) dropSelection();
+        if (replaced) bar?.retain(key => itemIndexes.has(key));
         state = next;
-        setText(count, embedded ? `${next.loaded.toLocaleString('en-US')} loaded · ${next.total.toLocaleString('en-US')} ${noun(next.total, 'linked image')}` : countLine(next));
+        bar?.listingChanged();
         if (!embedded) {
+            setText(count, filters.removed ? removedCaption(next.total) : countLine(next));
+            paintRemovedToggle(next);
             setText(captionDay, captionDate(next.items, filters.sort));
             if (captionDay.hidden !== !captionDay.textContent) captionDay.hidden = !captionDay.textContent;
         }
         if (changed) updateLayout();
         // The concept's Load more toast (app.js loadMoreImages) for every batch appended to a loaded collection.
-        if (!embedded && changed && previous?.loaded && next.loaded > previous.loaded) {
+        if (!embedded && changed && !replaced && previous?.loaded && next.loaded > previous.loaded) {
             const added = next.loaded - previous.loaded;
             showWorkspaceToast(`${added.toLocaleString('en-US')} more ${noun(added, 'image')} loaded. ${next.loaded.toLocaleString('en-US')} of ${next.total.toLocaleString('en-US')}.`);
         }
+        const gone = collectionGone(next);
         setText(message, continuationText(next));
-        setAttr(message, 'role', next.error ? 'alert' : 'status');
-        retry.hidden = !next.error;
+        setAttr(message, 'role', next.error && !gone ? 'alert' : 'status');
+        retry.hidden = !next.error || gone;
+        // A cursor the server can no longer verify is never resent: Retry becomes the collection refresh (#430).
+        setText(retry, next.error?.code === 'cursor-stale' ? 'Refresh image collection' : 'Retry');
         more.hidden = !next.hasMore || !!next.error;
         more.setAttribute('aria-disabled', String(next.loading || recovering));
-        if (!embedded) empty.hidden = recovering || next.loading || !!next.error || next.hasMore || next.loaded > 0;
+        if (onCollectionMissing && filters.collection && isCollectionGone(next.error) && reportedMissing !== next.error) {
+            reportedMissing = next.error;
+            queueMicrotask(() => { if (!scope.signal.aborted) onCollectionMissing(); });
+        }
+        if (showsEmpty) {
+            setText(empty, gone ? VIEW_COLLECTION_DELETED : embedded ? emptyText
+                : filters.removed ? removedEmpty(Boolean(filters.q || filters.subfolder || filters.media !== 'all')) : NO_MATCHES);
+            empty.hidden = !gone && (recovering || next.loading || !!next.error || next.hasMore || next.loaded > 0);
+        }
         if (focusAfterLoad !== null && !next.loading) settleLoadFocus(next);
         if (!selection && next.items.length) inspect(next.items[0]);
         scheduleLoad();
     }
     const stream = createImageStream({ api, fetchPage, onChange: renderState, restore: visit ? {filters, state:visit.state} : undefined });
+    const refreshTagged = followImageTagSaves({scope, stream, inspection, selection:() => selection, filtered:() => !embedded && !recovering && Boolean(filters.tags.length || filters.q),
+        onRefreshing:busy => more.setAttribute('aria-disabled', String(busy || Boolean(state?.loading) || recovering))});
     scope.cleanup(() => {
         stream.dispose();
         for (const video of body.querySelectorAll('video')) releaseVideo(video);
     });
     function pressLoad() {
-        if (recovering || state?.loading) return;
+        // A refresh re-reads the loaded range: Load more waits for it (and focus stays where it is, M3).
+        if (recovering || state?.loading || stream.refreshing) return;
         focusAfterLoad = state?.loaded ?? 0;
         stream.loadMore();
     }
@@ -538,8 +643,20 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
         }
     }
     scope.listen(more, 'click', pressLoad);
-    scope.listen(retry, 'click', pressLoad);
+    scope.listen(retry, 'click', () => (state?.error?.code === 'cursor-stale' ? refreshInspectionCollection() : pressLoad()));
+    /**
+     * D189: at one column the panel follows the whole list, so Info goes to it. That passes the continuation, so loading
+     * waits for the reader's next move: a batch appended now would push the panel away.
+     */
+    function bringPanelIntoView() {
+        if (getComputedStyle(details).position !== 'static') return;
+        panelHold = true;
+        details.scrollIntoView({ block: 'start' });
+    }
+    const releasePanel = () => { if (panelHold) { panelHold = false; scheduleLoad(); } };
+    for (const name of ['wheel', 'touchmove', 'keydown']) scope.listen(window, name, releasePanel, { passive: true });
     function maybeLoad() {
+        if (panelHold) return;
         if (!observer || recovering || scope.signal.aborted || !state?.hasMore || state.loading || state.error || main.querySelector('#viewer-dialog[open]')) return;
         const bounds = continuation.getBoundingClientRect();
         if (bounds.top <= window.innerHeight + 250 && bounds.bottom >= 0) stream.loadMore();
@@ -555,28 +672,98 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
     }
     function updateScope() {
         scopeText.textContent = ` ${scopeLabel(filters, roots)}`;
+        toolbar?.setActiveFilters(activeRefinements(filters));
     }
-    function reset() {
-        mediaViewer.stopSlideshow();
-        main.querySelector('#viewer-dialog[open]')?.close();
-        if (!recovering) {
+    /** No selected file; `keepPanel` (recovering sources) leaves the panel's details shown. */
+    function dropSelection({keepPanel = false} = {}) {
+        for (const video of details.querySelectorAll('video')) releaseVideo(video);
+        if (!keepPanel) {
             inspection.clear();
             detailInspector?.dispose(); detailInspector = null;
-            details.replaceChildren(el('h2', 'Image details'), el('p', 'Select an image to inspect it.'));
+            details.replaceChildren(noSelection());
         }
         selection = null;
+        selectedImage = null;
+    }
+    // Bumped by every reset: a source recovery that began before it leaves the page alone (#430).
+    let generation = 0;
+    const recovery = createSourceRecovery({api, signal:scope.signal, generation:() => generation, apply:recoveredSource({
+        selected:image => selection === imageKey(image), inspect, dropSelection, stream, filters, updateScope,
+        closeViewer:() => { mediaViewer.stopSlideshow(); main.querySelector('#viewer-dialog[open]')?.close(); },
+        clearChecks:() => bar?.clear(), listsNow:() => !recovering,
+        current:started => !scope.signal.aborted && started === generation,
+        rediscover:() => loadOptions().then(found => { if (found) renderLoadStatus(); })})});
+    /** #480: a finished delete job reloads the listing (the deleted files leave it, and the selection clears). */
+    function deleted() {
+        loadCategories();
+        reset();
+    }
+    /** #498 (D162): enter or leave Show removed images; entering clears the Category and Tags it never combines with. */
+    function setRemovedView(on) {
+        if (filters.removed === on) return;
+        filters.removed = on;
+        if (on && (filters.category || filters.tags.length)) {
+            filters.category = ''; filters.tags = [];
+            toolbar?.setValue({q:filters.q, category:'', sort:filters.sort});
+            toolbar?.setActiveFilters(activeRefinements(filters));
+        }
+        reset();
+    }
+    function paintRemovedToggle(next) {
+        if (!showRemoved) return;
+        const total = next.removedTotal;
+        // A return that leaves nothing removed ends the view: Images lists every file again.
+        if (filters.removed && total === 0 && !next.loading) { queueMicrotask(() => setRemovedView(false)); }
+        setText(showRemoved, toggleLabel(total));
+        setAttr(showRemoved, 'aria-pressed', String(filters.removed));
+        const shown = filters.removed || total > 0;
+        if (!shown) showRemoved.remove();
+        else if (!showRemoved.isConnected) heading.actions.prepend(showRemoved);
+    }
+    /** #498: Return to library for the checked images, "all N matching" (`filter`) or the inspector's one. */
+    function returnSome({images = [], filter = null, count = images.length, trigger = null, onDone = null}) {
+        return returnImages({api, scope, store:activity, images, filter, count, trigger, onReturned:() => { if (!scope.signal.aborted) { reset(); onDone?.(); } }});
+    }
+    /** #480: Delete… for one file, from the inspector or the viewer (`after` closes the viewer first). */
+    function deleteOne(target, trigger, after = null) {
+        openDeleteImages({api, scope, store:activity, images:[target], trigger, onDeleted:() => { after?.(); deleted(); }});
+    }
+    function reset() {
+        generation += 1;
+        mediaViewer.stopSlideshow();
+        main.querySelector('#viewer-dialog[open]')?.close();
+        dropSelection({keepPanel:recovering});
         focusAfterLoad = null;
         // The ruled selection lifetime: a replaced collection may no longer hold the checked files.
         bar?.clear();
-        for (const video of details.querySelectorAll('video')) releaseVideo(video);
+        // A toolbar change while discovery is still pending keeps the saved Source and Folder; the settled discovery
+        // then lists the view with every current value (#249 M3).
+        if (savedScopePending && !discoverySettled) { updateScope(); return; }
+        settleSavedScope();
         updateScope();
+        // #498: a removed file has no category or tags, so choosing one (toolbar, Refine, a tag chip) ends the view.
+        if (filters.removed && (filters.category || filters.tags.length)) filters.removed = false;
         stream.reset(filters, {load:!recovering});
+    }
+    /** A saved view's Source and Folder apply only while the discovered sources still list them (#249 D16). */
+    function settleSavedScope() {
+        if (!savedScopePending) return;
+        savedScopePending = false;
+        if (filters.root !== 'all' && !roots.some(root => String(root.index) === filters.root)) filters.root = 'all';
+        if (!folderOptions(filters.root).some(([path]) => path === filters.subfolder)) filters.subfolder = '';
+    }
+    /** A panel tag chip (D21): the Images Tags filter becomes exactly that tag, as "Refine this view" would set it. */
+    function filterByTag(tag) {
+        if (recovering || !tag.trim() || tag.includes(',')) return;
+        if (filters.tags.length === 1 && filters.tags[0] === tag) return;
+        filters.tags = [tag];
+        reset();
     }
     /** "Refine this view": Source, Folder, Media and Tags, the filters the old field row held (D14). */
     function openFilters(trigger) {
         if (recovering) return;
-        openRefineDialog({scope, trigger, fields:[
-            {key:'source', options:[['all', 'All sources'], ...roots.map(root => [String(root.index), root.label])]},
+        refine = openRefineDialog({scope, trigger, fields:[
+            {key:'source', options:sourceOptions()},
             {key:'folder', options:folderOptions('all'), optionsFor:folderOptions},
             {key:'media', options:MEDIA_OPTIONS},
             {key:'tags'},
@@ -585,6 +772,9 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
             toolbar.setValue({category:cleared.category});
             applyRefinement(cleared);
         }});
+    }
+    function sourceOptions() {
+        return [['all', 'All sources'], ...roots.map(root => [String(root.index), root.label])];
     }
     /** The chosen Source's folders, as the old field row reloaded them; every folder under All sources. */
     function folderOptions(source) {
@@ -623,17 +813,48 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
             if (scope.signal.aborted) return;
             renderLoadStatus();
             if (found) reset();
-            if (!scope.signal.aborted) showWorkspaceToast(rescanFinished(result));
+            if (!scope.signal.aborted) announceRescan(rescanFinished(result));
         } catch {
             // A failed rescan leaves the collection and any discovery alert as they were.
-            if (!scope.signal.aborted) showWorkspaceToast(RESCAN_FAILED);
+            if (!scope.signal.aborted) announceRescan(RESCAN_FAILED);
         } finally {
             rescanning = false;
             importDialog?.setRescanBusy(false);
         }
     }
+    /**
+     * D42: the concept's toast stays fixed at the bottom, so a discovery alert the rescan leaves is scrolled clear of
+     * the toast's band (its `scroll-margin-block-end`) only when it is in that band; elsewhere the page stays put.
+     */
+    function announceRescan(message) {
+        showWorkspaceToast(message);
+        if (optionsStatus.hidden) return;
+        const {top, bottom} = optionsStatus.getBoundingClientRect();
+        const band = parseFloat(getComputedStyle(optionsStatus).scrollMarginBlockEnd) || 0;
+        if (bottom > innerHeight - band && top < innerHeight) optionsStatus.scrollIntoView({block:'nearest', inline:'nearest'});
+    }
+    /**
+     * A confirmed collection change that may change this listing (a remove from the open collection): the loaded range
+     * is read again in place, keeping the scroll and the checked files still listed. A failed re-read lists the page
+     * again from its start, whose failure shows the usual Retry (or the deleted-collection page).
+     */
+    /** #531: after a bulk action that keeps the selection: the listing re-read, shown from the top. */
+    function bulkRefreshed() {
+        if (scope.signal.aborted) return;
+        scrollToPageTop();
+        if (!recovering) stream.refresh().catch(() => { if (!scope.signal.aborted) reset(); });
+    }
+    async function collectionChanged() {
+        if (scope.signal.aborted || !filters.collection || recovering) return;
+        try {
+            await stream.refresh();
+        } catch {
+            if (!scope.signal.aborted) reset();
+        }
+    }
     async function refreshInspectionCollection() {
         if (scope.signal.aborted) return;
+        recovery.reset();
         // Numeric roots may now name another source; retire the old stream first.
         recovering = true;
         filters.root = 'all';filters.subfolder = '';
@@ -671,6 +892,7 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
             roots = data.roots.filter(root => Number.isSafeInteger(root?.index) && typeof root.label === 'string')
                 .map(root => ({index:root.index, label:root.label, subfolders:paths(root.subfolders)}));
             folders = paths(data.subfolders);
+            refine?.setOptions('source', sourceOptions());
             updateScope();
             sourcesRetry = null;
             return true;
@@ -680,29 +902,37 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
             return false;
         }
     }
-    /** The toolbar's categories are the Library's (the linked positive's category, D13). */
+    /**
+     * The toolbar's categories: the Library's (prompts and recipes) and the listed images' own ones (D141, #332), read
+     * in parallel. If only the image list fails, the prompt categories show and the categories alert is raised.
+     */
     async function loadCategories() {
         if (!toolbar) return;
         categoryRequest?.abort();
         const request = new AbortController(); categoryRequest = request;
-        try {
-            const data = await api.get('/prompt_manager/library/options', {signal:request.signal});
-            if (scope.signal.aborted || request !== categoryRequest) return;
-            if (!Array.isArray(data?.categories)) throw new TypeError('Invalid categories');
-            // D36: alphabetical (case-insensitive) whatever order the server sends, a restored category among them.
-            const names = new Set([...data.categories.filter(value => typeof value === 'string' && value), filters.category]);
-            names.delete('');
-            toolbar.setCategories([...names].sort((a, b) => a.localeCompare(b, 'en-US', {sensitivity:'base'}) || (a < b ? -1 : a > b ? 1 : 0)));
-            categoriesFailed = false;
-        } catch {
-            if (scope.signal.aborted || request !== categoryRequest) return;
-            categoriesFailed = true;
-        }
+        const [library, images] = await Promise.allSettled([
+            api.get('/prompt_manager/library/options', {signal:request.signal}),
+            api.get(IMAGE_CATEGORIES_URL, {signal:request.signal}),
+        ]);
+        if (scope.signal.aborted || request !== categoryRequest) return;
+        const valid = result => result.status === 'fulfilled' && Array.isArray(result.value?.categories);
+        if (!valid(library)) { categoriesFailed = true; return; }
+        // D36: alphabetical (case-insensitive) whatever order the server sends, a restored category among them.
+        const names = new Set(mergeCategories(library.value.categories, valid(images) ? images.value.categories : []));
+        if (filters.category) names.add(filters.category);
+        categoryNames = [...names].sort((a, b) => a.localeCompare(b, 'en-US', {sensitivity:'base'}) || (a < b ? -1 : a > b ? 1 : 0));
+        toolbar.setCategories(categoryNames);
+        categoriesFailed = !valid(images);
     }
     scope.cleanup(() => { optionsRequest?.abort(); categoryRequest?.abort(); });
     updateScope();
     // The page's one discovery alert is written once both first loads settled (#249 final review m6).
-    if (!embedded) Promise.all([loadOptions(), loadCategories()]).then(() => { if (!scope.signal.aborted) renderLoadStatus(); });
+    if (!embedded) Promise.all([loadOptions(), loadCategories()]).then(() => {
+        if (scope.signal.aborted) return;
+        discoverySettled = true;
+        renderLoadStatus();
+        if (savedScopePending) reset();
+    });
     if (visit) {
         renderState(stream.state);
         const selected = stream.state.items.find(image => imageKey(image) === selection);
@@ -711,7 +941,8 @@ export function mountImages(main, api, parentScope, {embedded = false, fetchPage
             if (!scope.signal.aborted) window.scrollTo(0, visit.scrollY);
         });
         if (visit.state.loading || visit.state.error) stream.loadMore();
-    } else reset();
+    } else if (savedScopePending) updateScope();
+    else reset();
     /** D6: the selected file's prompt pair, only once its inspection loaded with both roles resolved. */
     function selectedPair() {
         const {record, prompts, loading, error, refreshRequired} = inspection.state;

@@ -77,7 +77,8 @@ def encode(read, *, prompts=None, file=None, library=None):
             "title": None,
             "category": None,
             "tags": [],
-            "metadata_scope": None,
+            "category_scope": None,
+            "tags_scope": None,
         },
     )
 
@@ -663,6 +664,21 @@ class TestInspectionResponse(unittest.TestCase):
         for key in ("positive_id", "pair_id", "category", "title"):
             self.assertNotIn(key, result["library"])
         self.assertEqual(result["library"]["tags"], ["valid"])
+        # An unknown or non-string scope is dropped, never passed through.
+        for bad in ("recipe", 3, ["pair"]):
+            result = json.loads(
+                encode(
+                    None,
+                    library={
+                        "status": "linked",
+                        "category_scope": bad,
+                        "tags_scope": bad,
+                        "tags": [],
+                    },
+                )
+            )
+            self.assertNotIn("category_scope", result["library"])
+            self.assertNotIn("tags_scope", result["library"])
         result = json.loads(
             encode(inspection({}), library={"status": "linked", "tags": ["猫" * 12000]})
         )
@@ -805,6 +821,183 @@ def _png_with_chunks(path, chunks):
             stream.write(chunk)
         stream.write(data[iend:])
     return path
+
+
+class TestImageTagsFacet(unittest.TestCase):
+    """B3: the rooted envelope's ``image_tags`` facet is validated."""
+
+    def encoded(self, facet):
+        import inspect as signature_of
+
+        parameters = signature_of.signature(encode_inspection_response).parameters
+        if "image_tags" not in parameters:
+            self.fail("the image_tags facet is not implemented")
+        body = encode_inspection_response(
+            image=IMAGE,
+            root_scope="a" * 64,
+            file={
+                "observation": "current-file",
+                "source_label": "output",
+                "media_type": "image",
+                "extension": ".png",
+                "size": 100,
+                "modified_time": 100,
+            },
+            prompts=PROMPTS,
+            resolution={"state": "resolved", "sampler_id": "3", "reason": ""},
+            inspection=inspection({"prompt": graph_text()}),
+            library={"status": "none"},
+            image_tags=facet,
+        )
+        return json.loads(body)
+
+    def test_valid_facets_pass_through(self):
+        for facet in (
+            {"state": "current", "tags": ["dunes", "warm_light"]},
+            {"state": "current", "tags": []},
+            {"state": "none", "tags": []},
+            {"state": "unavailable", "tags": []},
+            {"state": "current", "tags": [f"tag {i}" for i in range(100)]},
+        ):
+            with self.subTest(facet=facet):
+                self.assertEqual(self.encoded(facet)["image_tags"], facet)
+
+    def test_envelope_rejects_malformed_image_tags(self):
+        unavailable = {"state": "unavailable", "tags": []}
+        for facet in (
+            "current",
+            ["dunes"],
+            {"state": "current"},
+            {"state": "stale", "tags": []},
+            {"state": "current", "tags": "dunes"},
+            {"state": "current", "tags": ["dunes", 3]},
+            {"state": "current", "tags": [""]},
+            {"state": "current", "tags": [" dunes"]},
+            {"state": "current", "tags": ["a,b"]},
+            {"state": "current", "tags": ["x" * 51]},
+            {"state": "current", "tags": [f"tag {i}" for i in range(101)]},
+            {"state": "none", "tags": ["dunes"]},
+            {"state": "unavailable", "tags": ["dunes"]},
+            {"state": "current", "tags": [], "locator": "/abs/path.png"},
+        ):
+            with self.subTest(facet=facet):
+                self.assertEqual(self.encoded(facet)["image_tags"], unavailable)
+
+    def test_facet_is_absent_unless_given(self):
+        self.assertNotIn("image_tags", json.loads(encode(inspection({}))))
+        self.assertNotIn("image_tags", self.encoded(None))
+
+    def history_encoded(self, facet):
+        from utils.inspection_response import encode_history_inspection_response
+
+        body = encode_history_inspection_response(
+            current_output={"history_epoch": "epoch"},
+            file={"observation": "current-file", "size": 100},
+            prompts=PROMPTS,
+            resolution={"state": "resolved", "sampler_id": "3", "reason": ""},
+            inspection=inspection({"prompt": graph_text()}),
+            library={"status": "none"},
+            image_tags=facet,
+        )
+        return json.loads(body)
+
+    def test_history_envelope_validates_image_tags_like_the_rooted_one(self):
+        """#457: History's current-file read carries the same facet."""
+        for facet in (
+            {"state": "current", "tags": ["dunes", "warm_light"]},
+            {"state": "none", "tags": []},
+            {"state": "unavailable", "tags": []},
+            {"state": "current", "tags": ["a,b"]},
+            {"state": "current", "tags": [], "locator": "/abs/path.png"},
+        ):
+            with self.subTest(facet=facet):
+                self.assertEqual(
+                    self.history_encoded(facet)["image_tags"],
+                    self.encoded(facet)["image_tags"],
+                )
+        self.assertNotIn("image_tags", self.history_encoded(None))
+
+
+class TestVideoProbeBoundsMatchPngBudgets(unittest.TestCase):
+    """ffprobe escapes tag text; the stdout bounds must never gate a record
+    that the identical PNG reads within its decoded budget (I3)."""
+
+    @staticmethod
+    def _dense(size):
+        # Quote-dense JSON text: every other byte escapes, so ffprobe's JSON
+        # output is close to twice the decoded size.
+        unit = '{"k":"v",' + "".join('"' for _ in range(6)) + "}"
+        return (unit * (size // len(unit) + 1))[:size]
+
+    def _video_read(self, path, tags, bound):
+        payload = json.dumps({"format": {"tags": tags}}).encode()
+        self.assertGreater(len(payload), bound)
+        process = MagicMock()
+        process.stdout = io.BytesIO(payload)
+        process.poll.return_value = 0
+        process.returncode = 0
+        with (
+            patch("utils.prompt_inspector.ffprobe_path", return_value="/tool/ffprobe"),
+            patch(
+                "utils.prompt_inspector.subprocess.Popen", return_value=process
+            ) as spawn,
+        ):
+            read = read_inspection_file(path)
+        self.assertEqual(spawn.call_count, 1)
+        self.assertTrue(process.stdout.closed)
+        return read
+
+    def test_near_budget_records_read_the_same_as_png(self):
+        from utils.prompt_inspector import (
+            ROLE_METADATA_BYTES,
+            VIDEO_PROBE_BYTES,
+            VIDEO_REPROBE_BYTES,
+            WORKFLOW_METADATA_BYTES,
+        )
+
+        prompt = self._dense(ROLE_METADATA_BYTES - 1024)
+        workflow = self._dense(WORKFLOW_METADATA_BYTES - 1024)
+        with tempfile.TemporaryDirectory() as directory:
+            png = _png_with_chunks(
+                Path(directory) / "same.png",
+                [
+                    _text_chunk(b"tEXt", "prompt", prompt.encode("latin-1")),
+                    _text_chunk(b"tEXt", "workflow", workflow.encode("latin-1")),
+                ],
+            )
+            expected = read_inspection_file(png)
+            self.assertEqual(
+                expected.record_formats,
+                {"prompt": "original-text", "workflow": "original-text"},
+            )
+            video = Path(directory) / "same.mp4"
+            video.write_bytes(b"fixture")
+            # Escaped output is over the old 6 MiB + 64 KiB stdout bound.
+            read = self._video_read(
+                video,
+                {"prompt": prompt, "workflow": workflow},
+                ROLE_METADATA_BYTES + WORKFLOW_METADATA_BYTES + 64 * 1024,
+            )
+            self.assertEqual(read.metadata, expected.metadata)
+            self.assertEqual(read.record_formats, expected.record_formats)
+            self.assertEqual(read.limited_records, frozenset())
+            self.assertGreaterEqual(
+                VIDEO_PROBE_BYTES,
+                2 * (ROLE_METADATA_BYTES + WORKFLOW_METADATA_BYTES) + 64 * 1024,
+            )
+            self.assertGreaterEqual(
+                VIDEO_REPROBE_BYTES, 2 * ROLE_METADATA_BYTES + 64 * 1024
+            )
+            # A role record near its budget alone escapes past 2 MiB and must
+            # still read as the PNG does.
+            png = _png_with_chunks(
+                Path(directory) / "role.png",
+                [_text_chunk(b"tEXt", "prompt", prompt.encode("latin-1"))],
+            )
+            expected = read_inspection_file(png)
+            read = self._video_read(video, {"prompt": prompt}, ROLE_METADATA_BYTES)
+            self.assertEqual(read.metadata, expected.metadata)
+            self.assertEqual(read.record_formats, {"prompt": "original-text"})
 
 
 class TestPerRecordBudgets(unittest.TestCase):
@@ -1263,3 +1456,32 @@ class TestPerRecordBudgets(unittest.TestCase):
         self.assertEqual(metadata["record_formats"], {"workflow": "limited"})
         self.assertEqual(metadata["workflow_graph"]["status"], "limited")
         self.assertEqual(metadata["prompt_graph"]["status"], "absent")
+
+
+class TestInheritedCategory(unittest.TestCase):
+    """#332 MC4: one inherited-category rule for the chip, filter and History."""
+
+    def test_recipe_set_blank_and_absent(self):
+        from utils.inspection_response import inherited_category, library_metadata
+
+        cases = [
+            (("Night", "Recipes", True), ("Recipes", "pair")),
+            (("Night", "   ", True), ("Night", "positive")),
+            (("Night", " \t", True), ("Night", "positive")),
+            (("Night", b" ", True), ("Night", "positive")),
+            (("Night", None, True), ("Night", "positive")),
+            (("Night", "Recipes", False), ("Night", "positive")),
+            (("  ", None, False), ("  ", "positive")),
+            ((None, None, False), (None, "positive")),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                self.assertEqual(inherited_category(*args), expected)
+                positive, recipe, has_recipe = args
+                metadata = library_metadata(
+                    positive, ["t"], (recipe, []) if has_recipe else None
+                )
+                self.assertEqual(
+                    (metadata["category"], metadata["category_scope"]), expected
+                )
+                self.assertEqual(metadata["tags_scope"], "positive")

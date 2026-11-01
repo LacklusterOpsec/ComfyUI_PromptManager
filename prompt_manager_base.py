@@ -23,8 +23,16 @@ try:
     from .utils.image_monitor import get_image_monitor
     from .utils.prompt_tracker import get_prompt_tracker
     from .utils.hashing import generate_prompt_hash
-    from .utils.prompt_graph import resolve_text, run_prompt_nodes
+    from .utils.prompt_graph import resolve_text, run_prompt_nodes, save_setting
+    from .utils.run_keys import executing_run_id, prompt_node_key
     from .utils.usage_tracking import PENDING_FIRST_USE
+    from .utils.cached_runs import (
+        CACHED_RUNS,
+        Role,
+        Seen,
+        own_counts,
+        stored_facts,
+    )
 except ImportError:
     import sys
 
@@ -34,8 +42,32 @@ except ImportError:
     from utils.image_monitor import get_image_monitor
     from utils.prompt_tracker import get_prompt_tracker
     from utils.hashing import generate_prompt_hash
-    from utils.prompt_graph import resolve_text, run_prompt_nodes
+    from utils.prompt_graph import resolve_text, run_prompt_nodes, save_setting
+    from utils.run_keys import executing_run_id, prompt_node_key
     from utils.usage_tracking import PENDING_FIRST_USE
+    from utils.cached_runs import (
+        CACHED_RUNS,
+        Role,
+        Seen,
+        own_counts,
+        stored_facts,
+    )
+
+
+# The optional input every PromptManager node declares last (#90): declared
+# last so no widget value of a workflow saved before it shifts.
+SAVE_TO_LIBRARY_INPUT = (
+    "BOOLEAN",
+    {
+        "default": True,
+        "label_on": "save",
+        "label_off": "skip",
+        "tooltip": (
+            "Save this node's prompt to the library, count its runs and link its "
+            "images. Off: PromptManager ignores the run; the output is unchanged."
+        ),
+    },
+)
 
 
 class PromptManagerBase:
@@ -69,8 +101,10 @@ class PromptManagerBase:
         """Save the prompt to the SQLite database.
 
         Runs are normally counted by the queue hook (utils/usage_tracking.py), so a
-        save only counts one when asked to (batch items whose text the hook could not
-        see) or when the hook queued this prompt before it existed.
+        save only counts one when asked to (text the hook could not see, unless
+        this job already counted the node from ComfyUI's cache) or when the hook
+        queued this prompt before it existed. The two are independent: the
+        pending catch-up is written even when ``count_run`` is False.
 
         Args:
             text: The prompt text
@@ -138,7 +172,9 @@ class PromptManagerBase:
         resolved = resolve_text(prompt_graph, node_id)
         return {
             "is_run_prompt": node_id in run_prompt_nodes(prompt_graph),
+            # The hook skips a switch it cannot read (#90): the node counts
             "seen_at_queue": resolved is not None
+            and save_setting(prompt_graph, node_id) is True
             and generate_prompt_hash(resolved) == generate_prompt_hash(text),
             "known": True,
         }
@@ -165,16 +201,136 @@ class PromptManagerBase:
         batch_item = (
             role["known"] and role["is_run_prompt"] and not role["seen_at_queue"]
         )
-        prompt_id = self._save_prompt_to_database(
-            text=text, category=category, tags=tags, count_run=batch_item
+        counts = own_counts(
+            type(self).__name__,
+            stored_facts(text),
+            Role(
+                frozenset({"text"} if role["known"] and role["is_run_prompt"] else ())
+            ),
+            Seen(text=role["seen_at_queue"]),
         )
-        if prompt_id and role["is_run_prompt"]:
+        prompt_id = self._save_prompt_to_database(
+            text=text,
+            category=category,
+            tags=tags,
+            count_run=bool(counts) and not self._replayed(unique_id),
+        )
+        if role["is_run_prompt"] and not prompt_id:
+            # The save failed: an older entry of this key must not stand in (#342)
+            self._mark_untracked(prompt_graph, unique_id)
+        elif role["is_run_prompt"]:
             self.prompt_tracker.set_current_prompt(
                 prompt_text=encoding_text,
                 additional_data={**additional_data, "prompt_id": prompt_id},
                 push_to_queue=batch_item or not role["known"],
+                **self._run_identity(prompt_graph, unique_id),
             )
         return prompt_id
+
+    def _cached_runs(self) -> Any:
+        return getattr(self, "cached_runs", CACHED_RUNS)
+
+    def _replayed(self, unique_id: Any) -> bool:
+        """This job already counted the node from ComfyUI's cache (#347).
+
+        A RAM-pressure cache can free the entry after ``execution_cached``, so
+        the node executes in a job that replayed it: its own count is skipped.
+        """
+        try:
+            return unique_id is not None and self._cached_runs().replayed(unique_id)
+        except Exception as error:
+            self.logger.debug(f"Could not check the cached-run replay: {error}")
+            return False
+
+    def _record_cached_item(
+        self,
+        unique_id: Any,
+        outputs: tuple,
+        text: Any,
+        negative_text: Any = None,
+        fields: Optional[tuple] = None,
+    ) -> None:
+        """Remember this execution's outputs and stored text for cached jobs (#347).
+
+        ``fields`` are the ``(raw, prepend, append)`` texts this execution gave
+        ``record_runtime_context`` for each output, so a cached job's history
+        can record them too (#403).
+        """
+        if unique_id is None:
+            return
+        try:
+            self._cached_runs().record_item(
+                unique_id, outputs, stored_facts(text, negative_text), fields
+            )
+        except Exception as error:
+            self.logger.debug(f"Could not record the cached-run receipt: {error}")
+
+    @staticmethod
+    def _run_identity(prompt_graph: Any, unique_id: Any) -> Dict[str, Any]:
+        """The tracker's proof that an image belongs to this execution (#342)."""
+        return {
+            "run_key": prompt_node_key(prompt_graph, unique_id),
+            "run_id": executing_run_id(),
+        }
+
+    def _skip_not_saved(self, prompt_graph: Any = None, unique_id: Any = None) -> None:
+        """``save_to_library`` is off: nothing is saved, counted or tracked (#90).
+
+        A literal off makes the node no run prompt (``utils.prompt_graph``), so
+        no image looks up its run key. A switch wired from a node the graph
+        cannot read keeps the node a run prompt: its run key is marked like an
+        empty editor's, so an earlier run's entry of that key never links this
+        run's images.
+        """
+        message = (
+            "Save to library is off for this node: its prompt is not saved, the "
+            "run is not counted and its images are not linked"
+        )
+        if isinstance(prompt_graph, dict) and unique_id is not None:
+            self._mark_untracked(prompt_graph, unique_id, message)
+        else:
+            self.logger.info(message)
+
+    def _skip_empty_prompt(self, prompt_graph: Any, unique_id: Any) -> None:
+        """The ``text`` editor is empty: save and track nothing (#342).
+
+        Prepend and append text are deliberately never stored as the prompt, so
+        an empty editor has no prompt to save, count or link. For the run's
+        positive node this is logged at info and the node's run key is marked
+        empty (``_mark_untracked``).
+        """
+        self._mark_untracked(
+            prompt_graph,
+            unique_id,
+            "Prompt text is empty (prepend and append text are not stored): "
+            "nothing saved or tracked, and this run's images stay unlinked",
+        )
+
+    def _mark_untracked(
+        self, prompt_graph: Any, unique_id: Any, message: Optional[str] = None
+    ) -> None:
+        """This execution of a positive node has no prompt to link (#342).
+
+        An empty editor, or a save or tracking failure. The node's run key is
+        marked with a placeholder, so no earlier prompt of that key can be
+        linked to this run's images, and a batch item keeps its queue place.
+        ``message`` is logged at info for a positive node.
+        """
+        try:
+            role = self._prompt_role(prompt_graph, unique_id, "")
+            if not role["is_run_prompt"]:
+                if message:
+                    self.logger.debug("Empty text on a non-positive node; not saved")
+                return
+            if message:
+                self.logger.info(message)
+            self.prompt_tracker.mark_empty(
+                push_to_queue=role["known"],
+                **self._run_identity(prompt_graph, unique_id),
+            )
+        except Exception as error:
+            # Tracking must never block generation
+            self.logger.warning(f"Could not mark the untracked prompt: {error}")
 
     def _record_use(self, prompt_id: int, times: int = 1) -> None:
         """Count runs; a tracking failure must never block generation."""
@@ -213,8 +369,10 @@ class PromptManagerBase:
 
         cache = get_trigger_cache()
 
-        # Lazy-load cache on first use
-        if not cache.is_loaded and IntegrationConfig.LORA_MANAGER_PATH:
+        # Lazy-load cache on first use; a failed load waits before the next try
+        # (#355: never a rescan of LoraManager's folders on every run).
+        retry_due = getattr(cache, "retry_due", lambda: True)
+        if not cache.is_loaded and IntegrationConfig.LORA_MANAGER_PATH and retry_due():
             cache.load(IntegrationConfig.LORA_MANAGER_PATH)
 
         modified, injected = inject_trigger_words(text, cache)

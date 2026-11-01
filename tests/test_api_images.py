@@ -5,29 +5,45 @@ Uses aiohttp's test client against a real PromptManagerAPI wired to a
 temporary SQLite database and a temporary output directory.
 """
 
+import asyncio
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
+import threading
+import time
+import types
 import unittest
 from contextlib import ExitStack
-from pathlib import Path
+from pathlib import Path, PurePath
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ComfyUI-only modules are stubbed so the API can be imported standalone.
-sys.modules.setdefault("folder_paths", MagicMock())
+try:
+    from host_stubs import install_folder_paths_stub
+except ImportError:  # imported as tests.test_api_images
+    from tests.host_stubs import install_folder_paths_stub
+
+install_folder_paths_stub()
 sys.modules.setdefault("server", MagicMock())
 
 from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import AioHTTPTestCase  # noqa: E402
 from PIL import Image  # noqa: E402
 
+from database.models import PromptModel  # noqa: E402
 from database.operations import PromptDatabase  # noqa: E402
-import py.api.images as images_module  # noqa: E402
+import py.api.images as images_module
+from py.api import gallery_listing  # noqa: E402
+from py import lora_utils  # noqa: E402
+from py import lora_manager_layout as layout_module  # noqa: E402
+from py.api.thumbnail_settings import ThumbnailSettings  # noqa: E402
 from py.api import PromptManagerAPI  # noqa: E402
+from tests.private_temp import private_temp_db  # noqa: E402
 from py.api.prompts import MAX_PAGE_LIMIT  # noqa: E402
 from py.config import GalleryConfig  # noqa: E402
 from utils.hashing import generate_prompt_hash  # noqa: E402
@@ -46,8 +62,7 @@ class ImageAPITestCase(AioHTTPTestCase):
     """App with PromptManager routes, a temp DB and a temp output directory."""
 
     async def get_application(self):
-        self._temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-        self._temp_db.close()
+        self._temp_db = private_temp_db(self)
 
         self._output_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         # A fake ComfyUI tree: <tmp>/output is the gallery root and <tmp> is the
@@ -73,17 +88,46 @@ class ImageAPITestCase(AioHTTPTestCase):
 
     async def tearDownAsync(self):
         await super().tearDownAsync()  # closes the aiohttp test client
+        # The automatic preview worker writes into the temp tree: stop it first.
+        self.api.close_auto_thumbnails()
         self._anchor_patch.stop()
         # Windows refuses to unlink a database that still has open handles.
         self.api.db.close_all()
-        for path in (
-            self._temp_db.name,
-            self._temp_db.name + "-wal",
-            self._temp_db.name + "-shm",
-        ):
-            if os.path.exists(path):
-                os.unlink(path)
-        self._output_tmp.cleanup()
+        try:
+            leaked = self._close_leaked_connections()
+        finally:
+            for path in (
+                self._temp_db.name,
+                self._temp_db.name + "-wal",
+                self._temp_db.name + "-shm",
+            ):
+                if os.path.exists(path):
+                    os.unlink(path)
+            self._output_tmp.cleanup()
+        if leaked:
+            raise AssertionError(
+                f"{leaked} connection(s) to the test database were still open at "
+                "teardown; Windows cannot unlink it (WinError 32). Close every "
+                "extra PromptDatabase before tearDownAsync, not in a cleanup."
+            )
+
+    def _close_leaked_connections(self):
+        """Close and count connections other models still hold on the temp DB.
+
+        Linux unlinks an open SQLite file, Windows does not; counting here makes
+        a handle left open past teardown fail on every OS (#475).
+        """
+        key = os.path.normcase(os.path.realpath(self._temp_db.name))
+        with PromptModel._instances_lock:
+            models = list(PromptModel._instances)
+        leaked = 0
+        for model in models:
+            if model._schema_key() != key:
+                continue
+            with model._conn_lock:
+                leaked += len(model._connections)
+            model.close_all()
+        return leaked
 
     # -- helpers ---------------------------------------------------------
 
@@ -99,12 +143,24 @@ class ImageAPITestCase(AioHTTPTestCase):
         self.assertGreater(image_id, 0, "fixture: image link failed")
         return image_id
 
-    def _make_symlink(self, target, link):
+    def _make_symlink(self, target, link, target_is_directory=False):
         """Create a symlink or skip the test when the platform refuses."""
         try:
-            os.symlink(str(target), str(link))
+            os.symlink(str(target), str(link), target_is_directory=target_is_directory)
         except (OSError, NotImplementedError, AttributeError) as exc:
             self.skipTest(f"symlinks unavailable: {exc}")
+
+    def _spy_executor(self):
+        """Record the __name__ of every callable sent to _run_in_executor."""
+        original = self.api._run_in_executor
+        calls = []
+
+        async def spy(func, *args, **kwargs):
+            calls.append(getattr(func, "__name__", repr(func)))
+            return await original(func, *args, **kwargs)
+
+        self.api._run_in_executor = spy
+        return calls
 
 
 class TestServeOutputImage(ImageAPITestCase):
@@ -376,19 +432,7 @@ class ThumbnailTestCase(ImageAPITestCase):
 
     PROGRESS_URL = "/prompt_manager/images/generate-thumbnails/progress"
 
-    def _spy_executor(self):
-        """Record the __name__ of every callable sent to _run_in_executor."""
-        original = self.api._run_in_executor
-        calls = []
-
-        async def spy(func, *args, **kwargs):
-            calls.append(getattr(func, "__name__", repr(func)))
-            return await original(func, *args, **kwargs)
-
-        self.api._run_in_executor = spy
-        return calls
-
-    def _thumb_path(self, name, suffix=".png"):
+    def _thumb_path(self, name, suffix=".webp"):
         return self.output_dir / "thumbnails" / f"{name}_thumb{suffix}"
 
 
@@ -406,11 +450,11 @@ class TestThumbnailProgressStream(ThumbnailTestCase):
         lock = threading.Lock()
         original = images_module._write_image_thumbnail
 
-        def recording(src, dst, size):
+        def recording(src, dst, size, *args):
             with lock:
                 seen.add(threading.current_thread().name)
             time.sleep(0.05)
-            return original(src, dst, size)
+            return original(src, dst, size, *args)
 
         images_module._write_image_thumbnail = recording
         self.addCleanup(setattr, images_module, "_write_image_thumbnail", original)
@@ -487,7 +531,8 @@ class TestThumbnailProgressStream(ThumbnailTestCase):
         self.assertNotIn("_generate_one", calls)
         self.assertIn("_plan_gallery_thumbnails", calls)
 
-    async def test_capped_run_reports_remaining_and_the_next_run_finishes(self):
+    async def test_a_run_past_the_batch_cap_goes_on_to_the_end(self):
+        # The cap bounds one batch; the run plans again and finishes (#317).
         for name in ("a", "b", "c"):
             make_png(self.output_dir / f"{name}.png", size=(64, 64))
 
@@ -500,18 +545,19 @@ class TestThumbnailProgressStream(ThumbnailTestCase):
         )
 
         names = [e for e, _ in first]
-        self.assertEqual(names.count("progress"), 2)  # only pending files are work
+        self.assertEqual(names.count("progress"), 3)  # only pending files are work
+        self.assertEqual(dict(first)["start"]["total_images"], 3)
+        self.assertEqual(
+            [d["total_images"] for e, d in first if e == "progress"], [3] * 3
+        )
         done = dict(first)["complete"]
-        self.assertEqual(done["count"], 2)
-        self.assertEqual(done["remaining"], 1)
-        self.assertEqual(done["total_images"], 3)
-        self.assertIn("1 more", done["message"])
-        done = dict(second)["complete"]
-        self.assertEqual(done["count"], 1)
-        self.assertEqual(done["skipped"], 2)
+        self.assertEqual(done["count"], 3)
         self.assertEqual(done["remaining"], 0)
         self.assertEqual(done["total_images"], 3)
         self.assertNotIn("more", done["message"])
+        done = dict(second)["complete"]
+        self.assertEqual(done["count"], 0)
+        self.assertEqual(done["skipped"], 3)
 
     async def test_blocking_endpoint_reports_remaining(self):
         for name in ("a", "b", "c"):
@@ -579,14 +625,15 @@ class TestThumbnailProgressStream(ThumbnailTestCase):
         events = parse_sse(await resp.text())
         self.assertEqual(events[-1][0], "error")
 
-    async def test_unknown_quality_falls_back_to_medium(self):
-        make_png(self.output_dir / "one.png", size=(400, 400))
+    async def test_any_quality_preset_uses_the_server_size_limit(self):
+        # #317 R3: the server's thumbnail settings size every preview.
+        make_png(self.output_dir / "one.png", size=(1000, 1000))
 
         resp = await self.client.request("POST", f"{self.PROGRESS_URL}?quality=huge")
         await resp.text()
 
         with Image.open(self._thumb_path("one")) as thumb:
-            self.assertEqual(max(thumb.size), 300)
+            self.assertEqual(max(thumb.size), 512)
 
 
 class TestGenerateThumbnailsPost(ThumbnailTestCase):
@@ -631,6 +678,93 @@ class TestGenerateThumbnailsPost(ThumbnailTestCase):
         data = await resp.json()
         self.assertTrue(data["success"])
         self.assertEqual(data["total_images"], 0)
+
+
+class TestThumbnailRoutesHoldTheRegistry(ThumbnailTestCase):
+    """Thumbnail work is ``guarded``: never beside a record-changing job."""
+
+    def _run_scan(self):
+        gate = asyncio.Event()
+
+        async def runner(job):
+            await gate.wait()
+
+        job = self.api._jobs.start(
+            "scan", "Scan for metadata", admission="records", scope={}, runner=runner
+        )
+
+        async def release():
+            gate.set()
+            await asyncio.wait_for(job.task, 5)
+
+        self.addAsyncCleanup(release)
+        return job
+
+    async def test_thumbnail_generate_refused_while_scan_runs(self):
+        make_png(self.output_dir / "a.png")
+        self._run_scan()
+
+        resp = await self.client.request(
+            "POST", "/prompt_manager/images/generate-thumbnails", json={}
+        )
+        self.assertEqual(resp.status, 409)
+        self.assertEqual(
+            await resp.json(),
+            {"success": False, "error": "Scan for metadata already running"},
+        )
+
+        resp = await self.client.request("POST", self.PROGRESS_URL)
+        text = await resp.text()
+        self.assertEqual(resp.status, 200)  # the gallery reads an SSE stream
+        self.assertEqual(
+            text,
+            "event: error\ndata: "
+            + json.dumps(
+                {
+                    "error": "Scan for metadata already running",
+                    "message": "Scan for metadata already running",
+                }
+            )
+            + "\n\n",
+        )
+
+        thumbs = self.output_dir / "thumbnails"
+        make_png(thumbs / "b_thumb.png")
+        resp = await self.client.request(
+            "POST", "/prompt_manager/images/clear-thumbnails"
+        )
+        self.assertEqual(resp.status, 409)
+        self.assertFalse(self._thumb_path("a").exists())
+        self.assertTrue((thumbs / "b_thumb.png").exists())
+
+    async def test_scan_refused_while_thumbnails_generate(self):
+        make_png(self.output_dir / "a.png")
+        entered = threading.Event()
+        release = threading.Event()
+        real = self.api._generate_gallery_thumbnails_sync
+
+        def gated(*args):
+            entered.set()
+            release.wait(10)
+            return real(*args)
+
+        self.api._generate_gallery_thumbnails_sync = gated
+        loop = asyncio.get_running_loop()
+        generate = asyncio.ensure_future(
+            self.client.request(
+                "POST", "/prompt_manager/images/generate-thumbnails", json={}
+            )
+        )
+        self.assertTrue(await loop.run_in_executor(None, entered.wait, 10))
+        resp = await self.client.request("POST", "/prompt_manager/jobs/scan")
+        body = await resp.json()
+        self.assertEqual((resp.status, body["code"]), (409, "busy"))
+        self.assertEqual(
+            body["running"]["title"], "Thumbnail generation (gallery page)"
+        )
+        release.set()
+        self.assertEqual((await generate).status, 200)
+        self.assertTrue(self._thumb_path("a").exists())
 
 
 class TestRecentImagesCaps(ImageAPITestCase):
@@ -814,7 +948,8 @@ class TestThumbnailFilesAreNeverSeenHalfWritten(ThumbnailTestCase):
         make_png(self.output_dir / "a.png", size=(64, 64))
         thumbs = self.output_dir / "thumbnails"
         thumbs.mkdir()
-        dst = thumbs / "a_thumb.png"
+        dst = thumbs / "a_thumb.webp"
+        settings = ThumbnailSettings("webp", 80, 32)
 
         def crash_mid_write(self_img, fp, *args, **kwargs):
             # Simulates an interrupted encoder: bytes on disk, then failure.
@@ -824,14 +959,14 @@ class TestThumbnailFilesAreNeverSeenHalfWritten(ThumbnailTestCase):
         with patch.object(Image.Image, "save", crash_mid_write):
             with self.assertRaises(OSError):
                 images_module._write_image_thumbnail(
-                    self.output_dir / "a.png", dst, (32, 32)
+                    self.output_dir / "a.png", dst, settings
                 )
         self.assertFalse(dst.exists(), "a half-written thumbnail was left in place")
         self.assertEqual(os.listdir(thumbs), [])
 
-        images_module._write_image_thumbnail(self.output_dir / "a.png", dst, (32, 32))
+        images_module._write_image_thumbnail(self.output_dir / "a.png", dst, settings)
         self.assertTrue(dst.is_file())
-        self.assertEqual(os.listdir(thumbs), ["a_thumb.png"])
+        self.assertEqual(os.listdir(thumbs), ["a_thumb.webp"])
 
     def test_thumbnail_url_is_versioned_by_its_mtime(self):
         import os
@@ -839,7 +974,9 @@ class TestThumbnailFilesAreNeverSeenHalfWritten(ThumbnailTestCase):
 
         make_png(self.output_dir / "a.png", size=(64, 64))
         self.api._generate_thumbnails_sync(
-            self.output_dir, self.output_dir / "thumbnails", (32, 32)
+            self.output_dir,
+            self.output_dir / "thumbnails",
+            ThumbnailSettings("webp", 80, 32),
         )
         thumb = self._thumb_path("a")
 
@@ -848,7 +985,7 @@ class TestThumbnailFilesAreNeverSeenHalfWritten(ThumbnailTestCase):
         )
         self.assertRegex(
             entry["thumbnail_url"],
-            r"^/prompt_manager/images/serve/thumbnails/a_thumb\.png\?v=\d+&root=0$",
+            r"^/prompt_manager/images/serve/thumbnails/a_thumb\.webp\?v=\d+&root=0$",
         )
         first = int(re.search(r"v=(\d+)", entry["thumbnail_url"]).group(1))
         self.assertEqual(first, int(thumb.stat().st_mtime))
@@ -864,7 +1001,9 @@ class TestThumbnailFilesAreNeverSeenHalfWritten(ThumbnailTestCase):
     async def test_versioned_thumbnail_url_is_served(self):
         make_png(self.output_dir / "a.png", size=(64, 64))
         self.api._generate_thumbnails_sync(
-            self.output_dir, self.output_dir / "thumbnails", (32, 32)
+            self.output_dir,
+            self.output_dir / "thumbnails",
+            ThumbnailSettings("webp", 80, 32),
         )
         entry = images_module._output_image_entry(
             self.output_dir / "a.png", self.output_dir, 0
@@ -873,7 +1012,7 @@ class TestThumbnailFilesAreNeverSeenHalfWritten(ThumbnailTestCase):
         resp = await self.client.request("GET", entry["thumbnail_url"])
 
         self.assertEqual(resp.status, 200)
-        self.assertEqual(resp.headers["Content-Type"], "image/png")
+        self.assertEqual(resp.headers["Content-Type"], "image/webp")
 
     async def test_missing_image_404_is_not_cacheable(self):
         resp = await self.client.request(
@@ -928,7 +1067,9 @@ class TestMediaScanCaps(ImageAPITestCase):
         for name in ("a", "b", "c"):
             make_png(self.output_dir / f"{name}.png")
         self.api._generate_thumbnails_sync(
-            self.output_dir, self.output_dir / "thumbnails", (64, 64)
+            self.output_dir,
+            self.output_dir / "thumbnails",
+            ThumbnailSettings("webp", 80, 64),
         )
         for name in ("d", "e", "f"):
             make_png(self.output_dir / f"{name}.png")
@@ -986,11 +1127,6 @@ class TestMediaScanCaps(ImageAPITestCase):
             )
 
         self.assertEqual(targets, [])
-
-    def test_thumbnail_size_ignores_non_string_quality(self):
-        self.assertEqual(self.api._thumbnail_size({"w": 99999}), (300, 300))
-        self.assertEqual(self.api._thumbnail_size(None), (300, 300))
-        self.assertEqual(self.api._thumbnail_size("low"), (150, 150))
 
 
 class TestJsonBodyCaps(ImageAPITestCase):
@@ -1112,6 +1248,13 @@ def _raise(*_args, **_kwargs):
 class ImageRouteCoverageCase(ImageAPITestCase):
     """Helpers for driving success and failure branches of each route."""
 
+    def setUp(self):
+        # #362: the LoraManager layout cache is per process; every test here
+        # starts and ends with it empty (runs before the subclasses' setUpAsync).
+        super().setUp()
+        lora_utils.clear_layout_cache()
+        self.addCleanup(lora_utils.clear_layout_cache)
+
     def _break_db(self, db_method):
         setattr(self.api.db, db_method, _raise)
 
@@ -1214,7 +1357,8 @@ class TestServeErrorBranches(ImageRouteCoverageCase):
             with (
                 patch.object(IntegrationConfig, "LORA_MANAGER_ENABLED", True),
                 patch.object(IntegrationConfig, "LORA_MANAGER_PATH", ""),
-                patch("py.lora_utils.find_lora_directories", return_value=[lora]),
+                patch("py.lora_utils.detect_lora_manager", return_value=None),
+                patch("py.lora_utils.default_lora_roots", return_value=[lora]),
                 patch("py.lora_utils.get_lora_image_cache_dir", return_value=cache),
             ):
                 resp = await self.client.request(
@@ -1222,10 +1366,14 @@ class TestServeErrorBranches(ImageRouteCoverageCase):
                 )
                 self.assertEqual(resp.status, 200)
 
+            # The cache does not watch default_lora_roots (#362): without a
+            # clear the next request would reuse the folders above.
+            lora_utils.clear_layout_cache()
             with (
                 patch.object(IntegrationConfig, "LORA_MANAGER_ENABLED", True),
                 patch.object(IntegrationConfig, "LORA_MANAGER_PATH", ""),
-                patch("py.lora_utils.find_lora_directories", side_effect=RuntimeError),
+                patch("py.lora_utils.detect_lora_manager", return_value=None),
+                patch("py.lora_utils.default_lora_roots", side_effect=RuntimeError),
             ):
                 resp = await self.client.request(
                     "GET", f"/prompt_manager/images/{image_id}/file"
@@ -1244,7 +1392,12 @@ class TestLoraManagerPathAllowList(ImageRouteCoverageCase):
         )
         stack.enter_context(patch.object(IntegrationConfig, "LORA_MANAGER_PATH", path))
         stack.enter_context(
-            patch("py.lora_utils.find_lora_directories", return_value=[lora])
+            patch("py.lora_utils.default_lora_roots", return_value=[lora])
+        )
+        # Never the developer's LoraManager settings (#355).
+        settings = stack.enter_context(tempfile.TemporaryDirectory())
+        stack.enter_context(
+            patch.dict(os.environ, {"LORA_MANAGER_SETTINGS_DIR": settings})
         )
         stack.enter_context(
             patch("py.lora_utils.get_lora_image_cache_dir", return_value=cache)
@@ -1284,6 +1437,176 @@ class TestLoraManagerPathAllowList(ImageRouteCoverageCase):
             self.assertEqual(resp.status, 200)
             await resp.read()  # release the served file before the directory goes
             resolve.assert_called_once_with(configured)
+
+
+class TestLoraManagerMediaServing(ImageRouteCoverageCase):
+    """#355: LoraManager's sidecar and example-image folders are served while
+    the integration is on, only through the folder guard."""
+
+    async def setUpAsync(self):
+        await super().setUpAsync()
+        from py.config import IntegrationConfig
+
+        self._lm_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._lm_tmp.cleanup)
+        root = Path(os.path.realpath(self._lm_tmp.name))
+        custom_nodes = root / "custom_nodes"
+        self.lm = custom_nodes / "ComfyUI-Lora-Manager"
+        (self.lm / "py").mkdir(parents=True)
+        (self.lm / "__init__.py").write_text("")
+        self.settings = root / "settings"
+        self.settings.mkdir()
+        self.sidecars = root / "sidecars"
+        self.examples = root / "examples"
+        self.cache = root / "cache"
+        for folder in (self.sidecars, self.examples, self.cache):
+            folder.mkdir()
+        self.root = root
+        self.write_settings(str(self.sidecars))
+        self.enabled = patch.object(IntegrationConfig, "LORA_MANAGER_ENABLED", True)
+        self.default_roots = patch("py.lora_utils.default_lora_roots", return_value=[])
+        for item in (
+            self.enabled,
+            patch.object(IntegrationConfig, "LORA_MANAGER_PATH", str(self.lm)),
+            patch(
+                "py.lora_utils.custom_nodes_directories", return_value=[custom_nodes]
+            ),
+            self.default_roots,
+            patch("py.lora_utils.get_lora_image_cache_dir", return_value=self.cache),
+            patch.dict(os.environ, {"LORA_MANAGER_SETTINGS_DIR": str(self.settings)}),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def write_settings(self, sidecar_root, examples=None):
+        path = self.settings / "settings.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "sidecar_storage_mode": "centralized",
+                    "sidecar_storage_path": sidecar_root,
+                    "example_images_path": str(examples or self.examples),
+                    "civitai_api_key": "never-served",
+                }
+            )
+        )
+        # Ten seconds old, so the layout cache (real clock here) stores the
+        # first load instead of treating the file as being written (#362).
+        stamp = time.time_ns() - 10 * 10**9
+        os.utime(path, ns=(stamp, stamp))
+
+    async def _status(self, image_id):
+        resp = await self.client.request(
+            "GET", f"/prompt_manager/images/{image_id}/file"
+        )
+        await resp.read()  # release the served file before the folder goes
+        return resp.status
+
+    async def test_sidecar_and_example_media_are_served_while_enabled(self):
+        preview = self.sidecars / "loras-0a1b2c3d" / "neon.webp"
+        preview.parent.mkdir()
+        preview.write_bytes(b"RIFF")
+        example = self.examples / "ab12" / "1.mp4"
+        example.parent.mkdir()
+        example.write_bytes(b"video")
+        ids = [self._link_image(preview, "a"), self._link_image(example, "b")]
+
+        for image_id in ids:
+            self.assertEqual(await self._status(image_id), 200)
+        # A warm layout cache does not outlive the integration (#362).
+        self.assertIsNotNone(lora_utils._layout_cache._entry)
+        self.enabled.stop()
+        for image_id in ids:
+            self.assertEqual(await self._status(image_id), 403)
+        self.enabled.start()
+
+    def _example(self, folder=None, name="1.mp4"):
+        path = (folder or self.examples) / "ab12" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b"video")
+        return path
+
+    async def test_unchanged_settings_reuse_the_cached_layout(self):
+        image_id = self._link_image(self._example())
+        self.assertEqual(await self._status(image_id), 200)
+        self.assertIsNotNone(lora_utils._layout_cache._entry)
+        self.assertEqual(await self._status(image_id), 200)
+        self.assertEqual(lora_utils.default_lora_roots.call_count, 1)
+
+    async def test_a_settings_change_is_seen_without_a_clear(self):
+        image_id = self._link_image(self._example())
+        self.assertEqual(await self._status(image_id), 200)
+        self.assertIsNotNone(lora_utils._layout_cache._entry)
+        moved = self.root / "examples-moved"
+        moved.mkdir()
+        self.write_settings(str(self.sidecars), examples=moved)
+        self.assertEqual(await self._status(image_id), 403)
+
+    async def test_a_cached_folder_swapped_for_a_symlink_to_home_is_refused(self):
+        # CUJ 7: the example-images folder becomes a symlink to a folder that
+        # holds the home folder; the same recorded file is refused.
+        outer = self.root / "outer"
+        (outer / "home").mkdir(parents=True)
+        self._example(outer)
+        image_id = self._link_image(self._example())
+        with patch.object(layout_module.Path, "home", return_value=outer / "home"):
+            self.assertEqual(await self._status(image_id), 200)
+            self.assertIsNotNone(lora_utils._layout_cache._entry)
+            # A skip after the rmtree is safe: setUp builds a fresh tree.
+            shutil.rmtree(self.examples)
+            self._make_symlink(outer, self.examples, target_is_directory=True)
+            self.assertEqual(await self._status(image_id), 403)
+
+    async def test_a_configured_path_outside_custom_nodes_adds_nothing(self):
+        from py.config import IntegrationConfig
+
+        self.assertEqual(await self._status(self._link_image(self._example())), 200)
+        self.assertIsNotNone(lora_utils._layout_cache._entry)
+        with patch.object(IntegrationConfig, "LORA_MANAGER_PATH", str(self.sidecars)):
+            self.assertEqual(self.api._lora_image_dirs(), [])
+        # The warm entry for the real install was never handed out for it.
+        self.assertIsNone(lora_utils.cached_lora_manager_layout(str(self.sidecars))[0])
+
+    async def test_serve_image_builds_the_allow_list_in_the_executor(self):
+        calls = self._spy_executor()
+        self.assertEqual(await self._status(self._link_image(self._example())), 200)
+        self.assertIn("_lora_image_dirs", calls)
+
+    async def test_a_filesystem_root_as_sidecar_folder_adds_nothing(self):
+        self.write_settings(os.path.abspath(os.sep))
+        dirs = self.api._lora_image_dirs()
+        # An unusable layout: the default LoRA roots (none here) and the cache.
+        self.assertEqual(dirs, [self.cache])
+
+    async def test_the_layout_folders_are_the_served_ones(self):
+        dirs = self.api._lora_image_dirs()
+        self.assertEqual(
+            dirs,
+            [
+                Path(os.path.normcase(str(self.sidecars))),
+                Path(os.path.normcase(str(self.examples))),
+                self.cache,
+            ],
+        )
+
+
+class TestEnrichMarksVideos(ImageAPITestCase):
+    """#355: a linked video outside the output folders is marked as video."""
+
+    async def test_enrich_sets_is_video_and_media_type(self):
+        elsewhere = Path(tempfile.gettempdir()) / "lora-media"
+        images = [
+            {"id": 1, "image_path": str(elsewhere / "a.MP4")},
+            {"id": 2, "image_path": str(elsewhere / "b.png")},
+            {"id": 3, "image_path": str(elsewhere / "c.mp4"), "is_video": False},
+            {"id": 4, "image_path": ""},
+        ]
+        self.api._enrich_images(images)
+        self.assertEqual(
+            [(i.get("is_video"), i.get("media_type")) for i in images],
+            [(True, "video"), (False, "image"), (False, None), (None, None)],
+        )
+        self.assertEqual(images[0]["url"], "/prompt_manager/images/1/file")
 
 
 class TestLinkImageRelativePaths(ImageAPITestCase):
@@ -1352,17 +1675,20 @@ class TestGalleryListing(ImageRouteCoverageCase):
         self.assertEqual(data["images"], [])
 
     def test_gallery_scan_skips_unreadable_entries(self):
-        ghost = self.output_dir / "ghost.png"
+        make_png(self.output_dir / "real.png")
+        listed = list(images_module._walk_media(self.output_dir, 10))
+        ghost = MagicMock(path=str(self.output_dir / "ghost.png"))
+        ghost.stat.side_effect = FileNotFoundError("gone")
         with patch.object(
-            images_module, "_iter_media_files", return_value=iter([ghost])
+            images_module, "_walk_media", return_value=iter([ghost, *listed])
         ):
             found = self.api._scan_gallery_files_sync(self.output_dir)
-        self.assertEqual(found, [])
+        self.assertEqual([path.name for path, _mtime in found], ["real.png"])
 
 
 class TestThumbnailUnits(ImageRouteCoverageCase):
 
-    SIZE = (64, 64)
+    SIZE = ThumbnailSettings("webp", 80, 64)
 
     def test_generate_one_reports_vanished_source(self):
         result = self.api._generate_one(
@@ -1375,11 +1701,9 @@ class TestThumbnailUnits(ImageRouteCoverageCase):
         src = self.output_dir / "clip.mp4"
         src.write_bytes(b"\x00")
         with patch.object(self.api, "_generate_video_thumbnail", return_value=True):
-            ok = self.api._generate_one(src, self._dst("clip", ".jpg"), self.SIZE, True)
+            ok = self.api._generate_one(src, self._dst("clip"), self.SIZE, True)
         with patch.object(self.api, "_generate_video_thumbnail", return_value=False):
-            bad = self.api._generate_one(
-                src, self._dst("clip", ".jpg"), self.SIZE, True
-            )
+            bad = self.api._generate_one(src, self._dst("clip"), self.SIZE, True)
         self.assertEqual((ok["action"], ok["type"]), ("generated", "video"))
         self.assertEqual(bad["action"], "error")
 
@@ -1402,7 +1726,7 @@ class TestThumbnailUnits(ImageRouteCoverageCase):
         )
         self.assertEqual(result["count"], 2)
         self.assertTrue(self._dst("alpha").is_file())
-        self.assertTrue(self._dst("photo", ".jpg").is_file())
+        self.assertTrue(self._dst("photo").is_file())
 
     async def test_emit_sse_swallows_write_errors(self):
         response = MagicMock()
@@ -1425,14 +1749,15 @@ class TestThumbnailUnits(ImageRouteCoverageCase):
         )
         self.assertEqual(status, 500)
 
-    def _dst(self, name, suffix=".png"):
+    def _dst(self, name, suffix=".webp"):
         return self.output_dir / "thumbnails" / f"{name}_thumb{suffix}"
 
 
 class TestVideoThumbnailFallbacks(ImageRouteCoverageCase):
     """_generate_video_thumbnail degrades: cv2 -> ffmpeg -> placeholder."""
 
-    SIZE = (48, 48)
+    # JPEG keeps these checks format-specific; #317 settings carry the edge.
+    SIZE = ThumbnailSettings("jpeg", 85, 48)
 
     @property
     def video(self):
@@ -1471,39 +1796,73 @@ class TestVideoThumbnailFallbacks(ImageRouteCoverageCase):
         with Image.open(self.thumb) as img:
             self.assertEqual(img.format, "JPEG")
 
-    def test_cv2_cannot_open_or_read(self):
-        with patch.dict(sys.modules, {"cv2": self._fake_cv2(opened=False)}):
-            closed = self.api._generate_video_thumbnail(
-                self.video, self.thumb, self.SIZE
-            )
-        with patch.dict(sys.modules, {"cv2": self._fake_cv2(read_ok=False)}):
-            unread = self.api._generate_video_thumbnail(
-                self.video, self.thumb, self.SIZE
-            )
-        self.assertEqual((closed, unread), (False, False))
+    def test_cv2_cannot_open_or_read_falls_through_to_ffmpeg_then_placeholder(self):
+        # #249 I1: an OpenCV that cannot decode the clip (AV1) no longer ends
+        # the run; ffmpeg and then the placeholder are tried.
+        for fake in (self._fake_cv2(opened=False), self._fake_cv2(read_ok=False)):
+            self.thumb.unlink(missing_ok=True)
+            with (
+                patch.dict(sys.modules, {"cv2": fake}),
+                patch("subprocess.Popen", side_effect=FileNotFoundError("ffmpeg")),
+            ):
+                ok = self.api._generate_video_thumbnail(
+                    self.video, self.thumb, self.SIZE
+                )
+            self.assertTrue(ok)
+            with Image.open(self.thumb) as img:
+                self.assertEqual((img.format, img.size), ("JPEG", self.SIZE.size))
 
     def test_cv2_crash_is_contained(self):
         cv2 = MagicMock()
         cv2.VideoCapture.side_effect = RuntimeError("driver crash")
-        with patch.dict(sys.modules, {"cv2": cv2}):
+        with (
+            patch.dict(sys.modules, {"cv2": cv2}),
+            patch("subprocess.Popen", side_effect=FileNotFoundError("ffmpeg")),
+        ):
             ok = self.api._generate_video_thumbnail(self.video, self.thumb, self.SIZE)
+        self.assertTrue(ok, "the placeholder is written")
+
+    def test_cv2_failure_keeps_an_existing_preview_on_rebuild(self):
+        make_png(self.thumb)
+        before = self.thumb.read_bytes()
+        with (
+            patch.dict(sys.modules, {"cv2": self._fake_cv2(opened=False)}),
+            patch("subprocess.Popen", side_effect=FileNotFoundError("ffmpeg")),
+        ):
+            ok = self.api._generate_video_thumbnail(
+                self.video, self.thumb, self.SIZE, keep_existing=True
+            )
         self.assertFalse(ok)
+        self.assertEqual(self.thumb.read_bytes(), before)
 
     def test_ffmpeg_absent_yields_placeholder(self):
         with (
             patch.dict(sys.modules, {"cv2": None}),
-            patch("subprocess.run", side_effect=FileNotFoundError("ffmpeg")),
+            patch("subprocess.Popen", side_effect=FileNotFoundError("ffmpeg")),
         ):
             ok = self.api._generate_video_thumbnail(self.video, self.thumb, self.SIZE)
         self.assertTrue(ok)
         with Image.open(self.thumb) as img:
-            self.assertEqual(img.size, self.SIZE)
+            self.assertEqual(img.size, self.SIZE.size)
+
+    @staticmethod
+    def _process(returncode, stderr=b"", stdout=b""):
+        process = MagicMock(returncode=returncode)
+        process.communicate.return_value = (stdout, stderr)
+        return process
+
+    @staticmethod
+    def _png_frame(size=(96, 64)):
+        import io
+
+        buffer = io.BytesIO()
+        Image.new("RGB", size, (200, 0, 0)).save(buffer, "PNG")
+        return buffer.getvalue()
 
     def test_ffmpeg_failure_yields_placeholder(self):
-        failed = MagicMock(returncode=1, stderr="no stream")
         with (
             patch.dict(sys.modules, {"cv2": None}),
-            patch("subprocess.run", return_value=failed),
+            patch("subprocess.Popen", return_value=self._process(1, b"no stream")),
         ):
             ok = self.api._generate_video_thumbnail(self.video, self.thumb, self.SIZE)
         self.assertTrue(ok)
@@ -1512,16 +1871,46 @@ class TestVideoThumbnailFallbacks(ImageRouteCoverageCase):
     def test_ffmpeg_success(self):
         with (
             patch.dict(sys.modules, {"cv2": None}),
-            patch("subprocess.run", return_value=MagicMock(returncode=0)) as run,
+            patch(
+                "subprocess.Popen",
+                return_value=self._process(0, stdout=self._png_frame()),
+            ) as run,
         ):
             ok = self.api._generate_video_thumbnail(self.video, self.thumb, self.SIZE)
         self.assertTrue(ok)
         self.assertEqual(run.call_args.args[0][0], "ffmpeg")
+        with Image.open(self.thumb) as img:
+            # ffmpeg's frame (a PNG on stdout) fitted inside the edge (#317).
+            self.assertEqual((img.format, img.size), ("JPEG", (48, 32)))
+
+    def test_ffmpeg_is_tracked_and_a_hold_before_the_rename_writes_nothing(self):
+        tracked = []
+
+        def writing(cmd, **kwargs):
+            return self._process(0, stdout=self._png_frame())
+
+        with (
+            patch.dict(sys.modules, {"cv2": None}),
+            patch("subprocess.Popen", side_effect=writing),
+        ):
+            with self.assertRaises(images_module.PreviewWriteHeld):
+                self.api._generate_video_thumbnail(
+                    self.video,
+                    self.thumb,
+                    self.SIZE,
+                    guard=lambda: False,
+                    track=tracked.append,
+                )
+        self.assertEqual(len(tracked), 1)
+        self.assertFalse(self.thumb.exists())
+        self.assertEqual(
+            [p.name for p in self.thumb.parent.iterdir() if "part" in p.name], []
+        )
 
     def test_placeholder_failure_returns_false(self):
         with (
             patch.dict(sys.modules, {"cv2": None}),
-            patch("subprocess.run", side_effect=FileNotFoundError),
+            patch("subprocess.Popen", side_effect=FileNotFoundError),
             patch.object(
                 images_module.Image, "new", side_effect=RuntimeError("no PIL")
             ),
@@ -1640,10 +2029,13 @@ class TestClearThumbnails(ImageRouteCoverageCase):
         self.assertFalse(data["success"])
         self.assertTrue(original.is_file())
 
-    async def test_cleanup_runs_off_loop_and_invalidates_gallery_cache(self):
+    async def test_cleanup_runs_off_loop_and_keeps_the_listing(self):
         import threading
 
         make_png(self.output_dir / "thumbnails" / "a_thumb.png")
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", "/prompt_manager/images/output")
+        listing = self.api._root_listings[str(self.output_dir)].files
         loop_thread = threading.get_ident()
         deletion_threads = []
         original_unlink = Path.unlink
@@ -1652,14 +2044,14 @@ class TestClearThumbnails(ImageRouteCoverageCase):
             deletion_threads.append(threading.get_ident())
             return original_unlink(path, *args, **kwargs)
 
-        self.api._gallery_cache = {"previous": object()}
         with patch.object(Path, "unlink", unlink):
             status, data = await self._json("POST", self.URL)
         self.assertEqual(status, 200)
         self.assertEqual(data["cleared_files"], 1)
         self.assertTrue(deletion_threads)
         self.assertNotIn(loop_thread, deletion_threads)
-        self.assertEqual(self.api._gallery_cache, {})
+        # Previews are not part of the listing (#348): it stays as it was.
+        self.assertIs(self.api._root_listings[str(self.output_dir)].files, listing)
 
 
 class TestImagePromptLookup(ImageRouteCoverageCase):
@@ -1814,7 +2206,10 @@ class TestGalleryRescan(ImageAPITestCase):
         return resp.status, await resp.json()
 
     async def test_rescan_makes_new_files_visible_before_the_cache_expires(self):
-        self.api._gallery_cache_ttl = 3600  # the cache alone would hide the new file
+        # The listing alone would hide the new file for an hour.
+        refresh = patch.object(gallery_listing, "REFRESH_AFTER", 3600)
+        refresh.start()
+        self.addCleanup(refresh.stop)
         make_png(self.output_dir / "a.png")
         _, first = await self._json("GET", self.URL)
         self.assertEqual(first["total"], 1)
@@ -1845,7 +2240,11 @@ class TestGalleryRescan(ImageAPITestCase):
 
 
 class TestOutputScanHelpers(ImageAPITestCase):
-    """Stable ids for filesystem entries, no symlink reads, stop on disconnect."""
+    """Stable ids for filesystem entries and no symlink reads.
+
+    The thumbnail stream no longer stops when its client goes away: see
+    ``tests/test_thumbnail_jobs.py`` (the work is a job that outlives it).
+    """
 
     def test_output_entry_id_is_a_stable_digest_of_the_path(self):
         import hashlib
@@ -1856,6 +2255,78 @@ class TestOutputScanHelpers(ImageAPITestCase):
         entry = images_module._output_image_entry(media, output, 0)
         expected = hashlib.sha1(str(media).encode("utf-8")).hexdigest()[:16]
         self.assertEqual(entry["id"], expected)
+
+    def test_media_walk_matches_the_os_walk_reference(self):
+        # The scandir walk (#348) must list exactly what the os.walk version
+        # listed, in the same order: ties in mtime keep this order.
+        output = Path(self.output_dir)
+        for rel in (
+            "z.png",
+            "a.PNG",
+            "notes.txt",
+            "b/2.png",
+            "b/1.webp",
+            "b/c/deep.mp4",
+            "b/c/d/too_deep.png",
+            "thumbnails/t.png",
+            "b/thumbnails/u.png",
+            "e/.hidden.png",
+            "e/f.jpeg",
+            "e/..png",
+            "e/...webp",
+            "e/g.",
+        ):
+            make_png(output / rel)
+        try:
+            os.symlink(output / "z.png", output / "b" / "link.png")
+            os.symlink(output / "b", output / "dirlink", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pass  # the rest of the tree still checks order and filters
+        with patch.object(images_module, "MAX_SCAN_DEPTH", 2):
+            listed = list(images_module._iter_media_files(output, 100))
+            expected = list(_reference_iter_media_files(output, 100))
+            capped = list(images_module._iter_media_files(output, 3))
+        self.assertEqual(listed, expected)
+        self.assertEqual(capped, expected[:3])
+        # Path.suffix of Python 3.10-3.13, which CI and hosts run (3.14 changed
+        # it): "..png" has the suffix ".png", ".png" and "g." have none.
+        names = {path.name for path in listed}
+        self.assertTrue({"..png", "...webp", ".hidden.png"} <= names, names)
+        self.assertFalse({"g.", "notes.txt"} & names, names)
+        self.assertTrue(all(isinstance(path, Path) for path in listed))
+
+    def test_gallery_scan_reads_each_file_type_and_mtime_from_scandir(self):
+        # Path.stat and Path.is_symlink per file were the other half of the
+        # live walk's cost (#348); the scandir entries already carry both.
+        output = Path(self.output_dir)
+        make_png(output / "a.png")
+        make_png(output / "sub" / "b.png")
+        with (
+            patch.object(Path, "stat", side_effect=AssertionError),
+            patch.object(Path, "is_symlink", side_effect=AssertionError),
+        ):
+            found = self.api._scan_gallery_files_sync(output)
+        self.assertEqual(
+            sorted(path.name for path, _mtime in found), ["a.png", "b.png"]
+        )
+        for path, mtime in found:
+            self.assertEqual(mtime, os.stat(path).st_mtime)
+
+    def test_favorite_listing_slices_the_path_strings(self):
+        # relative_to per file was the largest cold cost of the first open.
+        output = Path(self.output_dir)
+        files = [
+            (output / "a.png", 1.0),
+            (output / "Sub" / "B.png", 2.0),
+            (output / "sub" / "deep" / "c.webp", 3.0),
+        ]
+        expected = {}
+        for path, _mtime in files:
+            posix = path.relative_to(output).as_posix()
+            expected.setdefault(images_module._favorite_relative_key(posix), posix)
+        with patch.object(PurePath, "relative_to", side_effect=AssertionError):
+            listing = self.api._favorite_listing(output, files)
+        self.assertEqual(listing, expected)
 
     def test_iter_media_files_skips_symlinked_files(self):
         output = Path(self.output_dir)
@@ -1869,28 +2340,6 @@ class TestOutputScanHelpers(ImageAPITestCase):
                 self.skipTest("symlinks not available")
             names = sorted(p.name for p in images_module._iter_media_files(output, 100))
         self.assertEqual(names, ["real.png"])
-
-    async def test_thumbnail_stream_stops_when_the_client_disconnects(self):
-        generated = []
-
-        def fake_generate(src, dst, size, is_video):
-            generated.append(src)
-            return {
-                "action": "generated",
-                "file": src.name,
-                "dir": src.parent.name,
-                "type": "image",
-            }
-
-        self.api._generate_one = fake_generate
-
-        class GoneResponse:
-            async def write(self, data):
-                raise ConnectionResetError("client went away")
-
-        targets = [(Path(f"/x/{i}.png"), Path(f"/x/t{i}.jpg"), False) for i in range(3)]
-        await self.api._stream_thumbnails(GoneResponse(), targets, (256, 256))
-        self.assertEqual(generated, [])
 
 
 class TestThumbnailStartupStatus(ThumbnailTestCase):
@@ -1932,7 +2381,7 @@ class TestThumbnailStartupStatus(ThumbnailTestCase):
         ):
             with self.subTest(route=route):
                 for root in (self.output_dir, second):
-                    for thumb in (root / "thumbnails").glob("*_thumb.png"):
+                    for thumb in (root / "thumbnails").glob("*_thumb.webp"):
                         thumb.unlink()
                 response = await self.client.post(route, json={})
                 if route == self.PROGRESS_URL:
@@ -1940,7 +2389,7 @@ class TestThumbnailStartupStatus(ThumbnailTestCase):
                 else:
                     data = await response.json()
                 self.assertEqual(data["count"], 2)
-                self.assertTrue((second / "thumbnails" / "b_thumb.png").exists())
+                self.assertTrue((second / "thumbnails" / "b_thumb.webp").exists())
                 status = await (await self.client.get(self.STATUS_URL)).json()
                 self.assertEqual(status["pending"], 0)
                 self.assertEqual(status["total_images"], 2)
@@ -1960,10 +2409,13 @@ class TestThumbnailStartupStatus(ThumbnailTestCase):
         make_png(second / "b.png")
         self.api._get_all_output_dirs = lambda: [self.output_dir, second]
         with patch.object(images_module, "MAX_THUMBNAIL_FILES", 1):
+            plan = self.api._plan_gallery_thumbnails([self.output_dir, second])
             response = await self.client.post(self.PROGRESS_URL)
             data = dict(parse_sse(await response.text()))["complete"]
-        self.assertEqual(data["count"], 1)
-        self.assertEqual(data["remaining"], 1)
+        # One batch holds one file across both roots; the run goes on (#317).
+        self.assertEqual((len(plan["targets"]), plan["remaining"]), (1, 1))
+        self.assertEqual(data["count"], 2)
+        self.assertEqual(data["remaining"], 0)
         self.assertEqual(data["total_images"], 2)
 
     async def test_equal_timestamps_do_not_regenerate_existing_thumbnails(self):
@@ -1992,7 +2444,7 @@ class TestGalleryRootIdentity(ThumbnailTestCase):
             root = roots[image["root_index"]]
             for key, path in (
                 ("url", root / "same.png"),
-                ("thumbnail_url", root / "thumbnails" / "same_thumb.png"),
+                ("thumbnail_url", root / "thumbnails" / "same_thumb.webp"),
             ):
                 response = await self.client.get(image[key])
                 self.assertEqual(response.status, 200)
@@ -2132,9 +2584,10 @@ class TestRootScopeServing(ImageAPITestCase):
         listing = await self.client.get("/prompt_manager/images/output?mode=workspace")
         descriptor = (await listing.json())["images"][0]
         self.assertRegex(descriptor.get("root_scope", ""), r"^[0-9a-f]{64}$")
-        with patch.object(
-            images_module, "_WORKSPACE_CURSOR_SECRET", b"different-process-key"
-        ):
+        from utils.workspace_keys import WorkspaceKeys
+
+        rotated = WorkspaceKeys(b"n" * 32, b"m" * 32, False)
+        with patch.object(self.api, "_workspace_keys", return_value=rotated):
             await self.assert_no_access("image.png", scope=descriptor["root_scope"])
         self.api._get_all_output_dirs = lambda: []
         await self.assert_no_access("image.png", scope=descriptor["root_scope"])
@@ -2192,3 +2645,1815 @@ class TestRootScopeServing(ImageAPITestCase):
             self._make_symlink(roots[1], link)
             for path in ("image.png", "thumbnails/image_thumb.png"):
                 await self.assert_no_access(path, scope=token)
+
+
+# Seconds any single wait in the shared-listing tests may take.
+_HANG_LIMIT = 30
+
+
+def _reference_iter_media_files(output_path, max_files):
+    """``_iter_media_files`` as it was before the scandir walk (#348)."""
+    output_path = Path(output_path)
+    root_depth = len(output_path.parts)
+    produced = 0
+    for root, dirs, files in os.walk(output_path):
+        root_path = Path(root)
+        rel_parts = root_path.parts[root_depth:]
+        if "thumbnails" in rel_parts:
+            dirs[:] = []
+            continue
+        if len(rel_parts) >= images_module.MAX_SCAN_DEPTH:
+            dirs[:] = []
+        for name in sorted(files):
+            # Path.suffix as Python 3.10-3.13 computed it (3.14 changed it).
+            dot = name.rfind(".")
+            suffix = name[dot:] if 0 < dot < len(name) - 1 else ""
+            if suffix.lower() not in images_module.MEDIA_EXTENSIONS:
+                continue
+            if (root_path / name).is_symlink():
+                continue
+            if produced >= max_files:
+                return
+            produced += 1
+            yield root_path / name
+
+
+class _GatedScan:
+    """Wraps the real scan, counts calls and can hold one call after it listed.
+
+    ``hold_next()`` makes the next call list the files, then wait on the
+    returned gate, so a test can change the disk or the cache while a walk
+    is in flight and decide when it ends.
+    """
+
+    def __init__(self, real):
+        self.real = real
+        self.calls = 0
+        self._gate = None
+        self.entered = threading.Event()
+        self._gates = []
+
+    def hold_next(self):
+        self._gate = threading.Event()
+        self._gates.append(self._gate)
+        self.entered.clear()
+        return self._gate
+
+    def release_all(self):
+        for gate in self._gates:
+            gate.set()
+
+    def __call__(self, root):
+        self.calls += 1
+        files = self.real(root)
+        gate, self._gate = self._gate, None
+        if gate is not None:
+            self.entered.set()
+            gate.wait(30)
+        return files
+
+    async def wait_entered(self):
+        loop = asyncio.get_running_loop()
+        entered = await loop.run_in_executor(None, self.entered.wait, 30)
+        if not entered:
+            raise AssertionError("the walk never reached the gate")
+
+
+class TestSharedListing(ImageAPITestCase):
+    """One listing per output root, shared and refreshed in the background (#348)."""
+
+    URL = "/prompt_manager/images/output"
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.scan = _GatedScan(self.api._scan_gallery_files_sync)
+        self.api._scan_gallery_files_sync = self.scan
+        self.addCleanup(self.scan.release_all)
+        # The stale refresh waits REFRESH_DELAY after the read (#348); these
+        # tests start it on the next loop turn and _settle waits for it.
+        delay = patch.object(gallery_listing, "REFRESH_DELAY", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
+
+    async def _json(self, method, path, **kwargs):
+        # Bounded, like every wait in this class: a stuck walk fails the test
+        # with a traceback instead of hanging the whole run.
+        async def call():
+            resp = await self.client.request(method, path, **kwargs)
+            return resp.status, await resp.json()
+
+        return await asyncio.wait_for(call(), _HANG_LIMIT)
+
+    def _record(self):
+        return self.api._root_listings[str(self.output_dir)]
+
+    def _pending(self):
+        return any(
+            record.rewalk_handle is not None
+            for record in self.api._root_listings.values()
+        )
+
+    def _warming(self):
+        task = self.api._workspace_warm_task
+        return task is not None and not task.done()
+
+    def _age(self, seconds=None):
+        from py.api import gallery_listing
+
+        record = self._record()
+        shift = (seconds or gallery_listing.REFRESH_AFTER) + 1
+        record.walked_at -= shift
+        # An old listing's walk also started long ago (rewalk_interval).
+        record.last_started_at -= shift
+
+    async def _settle(self):
+        """Wait for every background walk this API started."""
+
+        async def settle():
+            while self.api._listing_tasks or self._warming() or self._pending():
+                if self._pending():
+                    await asyncio.sleep(0.01)  # a delayed refresh not started yet
+                await asyncio.gather(*list(self.api._listing_tasks))
+                # A finished walk leaves the set in a done callback, which needs
+                # a loop turn; gather over finished tasks does not yield one.
+                await asyncio.sleep(0)
+                if self._warming():
+                    await asyncio.wait([self.api._workspace_warm_task])
+
+        await asyncio.wait_for(settle(), _HANG_LIMIT)
+
+    async def test_concurrent_cold_readers_share_one_walk(self):
+        make_png(self.output_dir / "sub" / "a.png")
+        results = await asyncio.gather(
+            self._json("GET", self.URL),
+            self._json("GET", self.URL + "?limit=1"),
+            self._json("GET", self.URL + "?mode=workspace&limit=1"),
+            self._json("GET", "/prompt_manager/gallery/subfolders"),
+        )
+        self.assertEqual([status for status, _ in results], [200] * 4)
+        self.assertEqual(self.scan.calls, 1)
+        self.assertEqual(results[0][1]["total"], 1)
+        self.assertEqual(results[3][1]["subfolders"], ["sub"])
+
+    async def test_a_stale_listing_is_served_at_once_and_refreshed_behind(self):
+        make_png(self.output_dir / "a.png")
+        _, first = await self._json("GET", self.URL)
+        make_png(self.output_dir / "b.png")
+        self._age()
+        gate = self.scan.hold_next()
+        _, stale = await self._json("GET", self.URL)
+        # Served from the old listing while the walk is still held.
+        self.assertEqual((first["total"], stale["total"]), (1, 1))
+        await self.scan.wait_entered()
+        # A second stale read joins the running walk instead of starting one.
+        _, again = await self._json("GET", self.URL)
+        self.assertEqual(again["total"], 1)
+        gate.set()
+        await self._settle()
+        _, fresh = await self._json("GET", self.URL)
+        self.assertEqual(fresh["total"], 2)
+        self.assertEqual(self.scan.calls, 2)
+
+    async def test_a_fresh_listing_is_not_walked_again(self):
+        make_png(self.output_dir / "a.png")
+        for _ in range(3):
+            await self._json("GET", self.URL)
+            await self._json("GET", "/prompt_manager/gallery/subfolders")
+        self.assertEqual(self.scan.calls, 1)
+        self.assertEqual(self.api._listing_tasks, set())
+
+    async def test_rescan_waits_for_a_walk_started_after_the_click(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        self._age()
+        gate = self.scan.hold_next()
+        await self._json("GET", self.URL)  # starts a background walk
+        await self.scan.wait_entered()  # it has listed: it cannot see c.png
+        make_png(self.output_dir / "c.png")
+        rescan = asyncio.ensure_future(
+            self._json("POST", "/prompt_manager/gallery/rescan")
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(rescan.done())
+        gate.set()
+        status, data = await rescan
+        self.assertEqual(status, 200)
+        self.assertEqual((data["total"], data["roots"]), (2, 1))
+        self.assertEqual(self.scan.calls, 3)
+
+    async def test_rescans_clicked_during_a_walk_share_the_next_one(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        original = self.api._listing
+        rescans = []
+        clicked = asyncio.Event()
+
+        async def listing(root, *, fresh=False):
+            if fresh:
+                rescans.append(root)
+                if len(rescans) == 3:
+                    clicked.set()
+            # Runs on in this step up to its first wait, so the Rescan's
+            # walk number is taken before the test resumes.
+            return await original(root, fresh=fresh)
+
+        self.api._listing = listing
+        gate = self.scan.hold_next()
+        first = asyncio.ensure_future(
+            self._json("POST", "/prompt_manager/gallery/rescan")
+        )
+        await self.scan.wait_entered()
+        # Clicked while the first Rescan's walk runs: neither may use it,
+        # and both wait for the same next walk.
+        later = [
+            asyncio.ensure_future(self._json("POST", "/prompt_manager/gallery/rescan"))
+            for _ in range(2)
+        ]
+        await asyncio.wait_for(clicked.wait(), 30)
+        gate.set()
+        results = await asyncio.gather(first, *later)
+        self.assertEqual([status for status, _ in results], [200] * 3)
+        self.assertEqual(self.scan.calls, 3)
+
+    async def test_rescan_failure_with_a_previous_listing_is_500(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        self.api._scan_gallery_files_sync = _raise
+        with self.assertLogs(self.api.logger, "WARNING"):
+            status, data = await self._json("POST", "/prompt_manager/gallery/rescan")
+        self.assertEqual(status, 500)
+        self.assertFalse(data["success"])
+        self.assertNotIn("boom", json.dumps(data))
+        # Plain readers keep the previous listing, and do not retry at once.
+        status, listed = await self._json("GET", self.URL)
+        self.assertEqual((status, listed["total"]), (200, 1))
+        self.assertEqual(self.api._listing_tasks, set())
+
+    async def test_a_cold_read_whose_walk_fails_is_500(self):
+        self.api._scan_gallery_files_sync = _raise
+        with self.assertLogs(self.api.logger, "WARNING"):
+            status, data = await self._json("GET", self.URL)
+        self.assertEqual(status, 500)
+        self.assertFalse(data["success"])
+
+    async def test_a_deleted_root_keeps_the_previous_listing_and_warns_once(self):
+        import shutil
+
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        shutil.rmtree(self.output_dir)
+        with self.assertLogs(self.api.logger, "WARNING") as logs:
+            for _ in range(2):
+                self._age()
+                status, data = await self._json("GET", self.URL)
+                self.assertEqual((status, data["total"]), (200, 1))
+                await self._settle()
+        warnings = [r for r in logs.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1, [r.getMessage() for r in warnings])
+        self.assertEqual(self.scan.calls, 1)  # the probe failed before the scan
+
+    async def test_a_root_that_recovers_warns_again_on_its_next_failure(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        real = self.api._scan_gallery_files_sync
+        with self.assertLogs(self.api.logger, "WARNING") as logs:
+            for scan in (_raise, real, _raise):
+                self.api._scan_gallery_files_sync = scan
+                self._age()
+                await self._json("GET", self.URL)
+                await self._settle()
+        warnings = [r for r in logs.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 2)
+
+    async def test_an_invalidation_during_a_walk_discards_it(self):
+        make_png(self.output_dir / "a.png")
+        gate = self.scan.hold_next()
+        reader = asyncio.ensure_future(self._json("GET", self.URL))
+        await self.scan.wait_entered()
+        make_png(self.output_dir / "b.png")
+        self.api.invalidate_gallery_cache()
+        gate.set()
+        status, data = await reader
+        self.assertEqual((status, data["total"]), (200, 2))
+        self.assertEqual(self.scan.calls, 2)
+
+    async def test_an_invalidation_from_a_worker_thread_drops_on_the_loop(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        record = self._record()
+        loop_thread = threading.get_ident()
+        threads = []
+        original = record.drop
+
+        def drop():
+            threads.append(threading.get_ident())
+            original()
+
+        record.drop = drop
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.api.invalidate_gallery_cache)
+        # Dropped on the loop, before invalidate_gallery_cache returned.
+        self.assertEqual(threads, [loop_thread])
+        self.assertIsNone(record.files)
+
+    async def test_three_discarded_walks_are_a_500(self):
+        loop = asyncio.get_running_loop()
+        real = self.scan.real
+
+        async def invalidate():
+            self.api.invalidate_gallery_cache()
+
+        def scan(root):
+            asyncio.run_coroutine_threadsafe(invalidate(), loop).result(30)
+            return real(root)
+
+        self.scan.real = scan
+        status, data = await self._json("GET", self.URL)
+        self.assertEqual(status, 500)
+        self.assertFalse(data["success"])
+        self.assertEqual(self.scan.calls, 3)
+
+    async def test_a_disconnected_waiter_does_not_cancel_the_walk(self):
+        make_png(self.output_dir / "a.png")
+        gate = self.scan.hold_next()
+        waiter = asyncio.ensure_future(self.api._listing(self.output_dir))
+        await self.scan.wait_entered()
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+        flight = self._record().flight
+        self.assertIsNotNone(flight)
+        gate.set()
+        await asyncio.shield(flight)
+        self.assertEqual(len(self._record().files), 1)
+        self.assertIsNone(self._record().flight)
+
+    async def test_a_duplicate_delete_is_gone_on_the_very_next_read(self):
+        make_png(self.output_dir / "keep.png")
+        make_png(self.output_dir / "dupe.png")
+        _, before = await self._json("GET", self.URL)
+        self.assertEqual(before["total"], 2)
+        status, data = await self._json(
+            "POST",
+            "/prompt_manager/delete_duplicate_images",
+            json={"image_paths": ["dupe.png"]},
+        )
+        self.assertEqual((status, data["deleted_count"]), (200, 1))
+        _, after = await self._json("GET", self.URL)
+        self.assertEqual([image["filename"] for image in after["images"]], ["keep.png"])
+
+    async def test_response_keys_are_unchanged(self):
+        make_png(self.output_dir / "sub" / "a.png")
+        _, legacy = await self._json("GET", self.URL)
+        self.assertEqual(
+            set(legacy),
+            {"success", "images", "total", "offset", "limit", "has_more"},
+        )
+        _, workspace = await self._json("GET", self.URL + "?mode=workspace")
+        self.assertEqual(
+            set(workspace),
+            {
+                "success",
+                "images",
+                "total",
+                "positive_count",
+                "limit",
+                "has_more",
+                "next_cursor",
+                # #498: Show removed images (N).
+                "removed_total",
+            },
+        )
+        _, folders = await self._json("GET", "/prompt_manager/gallery/subfolders")
+        self.assertEqual(set(folders), {"success", "subfolders"})
+        _, scoped = await self._json(
+            "GET", "/prompt_manager/gallery/subfolders?mode=workspace"
+        )
+        self.assertEqual(set(scoped), {"success", "subfolders", "roots"})
+        self.assertEqual(set(scoped["roots"][0]), {"index", "label", "subfolders"})
+        _, rescan = await self._json("POST", "/prompt_manager/gallery/rescan")
+        self.assertEqual(set(rescan), {"success", "total", "roots"})
+
+    async def test_subfolders_with_ancestors_come_from_the_listing(self):
+        make_png(self.output_dir / "a" / "b" / "c.png")
+        _, plain = await self._json("GET", "/prompt_manager/gallery/subfolders")
+        _, nested = await self._json(
+            "GET", "/prompt_manager/gallery/subfolders?include_ancestors=true"
+        )
+        self.assertEqual(plain["subfolders"], [str(Path("a") / "b")])
+        self.assertEqual(
+            sorted(nested["subfolders"]), sorted(["a", str(Path("a") / "b")])
+        )
+        self.assertEqual(self.scan.calls, 1)
+
+    async def test_warm_up_walks_every_root_before_the_first_read(self):
+        second = self.comfy_dir / "second"
+        make_png(second / "x.png")
+        make_png(self.output_dir / "a.png")
+        self.api._get_all_output_dirs = lambda: [self.output_dir, second]
+        await self.api.warm_gallery_listings(web.Application())
+        self.assertEqual(len(self.api._listing_tasks), 2)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+        _, data = await self._json("GET", self.URL)
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(self.scan.calls, 2)
+
+    async def test_warm_up_never_fails_startup(self):
+        def broken():
+            raise RuntimeError("no roots")
+
+        self.api._get_all_output_dirs = broken
+        with self.assertLogs(self.api.logger, "WARNING"):
+            await self.api.warm_gallery_listings(web.Application())
+        self.assertEqual(self.api._listing_tasks, set())
+
+    async def test_warm_up_failure_is_retried_by_the_first_read(self):
+        make_png(self.output_dir / "a.png")
+        self.api._scan_gallery_files_sync = _raise
+        with self.assertLogs(self.api.logger, "WARNING"):
+            await self.api.warm_gallery_listings(web.Application())
+            await self._settle()
+        self.api._scan_gallery_files_sync = self.scan
+        status, data = await self._json("GET", self.URL)
+        self.assertEqual((status, data["total"]), (200, 1))
+
+    async def test_cleanup_cancels_running_walks(self):
+        make_png(self.output_dir / "a.png")
+        gate = self.scan.hold_next()
+        await self.api.warm_gallery_listings(web.Application())
+        await self.scan.wait_entered()
+        tasks = set(self.api._listing_tasks)
+        flight = self._record().flight
+        await self.api.cleanup_gallery_listings(web.Application())
+        gate.set()
+        self.assertTrue(all(task.cancelled() for task in tasks))
+        self.assertEqual(self.api._listing_tasks, set())
+        self.assertTrue(flight.done())
+        self.assertIsNone(self._record().flight)
+        self.assertIsNone(self._record().files)
+
+    async def test_cleanup_resolves_a_walk_cancelled_before_it_ran(self):
+        await self.api.warm_gallery_listings(web.Application())
+        flight = self._record().flight
+        waiter = asyncio.ensure_future(asyncio.shield(flight))
+        # No await between the warm-up and the cleanup: the task never ran.
+        await self.api.cleanup_gallery_listings(web.Application())
+        outcome = await waiter
+        self.assertEqual(outcome.kind, gallery_listing.FAILED)
+        self.assertIsNone(self._record().flight)
+        self.assertEqual(self.scan.calls, 0)
+
+    async def test_a_stale_read_starts_its_refresh_after_a_delay(self):
+        # The read is served from the old listing; the walk starts
+        # REFRESH_DELAY later so it does not share the GIL with the page's
+        # own requests (#348 live test: 2.2 s reads during the walk).
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        self._age()
+        with patch.object(gallery_listing, "REFRESH_DELAY", 30):
+            status, data = await self._json("GET", self.URL)
+            await self._json("GET", self.URL)  # still one pending refresh
+            record = self._record()
+            handle = record.rewalk_handle
+            self.assertEqual((status, data["total"]), (200, 1))
+            self.assertIsNotNone(handle)
+            self.assertIsNone(record.flight)
+            self.assertEqual(self.scan.calls, 1)
+            self.assertAlmostEqual(
+                handle.when() - asyncio.get_running_loop().time(), 30, delta=2
+            )
+            handle.cancel()
+            record.rewalk_handle = None
+
+    async def test_the_delayed_refresh_walks_once_when_it_fires(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        make_png(self.output_dir / "b.png")
+        self._age()
+        await self._json("GET", self.URL)
+        await self._json("GET", self.URL)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+        self.assertIsNone(self._record().rewalk_handle)
+        _, data = await self._json("GET", self.URL)
+        self.assertEqual(data["total"], 2)
+
+    async def test_a_walk_started_meanwhile_cancels_the_delayed_refresh(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        self._age()
+        with patch.object(gallery_listing, "REFRESH_DELAY", 30):
+            await self._json("GET", self.URL)
+            handle = self._record().rewalk_handle
+            status, _ = await self._json("POST", "/prompt_manager/gallery/rescan")
+        self.assertEqual(status, 200)
+        self.assertTrue(handle.cancelled())
+        self.assertIsNone(self._record().rewalk_handle)
+        self.assertEqual(self.scan.calls, 2)
+
+    async def test_cleanup_cancels_a_delayed_refresh(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        self._age()
+        with patch.object(gallery_listing, "REFRESH_DELAY", 30):
+            await self._json("GET", self.URL)
+            handle = self._record().rewalk_handle
+            await self.api.cleanup_gallery_listings(web.Application())
+        self.assertTrue(handle.cancelled())
+        self.assertIsNone(self._record().rewalk_handle)
+        self.assertEqual(self.scan.calls, 1)
+
+    WORKSPACE_URL = "/prompt_manager/images/output?mode=workspace&limit=1"
+
+    async def _warmed(self):
+        await self.api.warm_gallery_listings(web.Application())
+        await self._settle()
+
+    def _workspace_ready(self):
+        """True when a first workspace page needs no per-file rebuild."""
+        files = self._record().files
+        favorites = self.api._favorite_listing_cache.get(str(self.output_dir))
+        listed = self.api._workspace_listed_cache.get((0, str(self.output_dir)))
+        return (
+            favorites is not None
+            and favorites[0] is files
+            and listed is not None
+            and listed[0] is files
+            and bool(self.api._workspace_order_cache)
+        )
+
+    async def test_warm_up_also_builds_the_workspace_caches(self):
+        # The first open after a restart paid ~3 s building these (#348 live).
+        make_png(self.output_dir / "a.png")
+        make_png(self.output_dir / "sub" / "b.png")
+        await self._warmed()
+        self.assertTrue(self._workspace_ready())
+        with patch.object(images_module, "_listed", side_effect=AssertionError):
+            status, data = await self._json("GET", self.WORKSPACE_URL)
+        self.assertEqual((status, data["total"]), (200, 2))
+
+    async def test_a_changed_refresh_rebuilds_the_workspace_caches_behind(self):
+        make_png(self.output_dir / "a.png")
+        await self._warmed()
+        make_png(self.output_dir / "b.png")
+        self._age()
+        await self._json("GET", self.URL)  # stale: one background walk
+        await self._settle()
+        self.assertEqual(len(self._record().files), 2)
+        self.assertTrue(self._workspace_ready())
+
+    async def test_an_unchanged_refresh_does_not_rebuild_them(self):
+        make_png(self.output_dir / "a.png")
+        await self._warmed()
+        with patch.object(
+            self.api, "_build_workspace_caches", side_effect=AssertionError
+        ):
+            self._age()
+            await self._json("GET", self.URL)
+            await self._settle()
+        self.assertTrue(self._workspace_ready())
+
+    async def test_without_the_warm_up_reads_start_no_workspace_build(self):
+        make_png(self.output_dir / "a.png")
+        await self._json("GET", self.URL)
+        await self._settle()
+        self.assertIsNone(self.api._workspace_warm_task)
+        self.assertEqual(self.api._favorite_listing_cache, {})
+
+    async def test_a_failed_workspace_build_warns_and_reads_still_work(self):
+        make_png(self.output_dir / "a.png")
+        with (
+            patch.object(
+                self.api, "_select_workspace_page", side_effect=RuntimeError("boom")
+            ),
+            self.assertLogs(self.api.logger, "WARNING") as logs,
+        ):
+            await self._warmed()
+        self.assertTrue(any("Images page" in line for line in logs.output))
+        status, data = await self._json("GET", self.URL)
+        self.assertEqual((status, data["total"]), (200, 1))
+
+    async def test_walks_during_a_workspace_build_coalesce_into_one_more(self):
+        make_png(self.output_dir / "a.png")
+        release, entered = threading.Event(), threading.Event()
+        built = []
+        real = self.api._build_workspace_caches
+
+        def build(listings):
+            built.append(len(listings[0][2]))
+            if len(built) == 1:
+                entered.set()
+                release.wait(_HANG_LIMIT)
+            real(listings)
+
+        self.addCleanup(release.set)
+        with patch.object(self.api, "_build_workspace_caches", side_effect=build):
+            await self.api.warm_gallery_listings(web.Application())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, entered.wait, _HANG_LIMIT)
+            for name in ("b.png", "c.png"):  # two changed walks while it builds
+                make_png(self.output_dir / name)
+                self._age()
+                await self._json("GET", self.URL)
+                while self.api._listing_tasks:
+                    await asyncio.gather(*list(self.api._listing_tasks))
+                    await asyncio.sleep(0)
+            release.set()
+            await self._settle()
+        self.assertEqual(built, [1, 3])
+        self.assertEqual(self.scan.calls, 3)  # two stored walks, one more build
+        self.assertTrue(self._workspace_ready())
+
+    async def test_a_build_that_cannot_list_the_roots_only_warns(self):
+        make_png(self.output_dir / "a.png")
+        await self._warmed()
+
+        def broken():
+            raise RuntimeError("no roots")
+
+        self.api._get_all_output_dirs = broken
+        with self.assertLogs(self.api.logger, "WARNING") as logs:
+            self.api._schedule_workspace_warm()
+            task = self.api._workspace_warm_task
+            await asyncio.wait([task])
+        self.assertIsNone(task.exception())
+        self.assertTrue(any("Images page" in line for line in logs.output))
+
+    async def test_cleanup_stops_a_running_workspace_build(self):
+        make_png(self.output_dir / "a.png")
+        release, entered = threading.Event(), threading.Event()
+
+        def build(_listings):
+            entered.set()
+            release.wait(_HANG_LIMIT)
+
+        self.addCleanup(release.set)
+        with patch.object(self.api, "_build_workspace_caches", side_effect=build):
+            await self.api.warm_gallery_listings(web.Application())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, entered.wait, _HANG_LIMIT)
+            task = self.api._workspace_warm_task
+            await self.api.cleanup_gallery_listings(web.Application())
+            release.set()
+        self.assertTrue(task.done())
+        self.assertIsNone(self.api._workspace_warm_task)
+
+    # -- monitor-triggered walks (#348, PR 2) ---------------------------
+
+    def _interval(self, seconds):
+        """Patch rewalk_interval() to *seconds*, whatever the walk took."""
+        for name in ("REWALK_FLOOR", "REWALK_CAP"):
+            patcher = patch.object(gallery_listing, name, seconds)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _output(self, name):
+        """A new output on disk, spelled as the monitor reports it (resolved)."""
+        return os.path.realpath(make_png(self.output_dir / name))
+
+    async def _listed(self):
+        """A stored listing of the root, built by a read."""
+        await self._json("GET", self.URL)
+        await self._settle()
+        return self._record()
+
+    def _fire(self, record):
+        """Run the pending deferred walk now, as its timer would."""
+        handle = record.rewalk_handle
+        self.assertIsNotNone(handle, "no deferred walk is pending")
+        handle.cancel()
+        self.api._delayed_walk(self.output_dir, record)
+
+    def _remaining(self, handle):
+        return handle.when() - asyncio.get_running_loop().time()
+
+    async def test_a_settled_output_is_listed_without_a_reload(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(0)
+        self.api.mark_root_dirty(self._output("b.png"))
+        self.assertIsNotNone(record.flight)  # the interval allows: walks now
+        self.assertFalse(record.dirty)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+        self.assertEqual(len(record.files), 2)
+        _, data = await self._json("GET", self.URL)
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(self.scan.calls, 2)
+
+    async def test_the_monitor_thread_hops_onto_the_loop(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(0)
+        path = self._output("b.png")
+        calls = []
+        real = self.api.output_settled
+
+        def settled(seen):
+            calls.append(threading.get_ident())
+            real(seen)
+
+        self.api.output_settled = settled
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.api.notify_output_settled, path)
+        # The hop was queued before the executor's result: one loop turn runs it.
+        await asyncio.sleep(0)
+        self.assertEqual(calls, [threading.get_ident()])
+        await self._settle()
+        self.assertEqual(len(record.files), 2)
+        self.assertEqual(self.scan.calls, 1)  # added, not walked
+
+    async def test_notify_before_the_loop_is_known_does_nothing(self):
+        self.assertIsNone(self.api._listing_loop)
+        with patch.object(self.api, "output_settled") as mark:
+            self.api.notify_output_settled(self._output("b.png"))
+            await asyncio.sleep(0)
+        mark.assert_not_called()
+
+    async def test_notify_after_cleanup_does_nothing(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        await self.api.cleanup_gallery_listings(web.Application())
+        self._interval(0)
+        with patch.object(self.api, "output_settled") as mark:
+            self.api.notify_output_settled(self._output("b.png"))
+            await asyncio.sleep(0)
+        mark.assert_not_called()
+        # A hop queued before the cleanup is dropped when it runs.
+        self.api.output_settled(self._output("c.png"))
+        self.api.mark_root_dirty(self._output("d.png"))
+        self.assertEqual(self.api._listing_tasks, set())
+        self.assertEqual(record.pending_adds, [])
+        self.assertFalse(record.dirty)
+        self.assertIsNone(record.flight)
+        self.assertIsNone(record.rewalk_handle)
+
+    async def test_notify_on_a_closed_loop_does_nothing(self):
+        loop = asyncio.new_event_loop()
+        loop.close()
+        self.api._listing_loop = loop
+        self.api.notify_output_settled(self._output("b.png"))  # no exception
+
+    async def test_notify_racing_the_loop_closing_does_nothing(self):
+        class ClosingLoop:
+            def is_running(self):
+                return True
+
+            def call_soon_threadsafe(self, *_args):
+                raise RuntimeError("Event loop is closed")
+
+        self.api._listing_loop = ClosingLoop()
+        self.api.notify_output_settled(self._output("b.png"))  # no exception
+
+    async def test_an_output_outside_every_root_is_ignored(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(0)
+        elsewhere = make_png(self.comfy_dir / "output2" / "x.png")
+        self.api.mark_root_dirty(os.path.realpath(elsewhere))
+        self.assertFalse(record.dirty)
+        self.assertIsNone(record.flight)
+        self.assertIsNone(record.rewalk_handle)
+
+    async def test_a_root_never_listed_is_not_walked_by_a_mark(self):
+        # No listing, no walk running: the first read walks anyway.
+        self.api.mark_root_dirty(self._output("b.png"))
+        self.assertEqual(self.api._root_listings, {})
+        self.assertEqual(self.scan.calls, 0)
+
+    async def test_a_dropped_listing_is_left_to_the_next_read(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self.api.invalidate_gallery_cache()
+        self._interval(0)
+        self.api.mark_root_dirty(self._output("b.png"))
+        self.assertIsNone(record.flight)
+        self.assertEqual(self.scan.calls, 1)
+
+    async def test_the_walk_records_the_resolved_root_and_its_timing(self):
+        make_png(self.output_dir / "a.png")
+        before = images_module._time.monotonic()
+        record = await self._listed()
+        self.assertEqual(
+            record.resolved_root, os.path.normcase(os.path.realpath(self.output_dir))
+        )
+        self.assertGreaterEqual(record.last_started_at, before)
+        self.assertLessEqual(record.last_started_at, record.walked_at)
+        # Measured when the walk ended, after its listing was stored.
+        self.assertGreaterEqual(
+            record.last_duration, record.walked_at - record.last_started_at
+        )
+
+    async def test_a_failed_walk_records_its_timing_and_clears_dirty(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        self.api.mark_root_dirty(self._output("b.png"))
+        self.assertTrue(record.dirty)
+        self.api._scan_gallery_files_sync = _raise
+        # Moved back, so the failed walk's start is later even on a coarse
+        # monotonic clock (Windows ticks every ~15.6 ms).
+        record.last_started_at -= 1000
+        record.last_duration = None
+        started = record.last_started_at
+        with self.assertLogs(self.api.logger, "WARNING"):
+            self._fire(record)
+            await self._settle()
+        self.assertGreater(record.last_started_at, started)
+        self.assertIsNotNone(record.last_duration)
+        self.assertFalse(record.dirty)
+        self.assertIsNone(record.rewalk_handle)  # no trailing walk after a failure
+        self.assertEqual(len(record.files), 1)  # the previous listing is kept
+
+    async def test_a_burst_of_marks_coalesces_into_one_walk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        for i in range(5):
+            self.api.mark_root_dirty(self._output(f"b{i}.png"))
+        handle = record.rewalk_handle
+        self.assertIsNotNone(handle)
+        self.assertIsNone(record.flight)
+        self.assertEqual(self.scan.calls, 1)
+        # Due one interval after the last walk started, not 30 s from now.
+        due = record.last_started_at + 30 - images_module._time.monotonic()
+        self.assertAlmostEqual(self._remaining(handle), due, delta=1)
+        self._fire(record)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+        self.assertEqual(len(record.files), 6)
+        self.assertFalse(record.dirty)
+        self.assertIsNone(record.rewalk_handle)
+
+    async def test_a_mark_during_a_walk_gives_exactly_one_trailing_walk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        gate = self.scan.hold_next()
+        rescan = asyncio.ensure_future(
+            self._json("POST", "/prompt_manager/gallery/rescan")
+        )
+        await self.scan.wait_entered()  # listed before b.png exists
+        for name in ("b.png", "c.png"):
+            self.api.mark_root_dirty(self._output(name))
+        # Never armed while a walk runs: the walk's end re-checks dirty.
+        self.assertIsNone(record.rewalk_handle)
+        self.assertTrue(record.dirty)
+        gate.set()
+        status, _ = await rescan
+        self.assertEqual(status, 200)
+        self.assertEqual(len(record.files), 1)
+        handle = record.rewalk_handle
+        self.assertIsNotNone(handle)  # the trailing walk, deferred by the interval
+        self.assertGreaterEqual(self._remaining(handle), 0.5)
+        self._fire(record)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 3)
+        self.assertEqual(len(record.files), 3)
+        self.assertIsNone(record.rewalk_handle)
+        self.assertFalse(record.dirty)
+
+    async def test_a_walk_slower_than_the_interval_trails_at_once_and_stops(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(0)  # the walk outlasts its interval
+        gate = self.scan.hold_next()
+        self.api.mark_root_dirty(self._output("b.png"))
+        await self.scan.wait_entered()
+        self.api.mark_root_dirty(self._output("c.png"))
+        self.assertIsNone(record.rewalk_handle)
+        gate.set()
+        await self._settle()
+        # One walk for the first mark, one trailing walk for the second, then
+        # nothing: no mark arrived during the trailing walk.
+        self.assertEqual(self.scan.calls, 3)
+        self.assertEqual(len(record.files), 3)
+        self.assertIsNone(record.rewalk_handle)
+        self.assertIsNone(record.flight)
+
+    async def test_a_read_triggered_walk_cancels_a_pending_rewalk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        self.api.mark_root_dirty(self._output("b.png"))
+        handle = record.rewalk_handle
+        status, data = await self._json("POST", "/prompt_manager/gallery/rescan")
+        self.assertEqual((status, data["total"]), (200, 2))
+        self.assertTrue(handle.cancelled())
+        self.assertIsNone(record.rewalk_handle)
+        self.assertFalse(record.dirty)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+
+    async def test_after_the_trailing_walk_a_new_mark_arms_again(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        self.api.mark_root_dirty(self._output("b.png"))
+        self._fire(record)
+        await self._settle()
+        self.assertIsNone(record.rewalk_handle)
+        self.api.mark_root_dirty(self._output("c.png"))
+        self.assertIsNotNone(record.rewalk_handle)
+        self._fire(record)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 3)
+        self.assertEqual(len(record.files), 3)
+
+    async def test_a_deferred_walk_waits_at_least_half_a_second(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        # The interval ends in a few milliseconds: still never a zero delay.
+        # The module's clock is held, so a slow runner cannot pass the end
+        # of the interval between these lines (the walk would start at once).
+        now = images_module._time.monotonic()
+        record.last_started_at = now - 29.99
+        held = types.SimpleNamespace(monotonic=lambda: now)
+        with patch.object(images_module, "_time", held):
+            self.api.mark_root_dirty(self._output("b.png"))
+        handle = record.rewalk_handle
+        self.assertIsNotNone(handle)
+        self.assertGreaterEqual(self._remaining(handle), 0.45)
+        handle.cancel()
+
+    async def test_a_mark_moves_a_later_stale_refresh_earlier(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._age()
+        self._interval(5)
+        with patch.object(gallery_listing, "REFRESH_DELAY", 30):
+            await self._json("GET", self.URL)
+        stale = record.rewalk_handle
+        self.assertGreater(self._remaining(stale), 25)
+        # The interval has long passed: the mark's walk starts now, and that
+        # walk is the refresh the stale read was waiting for.
+        self.api.mark_root_dirty(self._output("b.png"))
+        self.assertTrue(stale.cancelled())
+        self.assertIsNotNone(record.flight)
+        self.assertIsNone(record.rewalk_handle)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+        self.assertEqual(len(record.files), 2)
+
+    async def test_a_stale_read_keeps_an_earlier_pending_rewalk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(20)
+        self.api.mark_root_dirty(self._output("b.png"))
+        pending = record.rewalk_handle
+        when = pending.when()
+        # Stale by its age, while the interval since the last walk still runs.
+        record.walked_at -= gallery_listing.REFRESH_AFTER + 1
+        with patch.object(gallery_listing, "REFRESH_DELAY", 30):
+            await self._json("GET", self.URL)
+        self.assertIs(record.rewalk_handle, pending)
+        self.assertEqual(pending.when(), when)
+        self.assertFalse(pending.cancelled())
+
+    async def test_a_stale_read_moves_a_later_pending_rewalk_earlier(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(15)
+        self.api.mark_root_dirty(self._output("b.png"))
+        pending = record.rewalk_handle
+        self.assertGreater(self._remaining(pending), 10)
+        # A listing older than REFRESH_AFTER whose interval is over.
+        self._age()
+        with patch.object(gallery_listing, "REFRESH_DELAY", 2):
+            await self._json("GET", self.URL)
+        self.assertTrue(pending.cancelled())
+        replaced = record.rewalk_handle
+        self.assertIsNotNone(replaced)
+        self.assertLess(self._remaining(replaced), 3)
+        self.assertEqual(self.scan.calls, 1)
+        replaced.cancel()
+
+    async def test_a_dirty_read_rearms_a_lost_rewalk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        record.dirty = True  # e.g. its timer was cancelled by hand
+        await self._json("GET", self.URL)
+        self.assertIsNotNone(record.rewalk_handle)
+        self.assertEqual(self.scan.calls, 1)
+
+    async def test_cleanup_cancels_a_pending_rewalk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        self.api.mark_root_dirty(self._output("b.png"))
+        handle = record.rewalk_handle
+        await self.api.cleanup_gallery_listings(web.Application())
+        self.assertTrue(handle.cancelled())
+        self.assertIsNone(record.rewalk_handle)
+        self.assertEqual(self.scan.calls, 1)
+
+    async def test_a_walk_cancelled_by_cleanup_starts_no_trailing_walk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(0)
+        gate = self.scan.hold_next()
+        self.api.mark_root_dirty(self._output("b.png"))
+        await self.scan.wait_entered()
+        self.api.mark_root_dirty(self._output("c.png"))
+        self.assertTrue(record.dirty)
+        await self.api.cleanup_gallery_listings(web.Application())
+        gate.set()
+        self.assertIsNone(record.flight)
+        self.assertIsNone(record.rewalk_handle)
+        self.assertEqual(self.api._listing_tasks, set())
+        self.assertEqual(self.scan.calls, 2)
+
+    async def test_a_warm_up_after_cleanup_listens_again(self):
+        make_png(self.output_dir / "a.png")
+        self._interval(0)
+        await self._warmed()
+        await self.api.cleanup_gallery_listings(web.Application())
+        await self._warmed()
+        record = self._record()
+        self.api.mark_root_dirty(self._output("b.png"))
+        await self._settle()
+        self.assertEqual(len(record.files), 2)
+
+    async def test_a_root_removed_from_the_roots_is_never_walked_again(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(30)
+        self.api.mark_root_dirty(self._output("b.png"))
+        handle = record.rewalk_handle
+        self.assertIsNotNone(handle)
+        self.api.reset_gallery_roots_cache()  # e.g. the gallery root changed
+        self.assertTrue(handle.cancelled())
+        self.assertIsNone(record.rewalk_handle)
+        self.assertFalse(record.dirty)
+        self._interval(0)
+        # The monitor still watches the old root until ComfyUI restarts.
+        self.api.mark_root_dirty(self._output("c.png"))
+        self.api._delayed_walk(self.output_dir, record)  # a timer that raced
+        self.assertIsNone(record.flight)
+        self.assertIsNone(record.files)
+        self.assertEqual(self.scan.calls, 1)
+
+    async def test_a_walk_running_when_the_roots_change_gets_no_trailing_walk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(0)
+        gate = self.scan.hold_next()
+        self.api.mark_root_dirty(self._output("b.png"))
+        await self.scan.wait_entered()
+        self.api.reset_gallery_roots_cache()
+        self.api.mark_root_dirty(self._output("c.png"))
+        gate.set()
+        await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+        self.assertIsNone(record.files)  # the running walk was discarded
+        self.assertFalse(record.dirty)
+
+    async def test_a_root_read_again_after_the_roots_change_listens_again(self):
+        make_png(self.output_dir / "a.png")
+        await self._listed()
+        self.api.reset_gallery_roots_cache()
+        record = await self._listed()  # still configured: read and walked
+        self._interval(0)
+        self.api.mark_root_dirty(self._output("b.png"))
+        await self._settle()
+        self.assertEqual(len(record.files), 2)
+
+    async def test_a_cancelled_walk_starts_no_trailing_walk(self):
+        make_png(self.output_dir / "a.png")
+        record = await self._listed()
+        self._interval(0)
+        gate = self.scan.hold_next()
+        self.api.mark_root_dirty(self._output("b.png"))
+        await self.scan.wait_entered()
+        self.api.mark_root_dirty(self._output("c.png"))
+        (task,) = self.api._listing_tasks
+        seq = record.walk_seq
+        task.cancel()  # e.g. the loop shutting down without on_cleanup
+        await asyncio.gather(task, return_exceptions=True)
+        gate.set()
+        await self._settle()
+        self.assertTrue(task.cancelled())
+        self.assertEqual(record.walk_seq, seq)  # no walk started after it
+        self.assertEqual(self.scan.calls, 2)
+        self.assertIsNone(record.flight)
+        self.assertIsNone(record.rewalk_handle)
+        self.assertEqual(self.api._listing_tasks, set())
+
+    # -- settled outputs added without a walk (live test round) -----------
+
+    def _walked(self):
+        """The listing a full walk of the root gives now (not counted)."""
+        return self.scan.real(self.output_dir)
+
+    def _at(self, name, mtime):
+        """A new output on disk with *mtime*, spelled as the monitor reports it."""
+        path = make_png(self.output_dir / name)
+        os.utime(path, (mtime, mtime))
+        return os.path.realpath(path)
+
+    def _hold_adds(self):
+        """Hold each add batch in the executor until the returned gate is set."""
+        entered, gate, batches = threading.Event(), threading.Event(), []
+        real = images_module._patch_listing
+
+        def held(*args):
+            batches.append(list(args[4]))
+            entered.set()
+            gate.wait(_HANG_LIMIT)
+            return real(*args)
+
+        patcher = patch.object(images_module, "_patch_listing", held)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(gate.set)
+        return entered, gate, batches
+
+    async def _entered(self, event):
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, event.wait, _HANG_LIMIT):
+            raise AssertionError("the add never reached the executor")
+
+    def _no_walk_pending(self, record):
+        self.assertFalse(record.dirty)
+        self.assertIsNone(record.flight)
+        self.assertIsNone(record.rewalk_handle)
+
+    async def test_a_settled_output_is_added_without_a_walk(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        self._interval(0)
+        self.api.output_settled(self._at("b.png", 2000))
+        self.assertIsNone(record.flight)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 1)
+        self.assertEqual(record.patched, 1)
+        self._no_walk_pending(record)
+        self.assertEqual(record.files, self._walked())
+        self.assertEqual(str(record.files[0][0]), str(self.output_dir / "b.png"))
+        _, data = await self._json("GET", self.URL)
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(self.scan.calls, 1)
+
+    async def test_adds_land_where_a_walk_lists_them_and_name_new_folders(self):
+        for index, name in enumerate(("x/a.png", "x/y/b.png", "c.png", "z/d.png")):
+            self._at(name, 1000 + 100 * index)
+        record = await self._listed()
+        old_folders = record.folders
+        for name, mtime in (
+            ("x/y/n1.png", 1150),
+            ("new/deep/n2.png", 1250),
+            ("n3.png", 50),
+            ("x/n4.webp", 9000),
+        ):
+            make_png(self.output_dir / name.replace(".webp", ".png"))
+            if name.endswith(".webp"):
+                os.replace(self.output_dir / "x" / "n4.png", self.output_dir / name)
+            os.utime(self.output_dir / name, (mtime, mtime))
+            self.api.output_settled(os.path.realpath(self.output_dir / name))
+        await self._settle()
+        self.assertEqual(self.scan.calls, 1)
+        walked = self._walked()
+        self.assertEqual(record.files, walked)
+        self.assertEqual(
+            [str(path) for path, _ in record.files], [str(path) for path, _ in walked]
+        )
+        expected = gallery_listing.folder_sets(self.output_dir, walked)
+        self.assertEqual((record.folders, record.folders_with_ancestors), expected)
+        self.assertIsNot(record.folders, old_folders)
+        _, data = await self._json("GET", "/prompt_manager/gallery/subfolders")
+        self.assertIn(os.path.join("new", "deep"), data["subfolders"])
+
+    async def test_a_rewritten_output_moves_to_its_new_place(self):
+        self._at("a.png", 1000)
+        self._at("b.png", 2000)
+        record = await self._listed()
+        self.api.output_settled(self._at("a.png", 3000))
+        await self._settle()
+        self.assertEqual(self.scan.calls, 1)
+        self.assertEqual(record.files, self._walked())
+        self.assertEqual([path.name for path, _ in record.files], ["a.png", "b.png"])
+
+    async def test_a_repeated_report_changes_nothing(self):
+        self._at("a.png", 1000)
+        path = self._at("b.png", 2000)
+        record = await self._listed()
+        self.api.output_settled(path)
+        await self._settle()
+        files, patched = record.files, record.patched
+        with patch.object(self.api, "_schedule_workspace_warm") as warm:
+            self.api.output_settled(path)
+            await self._settle()
+        warm.assert_not_called()
+        self.assertIs(record.files, files)
+        self.assertEqual((record.patched, self.scan.calls), (patched, 1))
+
+    async def test_the_next_full_walk_keeps_the_patched_listing(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        self.api.output_settled(self._at("sub/b.png", 2000))
+        await self._settle()
+        patched = record.files
+        self._age()
+        with patch.object(self.api, "_schedule_workspace_warm") as warm:
+            await self._json("GET", self.URL)  # the 30 s rule walks behind
+            await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+        self.assertIs(record.files, patched)  # equal: the walk kept it
+        self.assertEqual(record.patched, 0)
+        warm.assert_not_called()
+
+    async def test_the_walks_filters_apply_to_an_add(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        files = record.files
+        deep = os.path.join(*[f"d{i}" for i in range(images_module.MAX_SCAN_DEPTH + 1)])
+        skipped = [
+            self._at(".png", 2000),  # no suffix, as Path.suffix on 3.10-3.13
+            self._at("notes.txt", 2000),
+            self._at(os.path.join("thumbnails", "t.png"), 2000),
+            self._at(os.path.join("x", "thumbnails", "t.png"), 2000),
+            self._at(os.path.join(deep, "too-deep.png"), 2000),
+        ]
+        for path in skipped:
+            self.api.output_settled(path)
+        await self._settle()
+        self.assertIs(record.files, files)
+        self.assertEqual(record.files, self._walked())
+        self._no_walk_pending(record)
+        self.assertEqual(self.scan.calls, 1)
+        # The deepest listed folder and a "..png" name are listed by a walk.
+        deepest = os.path.join(*[f"d{i}" for i in range(images_module.MAX_SCAN_DEPTH)])
+        for path in (
+            self._at("..png", 3000),
+            self._at(os.path.join(deepest, "deepest.png"), 4000),
+        ):
+            self.api.output_settled(path)
+        await self._settle()
+        self.assertEqual(record.files, self._walked())
+        self.assertEqual(len(record.files), 3)
+        self.assertEqual(self.scan.calls, 1)
+
+    async def test_a_symlinked_output_is_not_added(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        target = make_png(self.comfy_dir / "elsewhere.png")
+        link = self.output_dir / "link.png"
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available")
+        files = record.files
+        self.api.output_settled(str(link))  # as an unresolved report would name it
+        await self._settle()
+        self.assertIs(record.files, files)
+        self.assertEqual(record.files, self._walked())
+        self._no_walk_pending(record)
+
+    async def _assert_walks_instead(self, record, report):
+        self._interval(0)
+        self.api.output_settled(report)
+        await self._settle()
+        self.assertEqual(self.scan.calls, 2)
+        self.assertEqual(record.patched, 0)
+        self.assertEqual(record.files, self._walked())
+
+    async def test_a_tie_in_mtime_walks_instead(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        await self._assert_walks_instead(record, self._at("b.png", 1000))
+
+    async def test_a_report_that_cannot_be_read_walks_instead(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        gone = self._at("gone.png", 2000)
+        os.unlink(gone)
+        await self._assert_walks_instead(record, gone)
+
+    async def test_a_listing_at_the_cap_walks_instead(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        with patch.object(images_module, "MAX_GALLERY_FILES", 1):
+            self._interval(0)
+            self.api.output_settled(self._at("b.png", 2000))
+            await self._settle()
+        self.assertEqual((self.scan.calls, record.patched), (2, 0))
+        self.assertEqual(len(record.files), 1)  # the walk is capped too
+
+    async def test_a_path_that_cannot_be_sliced_walks_instead(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        self._at("b.png", 2000)
+        report = os.path.join(os.path.realpath(self.output_dir), ".", "b.png")
+        await self._assert_walks_instead(record, report)
+
+    async def test_an_on_disk_spelling_mismatch_walks_instead(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        report = self._at("b.png", 2000)
+        with patch.object(images_module, "_on_disk_path", return_value="/x/B.png"):
+            await self._assert_walks_instead(record, report)
+
+    async def test_an_unexpected_add_failure_walks_instead(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        report = self._at("b.png", 2000)
+        with patch.object(images_module, "_patch_listing", side_effect=ValueError):
+            with self.assertLogs(self.api.logger, "WARNING"):
+                await self._assert_walks_instead(record, report)
+        self.assertIsNone(record.add_task)
+
+    async def test_a_report_during_a_walk_gets_the_trailing_walk(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        self._interval(0)
+        self._age()
+        gate = self.scan.hold_next()
+        await self._json("GET", self.URL)
+        await self.scan.wait_entered()  # listed already: misses b.png
+        self.api.output_settled(self._at("b.png", 2000))
+        self.assertTrue(record.dirty)
+        self.assertEqual(record.pending_adds, [])
+        gate.set()
+        await self._settle()
+        self.assertEqual(self.scan.calls, 3)
+        self.assertEqual(record.files, self._walked())
+
+    async def test_a_walk_started_during_an_add_lists_it_and_the_add_is_dropped(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        files = record.files
+        entered, gate, _ = self._hold_adds()
+        self.api.output_settled(self._at("b.png", 2000))
+        await self._entered(entered)
+        walk = self.scan.hold_next()
+        rescan = asyncio.ensure_future(
+            self._json("POST", "/prompt_manager/gallery/rescan")
+        )
+        await self.scan.wait_entered()
+        add = record.add_task
+        gate.set()
+        await asyncio.wait_for(asyncio.shield(add), _HANG_LIMIT)
+        # The add ended while the Rescan walk runs: not stored over it.
+        self.assertIs(record.files, files)
+        self.assertEqual(record.patched, 0)
+        walk.set()
+        status, data = await rescan
+        await self._settle()
+        self.assertEqual((status, data["total"]), (200, 2))
+        self.assertEqual(self.scan.calls, 2)
+        self.assertEqual(record.files, self._walked())
+        self._no_walk_pending(record)
+
+    async def test_a_roots_change_during_an_add_drops_it(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        entered, gate, _ = self._hold_adds()
+        self.api.output_settled(self._at("b.png", 2000))
+        await self._entered(entered)
+        self.api.reset_gallery_roots_cache()
+        gate.set()
+        await self._settle()
+        self.assertIsNone(record.files)
+        self.assertEqual((self.scan.calls, record.patched), (1, 0))
+        self._no_walk_pending(record)
+
+    async def test_an_invalidation_during_an_add_drops_it(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        entered, gate, batches = self._hold_adds()
+        self.api.output_settled(self._at("b.png", 2000))
+        await self._entered(entered)
+        self.api.output_settled(self._at("c.png", 3000))  # waits for the batch
+        self.api.invalidate_gallery_cache()
+        gate.set()
+        await self._settle()
+        self.assertEqual(len(batches), 1)  # the dropped listing gets no second
+        self.assertIsNone(record.files)  # the next read walks
+        self.assertEqual((self.scan.calls, record.patched), (1, 0))
+        self._no_walk_pending(record)
+        _, data = await self._json("GET", self.URL)
+        self.assertEqual((data["total"], self.scan.calls), (3, 2))
+
+    async def test_an_add_failing_after_a_drop_walks_nothing(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+
+        def drop_then_fail(*_args):
+            self.api.invalidate_gallery_cache()  # a settings save, off the loop
+            raise ValueError("boom")
+
+        with patch.object(images_module, "_patch_listing", drop_then_fail):
+            with self.assertLogs(self.api.logger, "WARNING"):
+                self.api.output_settled(self._at("b.png", 2000))
+                await self._settle()
+        self.assertIsNone(record.files)
+        self.assertEqual(self.scan.calls, 1)
+        self._no_walk_pending(record)
+
+    async def test_cleanup_during_an_add_cancels_it(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        files = record.files
+        entered, gate, _ = self._hold_adds()
+        self.api.output_settled(self._at("b.png", 2000))
+        await self._entered(entered)
+        self.api.output_settled(self._at("c.png", 3000))
+        cleanup = asyncio.ensure_future(
+            self.api.cleanup_gallery_listings(web.Application())
+        )
+        await asyncio.sleep(0)
+        gate.set()
+        await asyncio.wait_for(cleanup, _HANG_LIMIT)
+        self.assertIs(record.files, files)
+        self.assertIsNone(record.add_task)
+        self.assertEqual(self.api._listing_tasks, set())
+        self._no_walk_pending(record)
+
+    async def test_a_removed_root_gets_no_add(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        self.api.reset_gallery_roots_cache()
+        self.api.output_settled(self._at("b.png", 2000))
+        await self._settle()
+        self.assertIsNone(record.files)
+        self.assertEqual(self.api._listing_tasks, set())
+        self.assertEqual(self.scan.calls, 1)
+
+    async def test_a_burst_is_added_in_batches_with_one_warm_build_each(self):
+        self._at("a.png", 1000)
+        await self.api.warm_gallery_listings(web.Application())
+        await self._settle()
+        record = self._record()
+        entered, gate, batches = self._hold_adds()
+        built = []
+        real = self.api._build_workspace_caches
+
+        def build(listings):
+            built.append(len(listings[0][2]))
+            real(listings)
+
+        with patch.object(self.api, "_build_workspace_caches", side_effect=build):
+            self.api.output_settled(self._at("b.png", 2000))
+            await self._entered(entered)
+            for index in range(4):  # land while the first batch is placed
+                self.api.output_settled(self._at(f"c{index}.png", 3000 + index))
+            gate.set()
+            await self._settle()
+        self.assertEqual([len(batch) for batch in batches], [1, 4])
+        self.assertEqual(self.scan.calls, 1)
+        self.assertEqual(record.patched, 2)
+        self.assertEqual(record.files, self._walked())
+        self.assertEqual(built[-1], 6)
+        self.assertLessEqual(len(built), 2)
+        self.assertTrue(self._workspace_ready())
+
+    async def _workspace_pages(self, **params):
+        """Every workspace order's full first page, as file names."""
+        pages = {}
+        for order in images_module.WORKSPACE_ORDERS:
+            query = "&".join(f"{k}={v}" for k, v in {"order": order, **params}.items())
+            _, data = await self._json(
+                "GET", f"{self.URL}?mode=workspace&limit=100&{query}"
+            )
+            pages[order] = [image["filename"] for image in data["images"]]
+        return pages
+
+    def _drop_workspace_caches(self):
+        self.api._workspace_listed_cache = {}
+        self.api._workspace_order_cache = {}
+        self.api._workspace_card_cache = {}
+        self.api._favorite_listing_cache = {}
+
+    async def test_workspace_pages_after_adds_match_a_cold_rebuild(self):
+        for index, name in enumerate(("a.png", "x/b.png", "x/c.mp4", "d.png")):
+            path = self.output_dir / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b"x")
+            os.utime(path, (1000 + index, 1000 + index))
+        await self._warmed()
+        for name in ("x/b.png", "d.png"):
+            status, _ = await self._json(
+                "PUT",
+                "/prompt_manager/images/favorite",
+                json={"root_index": 0, "path": name},
+            )
+            self.assertEqual(status, 200)
+        await self._workspace_pages()
+        await self._workspace_pages(favorites=1)
+        self.api.output_settled(self._at("y/new.png", 5000))  # a new folder
+        self.api.output_settled(self._at("x/b.png", 6000))  # rewritten favorite
+        await self._settle()
+        self.assertEqual(self.scan.calls, 1)
+        patched = (
+            await self._workspace_pages(),
+            await self._workspace_pages(favorites=1),
+        )
+        self._drop_workspace_caches()
+        cold = (await self._workspace_pages(), await self._workspace_pages(favorites=1))
+        self.assertEqual(patched, cold)
+        self.assertEqual(patched[0]["newest"][:2], ["b.png", "new.png"])
+        self.assertEqual(sorted(patched[1]["newest"]), ["b.png", "d.png"])
+
+    async def test_a_warm_build_after_an_add_builds_only_the_added_values(self):
+        for index in range(300):
+            path = self.output_dir / f"f{index:03d}.png"
+            path.write_bytes(b"x")
+            os.utime(path, (1000 + index, 1000 + index))
+        await self._warmed()
+        record = self._record()
+        listed, keys = [], []
+        real_listed, real_key = images_module._listed, images_module._newest_key
+
+        def counted_listed(*args):
+            listed.append(args[0].name)
+            return real_listed(*args)
+
+        def counted_key(entry):
+            keys.append(entry)
+            return real_key(entry)
+
+        with (
+            patch.object(images_module, "_listed", counted_listed),
+            patch.object(images_module, "_newest_key", counted_key),
+            patch.object(
+                images_module,
+                "_favorite_relative_key",
+                wraps=images_module._favorite_relative_key,
+            ) as favorite_keys,
+        ):
+            self.api.output_settled(self._at("new.png", 9000))
+            await self._settle()
+        self.assertEqual(self.scan.calls, 1)
+        self.assertTrue(self._workspace_ready())
+        self.assertEqual(listed, ["new.png"])
+        self.assertLess(len(keys), 20)  # bisection, not a sort of 301 files
+        self.assertLess(favorite_keys.call_count, 10)  # not one per file
+        self.assertEqual(
+            self.api._workspace_order([(0, self.output_dir, record.files)], "newest")[
+                0
+            ].path.name,
+            "new.png",
+        )
+
+    async def test_a_rewritten_output_drops_its_old_card_facts(self):
+        self._at("a.png", 1000)
+        self._at("b.png", 2000)
+        await self._warmed()
+        await self._json("GET", f"{self.URL}?mode=workspace&limit=10")
+        key = (0, str(self.output_dir))
+        before = set(self.api._workspace_card_cache.get(key, {}))
+        self.assertIn(Path(self._at("a.png", 1000)).name, {p.name for p, _ in before})
+        self.api.output_settled(self._at("a.png", 3000))
+        await self._settle()
+        after = self.api._workspace_card_cache.get(key, {})
+        self.assertNotIn((self.output_dir / "a.png", 1000.0), after)
+        self.assertIn((self.output_dir / "b.png", 2000.0), after)
+
+    def _synthetic(self, root, count, start=1000.0):
+        return [(root / f"f{i:04d}.png", start + i) for i in range(count)][::-1]
+
+    def test_the_newest_order_sorts_again_when_it_missed_a_step(self):
+        root = self.output_dir
+        files = self._synthetic(root, 50)
+        listings = [(0, root, files)]
+        self.api._workspace_orders(listings)
+        one = gallery_listing.insert_entry(files, (root / "n1.png", 5000.0), 100)
+        self.api._workspace_listed(0, root, one)  # values follow, the order not
+        two = gallery_listing.insert_entry(one, (root / "n2.png", 6000.0), 100)
+        newest = self.api._workspace_orders([(0, root, two)])["newest"]
+        self.assertEqual([entry.path for entry in newest], [p for p, _m in two])
+
+    def test_the_newest_order_follows_one_changed_root_of_two(self):
+        first, second = self.output_dir, self.comfy_dir / "second"
+        files = self._synthetic(first, 30)
+        others = self._synthetic(second, 30, start=1000.5)
+        self.api._workspace_orders([(0, first, files), (1, second, others)])
+        patched = gallery_listing.insert_entry(others, (second / "n.png", 1010.25), 100)
+        with patch.object(
+            images_module, "_newest_key", wraps=images_module._newest_key
+        ) as keys:
+            newest = self.api._workspace_orders(
+                [(0, first, files), (1, second, patched)]
+            )["newest"]
+        self.assertLess(keys.call_count, 20)
+        expected = sorted(
+            [(p, m, 0) for p, m in files] + [(p, m, 1) for p, m in patched],
+            key=lambda item: -item[1],
+        )
+        self.assertEqual(
+            [entry.path for entry in newest], [path for path, _m, _i in expected]
+        )
+
+    def test_the_on_disk_spelling_is_read_where_names_fold_case(self):
+        read = images_module._on_disk_path
+        self.assertIsNone(read(__file__, platform="linux"))
+        fake_fcntl = MagicMock(F_GETPATH=50)
+        fake_fcntl.fcntl.return_value = b"/Out/Sub/A.png" + bytes(10)
+        fake_nt = MagicMock()
+        fake_nt._getfinalpathname.return_value = "\\\\?\\C:\\Out\\A.png"
+        with patch.dict(sys.modules, {"fcntl": fake_fcntl, "nt": fake_nt}):
+            self.assertEqual(read(__file__, platform="darwin"), "/Out/Sub/A.png")
+            self.assertEqual(read(__file__, platform="win32"), "\\\\?\\C:\\Out\\A.png")
+        self.assertEqual(fake_fcntl.fcntl.call_args.args[1], 50)
+        fake_nt._getfinalpathname.assert_called_once_with(__file__)
+
+    def test_a_fifo_named_like_an_image_never_blocks_the_spelling_read(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs here")
+        fifo = self.output_dir / "pipe.png"
+        os.mkfifo(fifo)
+        fake = MagicMock(F_GETPATH=50)
+        fake.fcntl.return_value = os.fsencode(str(fifo))
+        done = []
+
+        def read():
+            with patch.dict(sys.modules, {"fcntl": fake}):
+                done.append(images_module._on_disk_path(fifo, platform="darwin"))
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        reader.join(_HANG_LIMIT)
+        if reader.is_alive():
+            # Unblock the open so the thread ends, then fail.
+            with open(fifo, "wb"):
+                pass
+            self.fail("opening the FIFO blocked")
+        self.assertEqual(done, [str(fifo)])
+
+    async def test_a_folder_the_walk_cannot_list_gets_no_add(self):
+        if os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0:
+            self.skipTest("needs POSIX permissions and a non-root user")
+        self._at("a.png", 1000)
+        record = await self._listed()
+        report = self._at(os.path.join("locked", "b.png"), 2000)
+        locked = self.output_dir / "locked"
+        os.chmod(locked, 0o300)  # enter but not list
+        try:
+            self.assertEqual(self._walked(), record.files)  # the walk skips it
+            files = record.files
+            self.api.output_settled(report)
+            await self._settle()
+        finally:
+            os.chmod(locked, 0o700)
+        self.assertIs(record.files, files)
+        self._no_walk_pending(record)
+
+    async def test_a_folder_named_like_an_image_is_not_added(self):
+        self._at("a.png", 1000)
+        record = await self._listed()
+        folder = self.output_dir / "folder.png"
+        folder.mkdir()
+        files = record.files
+        self.api.output_settled(os.path.realpath(folder))
+        await self._settle()
+        self.assertIs(record.files, files)
+        self._no_walk_pending(record)
+
+    async def test_the_filters_read_the_stored_spelling(self):
+        # Reported as thumbnails/, stored as Thumbnails/: a walk lists it, so
+        # the add must not skip it as a preview folder; the spelling differs,
+        # so the root is walked.
+        self._at("a.png", 1000)
+        record = await self._listed()
+        report = self._at(os.path.join("thumbnails", "t.png"), 2000)
+        stored = os.path.join(str(self.output_dir), "Thumbnails", "t.png")
+        with patch.object(images_module, "_on_disk_path", return_value=stored):
+            await self._assert_walks_instead(record, report)
+
+    def test_a_stale_read_racing_a_newer_build_sorts_in_full(self):
+        root = self.output_dir
+        f0 = self._synthetic(root, 50)
+        f1 = gallery_listing.insert_entry(f0, (root / "n1.png", 5000.0), 100)
+        f2 = gallery_listing.insert_entry(f1, (root / "n2.png", 6000.0), 100)
+        self.api._workspace_orders([(0, root, f0)])
+        key = (0, str(root))
+        built_from_f0 = self.api._workspace_listed_cache[key]
+        real = self.api._workspace_listed
+        armed = [True]
+
+        def listed(index, part_root, files):
+            values = real(index, part_root, files)
+            if armed[0] and files is f1:
+                armed[0] = False
+                # Another executor thread read the f0 values before this one
+                # stored f1's, and stores its f2 step (from f0) only now.
+                self.api._workspace_listed_cache[key] = built_from_f0
+                real(index, part_root, f2)
+            return values
+
+        with patch.object(self.api, "_workspace_listed", side_effect=listed):
+            stale = self.api._workspace_orders([(0, root, f1)])["newest"]
+        self.assertEqual([entry.path for entry in stale], [p for p, _m in f1])
+        for files in (f1, f2, f1, f2):
+            newest = self.api._workspace_orders([(0, root, files)])["newest"]
+            self.assertEqual([entry.path for entry in newest], [p for p, _m in files])
+
+    def test_a_roots_change_during_an_order_build_sorts_in_full(self):
+        root = self.output_dir
+        f0 = self._synthetic(root, 20)
+        f1 = gallery_listing.insert_entry(f0, (root / "n1.png", 5000.0), 100)
+        self.api._workspace_orders([(0, root, f0)])
+        real = self.api._workspace_listed
+
+        def listed(index, part_root, files):
+            values = real(index, part_root, files)
+            # A roots reset in another thread, between this call's two cache
+            # reads: the per-file values are gone, the order not yet.
+            self.api._workspace_listed_cache = {}
+            return values
+
+        with patch.object(self.api, "_workspace_listed", side_effect=listed):
+            newest = self.api._workspace_orders([(0, root, f1)])["newest"]
+        self.assertEqual([entry.path for entry in newest], [p for p, _m in f1])
+
+    def test_the_favorite_listing_step_rebuilds_when_it_cannot_follow(self):
+        root = self.output_dir
+        listing = {"a.png": "a.png"}
+        step = images_module._favorite_listing_step
+        self.assertEqual(
+            step(root, listing, [(root / "b.png", 2.0)], []),
+            {"a.png": "a.png", "b.png": "b.png"},
+        )
+        self.assertEqual(listing, {"a.png": "a.png"})  # never changed in place
+        # A removed file not added again, or a key another spelling holds.
+        self.assertIsNone(step(root, listing, [], [(root / "a.png", 1.0)]))
+        with patch.object(
+            images_module, "_favorite_relative_key", side_effect=str.lower
+        ):
+            self.assertIsNone(step(root, listing, [(root / "A.png", 2.0)], []))
+
+    async def test_monitor_walks_during_a_workspace_build_add_one_more_build(self):
+        make_png(self.output_dir / "a.png")
+        release, entered = threading.Event(), threading.Event()
+        built = []
+        real = self.api._build_workspace_caches
+
+        def build(listings):
+            built.append(len(listings[0][2]))
+            if len(built) == 1:
+                entered.set()
+                release.wait(_HANG_LIMIT)
+            real(listings)
+
+        self.addCleanup(release.set)
+        self._interval(0)
+        with patch.object(self.api, "_build_workspace_caches", side_effect=build):
+            await self.api.warm_gallery_listings(web.Application())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, entered.wait, _HANG_LIMIT)
+            for name in ("b.png", "c.png", "d.png"):  # three monitor walks
+                self.api.mark_root_dirty(self._output(name))
+                while self.api._listing_tasks:
+                    await asyncio.gather(*list(self.api._listing_tasks))
+                    await asyncio.sleep(0)
+            release.set()
+            await self._settle()
+        self.assertEqual(built, [1, 4])
+        self.assertEqual(self.scan.calls, 4)
+        self.assertTrue(self._workspace_ready())
+
+
+class TestGalleryListingHostHooks(unittest.IsolatedAsyncioTestCase):
+    async def test_root_registers_the_warm_up_and_its_cleanup(self):
+        try:
+            from test_init_package import fake_server_module, load_package
+        except ImportError:
+            from tests.test_init_package import fake_server_module, load_package
+
+        with tempfile.TemporaryDirectory() as directory:
+            server = fake_server_module()
+            server.PromptServer.instance.app = web.Application()
+            with load_package(
+                "gallery_listing_hooks_pkg",
+                str(Path(directory) / "db.sqlite"),
+                directory,
+                server,
+            ) as (package, host):
+                self.assertIn(package.api.warm_gallery_listings, host.app.on_startup)
+                self.assertIn(package.api.cleanup_gallery_listings, host.app.on_cleanup)
+
+    async def test_root_connects_the_monitor_to_the_listing(self):
+        try:
+            from test_init_package import fake_server_module, load_package
+        except ImportError:
+            from tests.test_init_package import fake_server_module, load_package
+
+        with tempfile.TemporaryDirectory() as directory:
+            server = fake_server_module()
+            server.PromptServer.instance.app = web.Application()
+            with load_package(
+                "gallery_listing_monitor_pkg",
+                str(Path(directory) / "db.sqlite"),
+                directory,
+                server,
+            ) as (package, host):
+                monitor = package._global_image_monitor
+                self.assertEqual(
+                    monitor.output_listener, package.api.notify_output_settled
+                )
+                # The first cleanup hook stops the monitor's hand-offs.
+                await host.app.on_cleanup[0](host.app)
+                self.assertIsNone(monitor.output_listener)

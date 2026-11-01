@@ -1,5 +1,7 @@
 import {startCoverage,saveCoverage} from '../../tools/vendor/browser-coverage.mjs';
-import {test,expect} from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import {test,expect} from './fixtures.mjs';
+import {armUnseenRestores,unseenRestore} from './unseen-restore.mjs';
+import {saveImageTags} from './concept-inventory.mjs';
 import {readFile,writeFile} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 
@@ -9,19 +11,20 @@ const dialog=page=>page.getByRole('dialog',{name:'Recorded run',exact:true});
 const saved=page=>page.getByRole('region',{name:'Saved prompt texts',exact:true});
 const gallery=page=>page.getByRole('region',{name:'Shared gallery',exact:true});
 const open=async(page,id)=>{await page.goto(`/prompt_manager/workspace#/library/${id}`);await expect(recorded(page)).toBeVisible();};
-// A history opens on its first negative variant, as in the concept; these contracts start from the whole shared gallery.
-const showAllImages=async page=>{const all=page.getByRole('button',{name:'All images for this positive',exact:true});await all.click();await expect(all).toHaveAttribute('aria-pressed','true');};
+// A history opens on its first negative variant, as in the concept; these contracts start from the lane that links the
+// fixture image (#249 D26: All images for this positive is a dialog now, not a gallery filter).
+const showLinkedImage=async page=>{const dot=page.getByRole('button',{name:'Select negative Saved exact negative',exact:true});await dot.click();await expect(dot).toHaveAttribute('aria-pressed','true');};
 const marker=(page,id,anchor='10')=>recorded(page).locator(`button[data-run-id="${id}"][data-anchor-id="${anchor}"]`);
 const exact=async locator=>locator.evaluate(node=>node.textContent);
 
 test.beforeEach(async({page,request,browserName})=>{
-    await startCoverage(page,browserName);page.historyErrors=[];page.on('pageerror',error=>page.historyErrors.push(error.message));
+    await startCoverage(page,browserName);await armUnseenRestores(page);page.historyErrors=[];page.on('pageerror',error=>page.historyErrors.push(error.message));
     const reset=await request.post('/__test__/reset',{data:{chronological_history:true}});await expect(reset).toBeOK();page.fixture=await reset.json();
 });
 test.afterEach(async({page,browserName})=>{await saveCoverage(page,browserName);expect(page.historyErrors).toEqual([]);});
 
 const command=async(request,data)=>{const response=await request.post('/__test__/history/commands',{data});await expect(response).toBeOK();return response.json();};
-const restoreSnapshot=async(request,bytes)=>{const response=await request.post('/prompt_manager/restore',{multipart:{database_file:{name:'history.db',mimeType:'application/octet-stream',buffer:bytes}}});await expect(response).toBeOK();expect((await response.json()).success).toBe(true);};
+const restoreSnapshot=async(page,request,bytes)=>{const response=await unseenRestore(page,()=>request.post('/prompt_manager/restore',{multipart:{database_file:{name:'history.db',mimeType:'application/octet-stream',buffer:bytes}}}));await expect(response).toBeOK();expect((await response.json()).success).toBe(true);};
 const historyRead=async(request,id)=>{const response=await request.get(`/prompt_manager/library/${id}/history`);await expect(response).toBeOK();return response.json();};
 const frozenContexts=contexts=>contexts.map(({navigation,positive_prompt_id,negative_prompt_id,pair_id,...frozen})=>frozen);
 const immutableReceipts=items=>items.map(({current_candidate,...receipt})=>receipt);
@@ -61,7 +64,7 @@ for(const boundary of ['window','detail','candidate','inspection','media']) test
     await command(request,{action:'arm',boundary});const pending=request.get(target);
     try {
         await expect.poll(async()=> (await(await request.get('/__test__/history/checkpoint')).json()).entered).toBe(true);
-        await restoreSnapshot(request,bytes);
+        await restoreSnapshot(page,request,bytes);
     } finally {await command(request,{action:'release'});}
     const retired=await pending;expect(retired.status()).toBe(409);expect((await retired.json()).code).toBe('history-changed');
     for(const url of [`/prompt_manager/library/${f.detail_id}/history?limit=1&cursor=${encodeURIComponent(firstWindow.next_cursor)}`,`${base}?epoch=${epoch}`,`${base}/outputs?epoch=${epoch}`,`${base}/outputs?epoch=${epoch}&cursor=${encodeURIComponent(outputs.next_cursor)}`,media.url,media.thumbnail_url,media.inspection_url]) {
@@ -93,7 +96,7 @@ test('same-path replacement is current content and a during-inspection change is
 
 test('root reconfiguration rejects in-flight candidates and every old scope URL without changing receipts',async({page,request})=>{
     const f=page.fixture,window=await historyRead(request,f.detail_id),base=`/prompt_manager/history/runs/${f.runs.shared}`;
-    await open(page,f.detail_id);await showAllImages(page);await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);
+    await open(page,f.detail_id);await showLinkedImage(page);await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);
     const before=await(await request.get(`${base}/outputs?epoch=${window.history_epoch}`)).json(),media=before.items[0].current_candidate.media;
     await command(request,{action:'arm',boundary:'candidate'});const pending=request.get(`${base}/outputs?epoch=${window.history_epoch}`);
     try {
@@ -128,10 +131,10 @@ test('archive delete merge and prune preserve frozen evidence without repairing 
 });
 
 test('actual restore with reused numeric owner rejects stale history and offers explicit saved recovery',async({page,request})=>{
-    const f=page.fixture;await open(page,f.detail_id);const original=await exact(saved(page).getByRole('region',{name:'Positive prompt',exact:true}).locator('pre'));
-    const source=await request.get('/__test__/history/reused-snapshot');await expect(source).toBeOK();await restoreSnapshot(request,await source.body());
+    const f=page.fixture;await open(page,f.detail_id);const original=await exact(saved(page).getByRole('region',{name:'Positive prompt',exact:true}).locator('p.prompt-text'));
+    const source=await request.get('/__test__/history/reused-snapshot');await expect(source).toBeOK();await restoreSnapshot(page,request,await source.body());
     await marker(page,f.runs.shared).click();await expect(dialog(page)).toContainText('Recorded evidence changed');await page.keyboard.press('Escape');
-    await expect(page.locator('.library-parent-status')).toContainText('changed');expect(await exact(saved(page).getByRole('region',{name:'Positive prompt',exact:true}).locator('pre'))).toBe(original);
+    await expect(page.locator('.library-parent-status')).toContainText('changed');expect(await exact(saved(page).getByRole('region',{name:'Positive prompt',exact:true}).locator('p.prompt-text'))).toBe(original);
     await expect(recorded(page).getByRole('button',{name:'Reload recorded history',exact:true})).toBeVisible();
     await page.getByRole('button',{name:'Reload saved Library view',exact:true}).click();await expect(saved(page)).toContainText('Restored owner with reused numeric ID');
     expect((await request.get(`/prompt_manager/history/runs/${f.runs.shared}`)).status()).toBe(404);
@@ -141,12 +144,12 @@ for(const outcome of ['success','error'])test(`delayed actual old browser ${outc
     const f=page.fixture;await open(page,f.detail_id);const snapshot=await request.get('/__test__/history/snapshot');const bytes=await snapshot.body();
     let entered,release;const started=new Promise(resolve=>{entered=resolve;}),held=new Promise(resolve=>{release=resolve;});
     await page.route(new RegExp(`/history/runs/${f.runs.shared}\\?`),async route=>{
-        if(outcome==='error')await restoreSnapshot(request,bytes);
+        if(outcome==='error')await restoreSnapshot(page,request,bytes);
         const response=await route.fetch();expect(response.status()).toBe(outcome==='success'?200:409);entered();await held;
         await route.fulfill({response}).catch(()=>{});
     });
     try {
-        await marker(page,f.runs.shared).click();await started;if(outcome==='success')await restoreSnapshot(request,bytes);
+        await marker(page,f.runs.shared).click();await started;if(outcome==='success')await restoreSnapshot(page,request,bytes);
         await page.evaluate(()=>{location.hash='#/overview';});await expect(page.locator('#workspace-main h1')).toHaveText('Overview');release();
         await page.unroute(new RegExp(`/history/runs/${f.runs.shared}\\?`));await open(page,f.detail_id);
         await expect(recorded(page).locator('button[data-run-id]')).toHaveCount(0);
@@ -163,8 +166,8 @@ test('strict reset seeds real A,A,B positions, two contexts and independently se
     const fixture=page.fixture;let galleryReads=0;page.on('request',request=>{if(new URL(request.url()).pathname===`/prompt_manager/library/${fixture.positive_id}/images`)galleryReads++;});
     await open(page,fixture.positive_id);
     const detail=await(await request.get(`/prompt_manager/library/${fixture.positive_id}`)).json();
-    const selected=detail.variants.findIndex(v=>v.negative_text==='A negative')+1;
-    await page.getByRole('button',{name:`Select negative variant ${selected}`,exact:true}).click();
+    const selected=detail.variants.find(v=>v.negative_text==='A negative').title;
+    await page.getByRole('button',{name:`Select negative ${selected}`,exact:true}).click();
     await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);
     const before=galleryReads,keys=await gallery(page).locator('article[data-image-key]').evaluateAll(nodes=>nodes.map(n=>n.dataset.imageKey));
     await expect(recorded(page)).toContainText('3 distinct recorded runs as of this read');
@@ -182,7 +185,7 @@ test('strict reset seeds real A,A,B positions, two contexts and independently se
         await expect(marker(page,id)).toBeFocused();
     }
     await expect(saved(page).getByRole('region',{name:'Negative prompt',exact:true})).toContainText('A negative');
-    await expect(page.getByRole('button',{name:`Select negative variant ${selected}`,exact:true})).toHaveAttribute('aria-pressed','true');
+    await expect(page.getByRole('button',{name:`Select negative ${selected}`,exact:true})).toHaveAttribute('aria-pressed','true');
     expect(galleryReads).toBe(before);expect(await gallery(page).locator('article[data-image-key]').evaluateAll(nodes=>nodes.map(n=>n.dataset.imageKey))).toEqual(keys);
 });
 
@@ -199,18 +202,20 @@ test('frozen exact roles distinguish unknown, explicit empty, whitespace, mode a
     const detail=await(await request.get(`/prompt_manager/history/runs/${f.runs.shared}?epoch=${window.history_epoch}`)).json();
     const chosen=detail.contexts.find(c=>c.anchor_id==='z');
     const pos=dialog(page).getByRole('region',{name:'Positive prompt',exact:true}),neg=dialog(page).getByRole('region',{name:'Negative prompt',exact:true});
-    expect(await exact(pos.locator('pre'))).toBe(chosen.positive.raw);expect(await exact(neg.locator('pre'))).toBe(chosen.negative.raw);
+    expect(await exact(pos.locator('p.prompt-text'))).toBe(chosen.positive.raw);expect(await exact(neg.locator('p.prompt-text'))).toBe(chosen.negative.raw);
     expect(await pos.evaluate(node=>node.nextElementSibling?.getAttribute('aria-label'))).toBe('Negative prompt');
-    await dialog(page).getByRole('button',{name:'Effective',exact:true}).click();expect(await exact(neg.locator('pre'))).toBe(chosen.negative.effective);
+    await dialog(page).getByRole('button',{name:'Effective',exact:true}).click();expect(await exact(neg.locator('p.prompt-text'))).toBe(chosen.negative.effective);
     await dialog(page).getByRole('button',{name:'Close recorded run',exact:true}).click();
     await marker(page,f.runs.unknown).click();await dialog(page).getByRole('button',{name:'Raw',exact:true}).click();
     const unknown=dialog(page).getByRole('region',{name:'Negative prompt',exact:true});await expect(unknown.getByRole('button')).toHaveCount(0);await expect(dialog(page).getByRole('button',{name:'Send prompt pair',exact:true})).toHaveCount(0);
-    await dialog(page).getByRole('button',{name:'Effective',exact:true}).click();expect(await exact(unknown.locator('pre'))).toBe('  \n\t ');await expect(unknown).toContainText('host_cache_output');
+    await dialog(page).getByRole('button',{name:'Effective',exact:true}).click();expect(await exact(unknown.locator('p.prompt-text'))).toBe('  \n\t ');
+    // D22: the frozen block has no source line; each field's source stays in "Frozen field provenance".
+    await expect(unknown).not.toContainText('host_cache_output');await expect(dialog(page).locator('.recorded-provenance')).toContainText(/Effective · \w+ · host_cache_output/);
     await dialog(page).getByRole('button',{name:'Close recorded run',exact:true}).click();
-    await marker(page,f.runs.empty).click();await expect(dialog(page).getByRole('region',{name:'Negative prompt',exact:true})).toContainText('Empty negative prompt');
+    await marker(page,f.runs.empty).click();await expect(dialog(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('p.prompt-text')).toHaveText('No negative prompt (explicitly empty)');
     await expect(dialog(page).getByRole('button',{name:'Copy negative prompt',exact:true})).toBeVisible();await expect(dialog(page).getByRole('button',{name:'Send prompt pair',exact:true})).toBeVisible();
     await dialog(page).getByRole('button',{name:'Close recorded run',exact:true}).click();
-    await marker(page,f.runs.whitespace).click();await dialog(page).getByRole('button',{name:'Raw',exact:true}).click();expect(await exact(dialog(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('pre'))).toBe('  \n\t ');
+    await marker(page,f.runs.whitespace).click();await dialog(page).getByRole('button',{name:'Raw',exact:true}).click();expect(await exact(dialog(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('p.prompt-text'))).toBe('  \n\t ');
     await expect(dialog(page)).toContainText('graph_literal');await expect(dialog(page)).toContainText('Role assignment: inferred');
     await dialog(page).getByText('Frozen field provenance',{exact:true}).click();await expect(dialog(page)).toContainText('Prepend');await expect(dialog(page)).toContainText('Append');await expect(dialog(page)).toContainText('graph_semantics');
     expect(shared.matching_anchors.map(a=>a.anchor_id)).toEqual(['10','2','z']);
@@ -226,6 +231,8 @@ test('every ordered receipt remains selected through distinct current locations,
     const loadedReads=outputReads;const view=receipts.nth(1).getByRole('button',{name:'View current file',exact:true});await view.click();
     const viewer=page.locator('dialog#viewer-dialog');await expect(viewer).toBeVisible();
     await expect(viewer).toContainText('1 of 2 loaded');await expect(viewer.getByRole('region',{name:'Negative prompt',exact:true})).not.toContainText('same visible negative');
+    // #532: the arrows work over the recorded run from the first moment.
+    await page.keyboard.press('ArrowRight');await expect(viewer).toContainText('2 of 2 loaded');await page.keyboard.press('ArrowLeft');await expect(viewer).toContainText('1 of 2 loaded');
     await viewer.getByRole('button',{name:'Next media',exact:true}).click();await expect(viewer).toContainText('2 of 2 loaded');
     await page.keyboard.press('Escape');await expect(viewer).toHaveCount(0);await expect(dialog(page)).toBeVisible();
     await expect(receipts.nth(2)).toHaveAttribute('aria-current','true');await expect(receipts.nth(2).getByRole('button',{name:'View current file',exact:true})).toBeFocused();
@@ -255,7 +262,7 @@ test('inspection first discovers a real restore and immediately retires every su
                 if(changed)window.recordedRecoveryStates.push({receipts:run.querySelectorAll('[data-receipt]').length,active:[...run.querySelectorAll('[data-send-role],[data-copy-role],[data-view-receipt]')].filter(node=>!node.disabled&&node.checkVisibility()).length});
             });observer.observe(run,{subtree:true,childList:true,attributes:true,characterData:true});
         });
-        await restoreSnapshot(request,await snapshot.body());
+        await restoreSnapshot(page,request,await snapshot.body());
     } finally {await command(request,{action:'release'});}
     const response=await inspectionRead;expect(response.status()).toBe(409);expect((await response.json()).code).toBe('history-changed');
     await expect(dialog(page).locator('.recorded-run-status')).toContainText('Recorded evidence changed');
@@ -280,7 +287,7 @@ test('active stale inspection echo reaches history ownership without a second me
 });
 
 test('unavailable exact receipt selection and targeted retry observe a newly available file without writes',async({page,request})=>{
-    const f=page.fixture;await open(page,f.detail_id);await page.getByRole('button',{name:'Select negative variant 1',exact:true}).click();
+    const f=page.fixture;await open(page,f.detail_id);await page.getByRole('button',{name:'Select negative Saved empty',exact:true}).click();
     const keys=await gallery(page).locator('article[data-image-key]').evaluateAll(nodes=>nodes.map(node=>node.dataset.imageKey));
     let writes=0,galleryReads=0,outputReads=0;
     page.on('request',request=>{const url=new URL(request.url());if(url.pathname.startsWith('/prompt_manager/')&&request.method()!=='GET')writes++;if(url.pathname.endsWith('/images'))galleryReads++;if(url.pathname.endsWith('/outputs'))outputReads++;});
@@ -299,7 +306,7 @@ test('unavailable exact receipt selection and targeted retry observe a newly ava
     await expect(dialog(page).locator('[data-receipt]')).toHaveCount(5);
     await missing.getByRole('button',{name:'View current file',exact:true}).click();await expect(page.locator('dialog#viewer-dialog')).toBeVisible();await page.keyboard.press('Escape');
     await expect(missing).toHaveAttribute('aria-current','true');await page.keyboard.press('Escape');
-    await expect(page.getByRole('button',{name:'Select negative variant 1',exact:true})).toHaveAttribute('aria-pressed','true');
+    await expect(page.getByRole('button',{name:'Select negative Saved empty',exact:true})).toHaveAttribute('aria-pressed','true');
     expect(await gallery(page).locator('article[data-image-key]').evaluateAll(nodes=>nodes.map(node=>node.dataset.imageKey))).toEqual(keys);expect(writes).toBe(0);
 });
 
@@ -312,6 +319,19 @@ test('marker labels disclose exact observed dequeue and outcome including times 
         expect(await button.getAttribute('title')).toBe(label);
         if(run.observed_dequeue_at==='9223372036854775807')expect(label).toContain('outside display range');
     }
+});
+
+// A timeline scroll re-renders the markers on the next frame. On a slow runner that frame lands between the press and
+// the release of a marker tap (Playwright's own scroll-into-view scrolls the timeline first); the re-render must leave
+// the pressed marker's nodes alone, or Chromium touch drops the click. The scroll event is dispatched so the marker
+// stays under the pointer, and the two frames are the re-render itself.
+test('a timeline re-render between press and release keeps the marker tap',async({page})=>{
+    const f=page.fixture;await open(page,f.detail_id);
+    const target=marker(page,f.runs.shared,'z');await expect(target).toHaveAttribute('aria-disabled','false');await target.scrollIntoViewIfNeeded();
+    const box=await target.boundingBox();await page.mouse.move(box.x+box.width/2,box.y+box.height/2);await page.mouse.down();
+    await recorded(page).locator('.history-timeline').evaluate(timeline=>{timeline.dispatchEvent(new Event('scroll'));return new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));});
+    await page.mouse.up();
+    await expect(dialog(page).locator('[data-receipt]')).toHaveCount(5);
 });
 
 test('same-epoch refresh retains recorded context mode and exact receipt after fresh candidate reads',async({page})=>{
@@ -378,7 +398,7 @@ for(const [width,height] of [[1600,1100],[390,844]])for(const theme of ['dark','
     await recorded(page).getByRole('button',{name:'View selected run',exact:true}).click();await expect(dialog(page)).toContainText(oldRun);await expect(dialog(page).getByRole('button',{name:'Effective',exact:true})).toHaveAttribute('aria-pressed','true');
     await reviewCapture(page,testInfo,`outside-selected-dialog-${width}-${theme}`,dialog(page));
     const hashes={};
-    for(const path of ['docs/concepts/workspace/index.html','docs/concepts/workspace/app.js','docs/concepts/workspace/style.css','database/history_reads.py','py/api/history.py','web/js/workspace/history-state.mjs','web/js/workspace/history-media.mjs','web/js/workspace/history.mjs','web/js/workspace/recorded-run.mjs','web/js/workspace/library.css'])hashes[path]=createHash('sha256').update(await readFile(new URL(`../../${path}`,import.meta.url))).digest('hex');
+    for(const path of ['docs/concepts/workspace/index.html','docs/concepts/workspace/app.js','docs/concepts/workspace/style.css','database/history_reads.py','py/api/history.py','web/js/workspace/history-state.mjs','web/js/workspace/history-media.mjs','web/js/workspace/history.mjs','web/js/workspace/recorded-run.mjs','web/js/workspace/workspace.css'])hashes[path]=createHash('sha256').update(await readFile(new URL(`../../${path}`,import.meta.url))).digest('hex');
     expect(hashes['docs/concepts/workspace/index.html']).toBe('d84712c7284bb232919a1ed9b154575c8ac574f63b2404a4ac4bc06cbf323c03');expect(hashes['docs/concepts/workspace/app.js']).toBe('e33e7652da12a68cd3fe31e94d77d680aa439b6434ceee94f21cc4ce8883263e');expect(hashes['docs/concepts/workspace/style.css']).toBe('2c479ca1a2ddbbd14a550eae27dd731c326ccdb91fe9ddc87e2b81cd5298fce8');
     const manifest=testInfo.outputPath('final-fix-visual-source-and-scroll.json');await writeFile(manifest,JSON.stringify({width,height,theme,oldRun,before,after,hashes},null,2));
     await testInfo.attach('final-fix-visual-source-and-scroll.json',{path:manifest,contentType:'application/json'});
@@ -397,7 +417,7 @@ test('history, run and output failures retry their own reads and route exit igno
     const f=page.fixture;let windowFailure=true,runFailure=true,outputFailure=true;
     await page.route(/\/library\/\d+\/history\?/,async route=>windowFailure?route.fulfill({status:503,json:{success:false}}):route.continue());
     await page.goto(`/prompt_manager/workspace#/library/${f.detail_id}`);await expect(recorded(page).getByRole('button',{name:'Retry recorded history',exact:true})).toBeVisible();
-    await showAllImages(page);await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);windowFailure=false;await recorded(page).getByRole('button',{name:'Retry recorded history',exact:true}).click();
+    await showLinkedImage(page);await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);windowFailure=false;await recorded(page).getByRole('button',{name:'Retry recorded history',exact:true}).click();
     await page.route(/\/history\/runs\/[^/]+\?/,async route=>runFailure?route.fulfill({status:503,json:{success:false}}):route.continue());
     await page.route(/\/history\/runs\/[^/]+\/outputs\?/,async route=>outputFailure?route.fulfill({status:503,json:{success:false}}):route.continue());
     await marker(page,f.runs.shared).click();await expect(dialog(page).getByRole('button',{name:'Retry run details',exact:true})).toBeVisible();runFailure=false;await dialog(page).getByRole('button',{name:'Retry run details',exact:true}).click();
@@ -447,10 +467,10 @@ test('frozen Effective pair uses the shared acknowledged sender and Escape close
     });
     try {
         await open(page,page.fixture.detail_id);await marker(page,page.fixture.runs.unknown).click();await dialog(page).getByRole('button',{name:'Effective',exact:true}).click();
-        const positive=await exact(dialog(page).getByRole('region',{name:'Positive prompt',exact:true}).locator('pre'));
+        const positive=await exact(dialog(page).getByRole('region',{name:'Positive prompt',exact:true}).locator('p.prompt-text'));
         const send=dialog(page).getByRole('button',{name:'Send prompt pair',exact:true});await send.click();
         const sender=page.getByRole('dialog',{name:'Send to ComfyUI',exact:true});await sender.getByRole('combobox',{name:'ComfyUI window',exact:true}).selectOption({label:'History ComfyUI'});
-        await sender.getByRole('combobox',{name:'Destination node',exact:true}).selectOption({label:'History destination'});await sender.getByRole('button',{name:'Preview changes',exact:true}).click();
+        await sender.getByRole('combobox',{name:'Destination node',exact:true}).selectOption({label:'#history-pair History destination'});await sender.getByRole('button',{name:'Preview changes',exact:true}).click();
         await expect(sender.getByRole('button',{name:'Apply to ComfyUI',exact:true})).toBeEnabled();await sender.getByRole('button',{name:'Apply to ComfyUI',exact:true}).click();await expect(sender).toContainText('Sent to ComfyUI.');
         expect(await host.evaluate(()=>window.historyApplied)).toEqual([{positive,negative:'  \n\t '}]);
         await page.keyboard.press('Escape');await expect(sender).toHaveCount(0);await expect(dialog(page)).toBeVisible();await expect(send).toBeFocused();
@@ -466,16 +486,91 @@ test('the inline current file names its prompts apart from the frozen run fields
     await open(page,page.fixture.detail_id);await marker(page,page.fixture.runs.shared).click();await expect(dialog(page).locator('[data-receipt]')).toHaveCount(5);
     await dialog(page).getByRole('button',{name:'Raw',exact:true}).click();
     const frozen=dialog(page).getByRole('region',{name:'Frozen run prompt texts',exact:true});
-    const before=await exact(frozen.getByRole('region',{name:'Positive prompt',exact:true}).locator('pre'));
+    const before=await exact(frozen.getByRole('region',{name:'Positive prompt',exact:true}).locator('p.prompt-text'));
     await dialog(page).locator('[data-receipt]').first().getByRole('button',{name:'View current file',exact:true}).click();
     await expect(page.locator('dialog#viewer-dialog')).toBeVisible();await page.keyboard.press('Escape');await expect(dialog(page)).toBeVisible();
     const current=dialog(page).getByRole('region',{name:'Current reported file',exact:true});await expect(current).toBeVisible();
-    await expect(current.getByRole('region',{name:'Current file positive prompt',exact:true}).locator('pre')).toHaveText('current file positive');
-    await expect(current.getByRole('region',{name:'Current file negative prompt',exact:true}).locator('pre')).toHaveText('current file negative');
-    await expect(current.getByRole('button',{name:'Copy current file positive prompt',exact:true})).toBeVisible();
+    await expect(current.getByRole('region',{name:'Current file positive prompt',exact:true}).locator('p.prompt-text')).toHaveText('current file positive');
+    await expect(current.getByRole('region',{name:'Current file negative prompt',exact:true}).locator('p.prompt-text')).toHaveText('current file negative');
+    await expect(current.getByRole('button',{name:/^Copy current file positive prompt: /})).toBeVisible();
     for(const role of ['Positive','Negative'])await expect(dialog(page).getByRole('region',{name:`${role} prompt`,exact:true})).toHaveCount(1);
     await expect(current.getByRole('region',{name:/^(Positive|Negative) prompt$/})).toHaveCount(0);
-    expect(await exact(dialog(page).getByRole('region',{name:'Positive prompt',exact:true}).locator('pre'))).toBe(before);
+    expect(await exact(dialog(page).getByRole('region',{name:'Positive prompt',exact:true}).locator('p.prompt-text'))).toBe(before);
+});
+
+// #449 (D154), #457: History's inline current file draws the file's own image tags in the shared labelled section, named
+// with its context so they stay apart from the frozen run's fields. The tags are saved on the real file through the Tag
+// routes and come from History's own current-file read (its `image_tags` facet), as Images reads them.
+test('the inline current file labels its image tags after its negative prompt',async({page,request})=>{
+    const reads=[];
+    await page.route(url=>url.pathname.endsWith('/inspection'),async route=>{const response=await route.fetch();const body=await response.json();
+        reads.push(body.image_tags);
+        body.prompts={positive:{status:'resolved',text:'current file positive',source:'graph-inferred'},negative:{status:'resolved',text:'current file negative',source:'graph-inferred'}};
+        await route.fulfill({response,json:body});});
+    const current=dialog(page).getByRole('region',{name:'Current reported file',exact:true});
+    const tags=current.getByRole('region',{name:'Current file image tags',exact:true});
+    const showCurrent=async()=>{
+        await open(page,page.fixture.detail_id);await marker(page,page.fixture.runs.shared).click();await expect(dialog(page).locator('[data-receipt]')).toHaveCount(5);
+        await dialog(page).getByRole('button',{name:'Raw',exact:true}).click();
+        await dialog(page).locator('[data-receipt]').first().getByRole('button',{name:'View current file',exact:true}).click();
+        await expect(page.locator('dialog#viewer-dialog')).toBeVisible();await page.keyboard.press('Escape');await expect(dialog(page)).toBeVisible();
+        await expect(current.getByRole('region',{name:'Current file negative prompt',exact:true})).toBeVisible();
+    };
+    // An untagged file draws no image tags section.
+    await showCurrent();await expect(tags).toHaveCount(0);expect(reads.at(-1)).toEqual({state:'none',tags:[]});
+    await dialog(page).getByRole('button',{name:'Close recorded run',exact:true}).click();
+    expect(await saveImageTags(request,'history/current.png',['history_tag','dusk'])).toEqual(['history_tag','dusk']);
+    await showCurrent();expect(reads.at(-1)).toEqual({state:'current',tags:['history_tag','dusk']});
+    await expect(tags.locator('.role-label')).toHaveText('Image tags · 2');await expect(tags.locator('.tags > .chip')).toHaveText(['history_tag','dusk']);
+    const negative=current.getByRole('region',{name:'Current file negative prompt',exact:true});
+    expect(await negative.evaluate((node,section)=>({after:Boolean(node.compareDocumentPosition(section)&Node.DOCUMENT_POSITION_FOLLOWING),inside:node.contains(section)}),await tags.elementHandle())).toEqual({after:true,inside:false});
+    // The viewer opened from History shares the inspection: the same section, plain chips (no Tags filter there, D88).
+    await dialog(page).locator('[data-receipt]').first().getByRole('button',{name:'View current file',exact:true}).click();
+    const viewerTags=page.locator('dialog#viewer-dialog #viewer-details section.tag-section.image-tags');
+    await expect(viewerTags.locator('.role-label')).toHaveText('Image tags · 2');
+    await expect(viewerTags.locator('span.chip')).toHaveText(['history_tag','dusk']);await expect(viewerTags.locator('button')).toHaveCount(0);
+    await page.keyboard.press('Escape');await expect(dialog(page)).toBeVisible();
+});
+
+// #332 CUJ 5 (MC8, §5.3): History's current-file inspector reads the file's own category with the Images key rule, so
+// the inline current file and its viewer show "Portraits · this image"; current.png has two saved links, so it inherits
+// nothing and shows no chip before.
+test('the current file shows its own category with its origin in the recorded run and its viewer',async({page,request})=>{
+    const chip=scope=>scope.locator('span.chip:has(> span.chip-source)');
+    const current=dialog(page).getByRole('region',{name:'Current reported file',exact:true});
+    const viewCurrent=async()=>{await dialog(page).locator('[data-receipt]').first().getByRole('button',{name:'View current file',exact:true}).click();
+        const details=page.locator('dialog#viewer-dialog #viewer-details');await expect(details.locator('.panel-heading')).toBeVisible();return details;};
+    await open(page,page.fixture.detail_id);await marker(page,page.fixture.runs.shared).click();await expect(dialog(page).locator('[data-receipt]')).toHaveCount(5);
+    let details=await viewCurrent();await expect(details.locator('.panel-heading h2')).toBeVisible();await expect(chip(details)).toHaveCount(0);
+    await page.keyboard.press('Escape');await expect(current).toBeVisible();await expect(chip(current)).toHaveCount(0);
+    await dialog(page).getByRole('button',{name:'Close recorded run',exact:true}).click();
+    const {images}=await(await request.get('/prompt_manager/images/output?mode=workspace&subfolder=history&limit=40')).json();
+    const file=images.find(image=>image.root_index===0&&image.path==='history/current.png');
+    const put=await request.put('/prompt_manager/images/category',{data:{items:[{root_index:0,root_scope:file.root_scope,path:file.path}],category:'Portraits'}});
+    await expect(put).toBeOK();expect((await put.json()).updated).toBe(1);
+    await open(page,page.fixture.detail_id);await marker(page,page.fixture.runs.shared).click();await expect(dialog(page).locator('[data-receipt]')).toHaveCount(5);
+    details=await viewCurrent();
+    await expect(chip(details)).toHaveText('Image category: Portraits · this image');
+    await page.keyboard.press('Escape');await expect(current).toBeVisible();
+    await expect(chip(current)).toHaveText('Image category: Portraits · this image');
+    expect(await chip(current).locator('.chip-source').evaluate(node=>node.textContent)).toBe(' · this image');
+});
+
+// LI-4 (D117): the recorded history's current-file viewer is the shared full inspector, so it copies the legacy summary.
+test('the current file viewer copies its settings summary',async({page})=>{
+    await page.addInitScript(()=>{window.__copied=[];Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>{window.__copied.push(text);}}});});
+    await page.route(url=>url.pathname.endsWith('/inspection'),async route=>{const response=await route.fetch();const body=await response.json();
+        body.prompts={positive:{status:'resolved',text:'current file positive',source:'graph-inferred'},negative:{status:'resolved',text:'current file negative',source:'graph-inferred'}};
+        await route.fulfill({response,json:body});});
+    await open(page,page.fixture.detail_id);await marker(page,page.fixture.runs.shared).click();await expect(dialog(page).locator('[data-receipt]')).toHaveCount(5);
+    await dialog(page).locator('[data-receipt]').first().getByRole('button',{name:'View current file',exact:true}).click();
+    const details=page.locator('dialog#viewer-dialog #viewer-details');await expect(details.locator('.panel-heading')).toBeVisible();
+    const facts=await details.locator(':scope > div > dl.meta-grid dd').allTextContents();
+    await details.getByRole('button',{name:'Copy settings summary',exact:true}).click();
+    await expect(page.locator('#workspace-toast')).toHaveText('Settings summary copied.');
+    const [seed,steps,cfg,sampler,,model]=facts;
+    expect(await page.evaluate(()=>window.__copied)).toEqual([[`Checkpoint: ${model}`,'Positive Prompt: current file positive','Negative Prompt: current file negative',
+        `Steps: ${steps}`,`CFG Scale: ${cfg}`,`Sampler: ${sampler}`,`Seed: ${seed}`].join('\n').replace(/: (Not recorded|Unresolved|Ambiguous|Unavailable within inspection limits)(?=\n|$)/g,': Unknown')]);
 });
 
 test('the recorded run dialog with a resolved current file has no duplicate button or region names',async({page})=>{
@@ -562,7 +657,7 @@ test('capture recovery reloads only reported outputs while retaining frozen run 
 });
 
 test('history epoch recovery reports saved-parent read failures and retries without resetting the gallery',async({page})=>{
-    const f=page.fixture;await open(page,f.detail_id);await showAllImages(page);await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);
+    const f=page.fixture;await open(page,f.detail_id);await showLinkedImage(page);await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);
     let parentFailure=true,galleryReads=0;page.on('request',request=>{if(new URL(request.url()).pathname===`/prompt_manager/library/${f.detail_id}/images`)galleryReads++;});
     await page.route(new RegExp(`/prompt_manager/library/${f.detail_id}(?:\\?|$)`),async route=>parentFailure?route.fulfill({status:503,json:{success:false,error:'Unavailable'}}):route.continue());
     await page.route(/\/history\/runs\/[^/]+\/outputs\?/,async route=>route.fulfill({status:409,json:{success:false,history_version:1,code:'history-changed',error:'History changed',recovery:{action:'refresh-history'}}}));
@@ -573,8 +668,8 @@ test('history epoch recovery reports saved-parent read failures and retries with
 });
 
 test('changed saved-owner identity is disclosed without silently relabeling or rebinding the existing gallery',async({page,request})=>{
-    const f=page.fixture;await open(page,f.detail_id);await showAllImages(page);await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);
-    const positive=saved(page).getByRole('region',{name:'Positive prompt',exact:true});const original=await exact(positive.locator('pre'));
+    const f=page.fixture;await open(page,f.detail_id);await showLinkedImage(page);await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);
+    const positive=saved(page).getByRole('region',{name:'Positive prompt',exact:true});const original=await exact(positive.locator('p.prompt-text'));
     const cards=gallery(page).locator('article[data-image-key]');await cards.first().evaluate(node=>{window.savedGalleryCard=node;});let galleryReads=0;
     page.on('request',request=>{if(new URL(request.url()).pathname===`/prompt_manager/library/${f.detail_id}/images`)galleryReads++;});
     const details=await(await request.get(`/prompt_manager/library/${f.detail_id}`)).json();
@@ -583,7 +678,7 @@ test('changed saved-owner identity is disclosed without silently relabeling or r
     await expect(await request.put(`/prompt_manager/prompts/${f.detail_id}`,{data:{text:'Replaced saved owner'}})).toBeOK();
     await page.route(/\/history\/runs\/[^/]+\/outputs\?/,async route=>route.fulfill({status:409,json:{success:false,history_version:1,code:'history-changed',error:'History changed',recovery:{action:'refresh-history'}}}));
     await marker(page,f.runs.shared).click();await expect(dialog(page)).toContainText('Recorded evidence changed');await dialog(page).getByRole('button',{name:'Close recorded run',exact:true}).click();
-    await expect(page.locator('.library-parent-status')).toContainText('changed');expect(await exact(positive.locator('pre'))).toBe(original);
+    await expect(page.locator('.library-parent-status')).toContainText('changed');expect(await exact(positive.locator('p.prompt-text'))).toBe(original);
     const reload=page.getByRole('button',{name:'Reload saved Library view',exact:true});await expect(reload).toBeVisible();
     expect(await cards.first().evaluate(node=>node===window.savedGalleryCard)).toBe(true);expect(galleryReads).toBe(0);
     await reload.click();await expect(saved(page).getByRole('region',{name:'Positive prompt',exact:true})).toContainText('Replaced saved owner');
@@ -593,7 +688,7 @@ test('a bounded saved-parent prefix leaves previously loaded variants unverified
     const f=page.fixture;const detail=await(await request.get(`/prompt_manager/library/${f.detail_id}`)).json();
     for(let index=0;index<41;index++)await expect(await request.post('/prompt_manager/pairs',{data:{positive_text:detail.positive.text,negative_text:`Bounded negative ${index}`}})).toBeOK();
     await open(page,f.detail_id);await expect(page.getByRole('button',{name:'Load more negative variants',exact:true})).toBeVisible();await page.getByRole('button',{name:'Load more negative variants',exact:true}).click();
-    const choices=page.getByRole('button',{name:/^Select negative variant /});await expect(choices).toHaveCount(43);await choices.last().click();await expect(choices.last()).toHaveAttribute('aria-pressed','true');
+    const choices=page.getByRole('button',{name:/^Select negative /});await expect(choices).toHaveCount(43);await choices.last().click();await expect(choices.last()).toHaveAttribute('aria-pressed','true');
     const negative=await saved(page).getByRole('region',{name:'Negative prompt',exact:true}).textContent();
     await page.route(/\/history\/runs\/[^/]+\/outputs\?/,async route=>route.fulfill({status:409,json:{success:false,history_version:1,code:'history-changed',error:'History changed',recovery:{action:'refresh-history'}}}));
     await marker(page,f.runs.shared).click();await expect(dialog(page)).toContainText('Recorded evidence changed');await page.keyboard.press('Escape');
@@ -606,7 +701,7 @@ test('an authoritative save after a stale revalidation makes the saved view curr
     const f=page.fixture;const detail=await(await request.get(`/prompt_manager/library/${f.detail_id}`)).json();
     for(let index=0;index<41;index++)await expect(await request.post('/prompt_manager/pairs',{data:{positive_text:detail.positive.text,negative_text:`Bounded negative ${index}`}})).toBeOK();
     await open(page,f.detail_id);await page.getByRole('button',{name:'Load more negative variants',exact:true}).click();
-    const choices=page.getByRole('button',{name:/^Select negative variant /});await expect(choices).toHaveCount(43);await choices.last().click();
+    const choices=page.getByRole('button',{name:/^Select negative /});await expect(choices).toHaveCount(43);await choices.last().click();
     const negative=await saved(page).getByRole('region',{name:'Negative prompt',exact:true}).textContent();
     await page.route(/\/history\/runs\/[^/]+\/outputs\?/,async route=>route.fulfill({status:409,json:{success:false,history_version:1,code:'history-changed',error:'History changed',recovery:{action:'refresh-history'}}}));
     await marker(page,f.runs.shared).click();await expect(dialog(page)).toContainText('Recorded evidence changed');await page.keyboard.press('Escape');
@@ -615,7 +710,7 @@ test('an authoritative save after a stale revalidation makes the saved view curr
     await expect(editor.getByRole('button',{name:'Save',exact:true})).toBeEnabled();await editor.getByLabel('Notes',{exact:true}).fill('Saved after stale revalidation');
     await editor.getByRole('button',{name:'Save',exact:true}).click();await expect(editor).toHaveCount(0);
     await expect(page.locator('.library-parent-status')).toBeHidden();await expect(page.getByRole('button',{name:'Reload saved Library view',exact:true})).toBeHidden();
-    await expect(choices.first()).toBeEnabled();await expect(page.locator('.library-variant-dot[aria-pressed="true"]')).toHaveCount(1);
+    await expect(choices.first()).toBeEnabled();await expect(page.locator('.variant-dot[aria-pressed="true"]')).toHaveCount(1);
     expect(await saved(page).getByRole('region',{name:'Negative prompt',exact:true}).textContent()).toBe(negative);
     const names=await choices.evaluateAll(nodes=>nodes.map(node=>node.getAttribute('aria-label')));expect(new Set(names).size).toBe(names.length);
 });
@@ -623,15 +718,15 @@ test('an authoritative save after a stale revalidation makes the saved view curr
 async function retainSavedSelection(page,request,fixture) {
     await open(page,fixture.detail_id);
     const details=await(await request.get(`/prompt_manager/library/${fixture.detail_id}`)).json();
-    const index=details.variants.findIndex(variant=>variant.id===fixture.saved_pair);
-    await page.getByRole('button',{name:`Select negative variant ${index+1}`,exact:true}).click();
+    const name=details.variants.find(variant=>variant.id===fixture.saved_pair).title;
+    await page.getByRole('button',{name:`Select negative ${name}`,exact:true}).click();
     await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(1);
-    const negative=await exact(saved(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('pre'));
+    const negative=await exact(saved(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('p.prompt-text'));
     await gallery(page).locator('article[data-image-key]').first().evaluate(node=>{window.fix1SavedGalleryCard=node;});
     let reads=0;page.on('request',request=>{if(new URL(request.url()).pathname===`/prompt_manager/library/${fixture.detail_id}/images`)reads++;});
     return async()=>{
-        await expect(page.getByRole('button',{name:`Select negative variant ${index+1}`,exact:true})).toHaveAttribute('aria-pressed','true');
-        expect(await exact(saved(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('pre'))).toBe(negative);
+        await expect(page.getByRole('button',{name:`Select negative ${name}`,exact:true})).toHaveAttribute('aria-pressed','true');
+        expect(await exact(saved(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('p.prompt-text'))).toBe(negative);
         expect(await gallery(page).locator('article[data-image-key]').first().evaluate(node=>node===window.fix1SavedGalleryCard)).toBe(true);expect(reads).toBe(0);
     };
 }
@@ -702,7 +797,7 @@ test('capture-only recovery uses the changed real output capture without re-read
     const outputs=await(await outputsRead).json();expect(outputs.capture.state).toBe('conflicting');expect(outputs.retained_occurrence_count).toBe(1);expect(outputs.list_status).toBe('incomplete');
     await expect(dialog(page).locator('[data-receipt]')).toHaveCount(1);await expect(dialog(page).locator('.recorded-output-status')).toContainText('1 retained reported output · incomplete · conflicting');
     await expect(dialog(page).getByText('Output capture',{exact:true}).locator('..').locator('dd')).toHaveText('conflicting · conflicting');expect(runReads).toBe(1);expect(outputsReads).toBe(2);
-    expect(await exact(dialog(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('pre'))).toBe('  \n\t ');await page.keyboard.press('Escape');await retained();
+    expect(await exact(dialog(page).getByRole('region',{name:'Negative prompt',exact:true}).locator('p.prompt-text'))).toBe('  \n\t ');await page.keyboard.press('Escape');await retained();
 });
 
 test('completed page one stays bounded across mode changes until explicit output paging',async({page,request})=>{
@@ -718,4 +813,311 @@ test('completed page one stays bounded across mode changes until explicit output
         await more.click();await started;expect(reads).toBe(2);releaseNext();await expect(dialog(page).locator('[data-receipt]')).toHaveCount(41);await expect(more).toBeHidden();
         await page.keyboard.press('Escape');await retained();
     } finally {releaseNext();}
+});
+
+// #249 PR F1: the concept heading (app.js a591–597) and summary surface (a598) with real counts (D24).
+const historyHeading=page=>page.locator('#workspace-main > .heading');
+const summary=page=>page.locator('#workspace-main .library-history article.surface');
+test('history heading actions stay on one row at 1600 and are enabled after load',async({page,request})=>{
+    await page.setViewportSize({width:1600,height:1100});const f=page.fixture;
+    let releaseDetail;const held=new Promise(resolve=>{releaseDetail=resolve;});
+    await page.route(new RegExp(`/prompt_manager/library/${f.positive_id}\\?`),async route=>{await held;await route.continue().catch(()=>{});});
+    try {
+        await page.goto(`/prompt_manager/workspace#/library/${f.positive_id}`);
+        const heading=historyHeading(page),send=heading.locator('.heading-actions > button.send');
+        await expect(heading.locator('p.muted')).toHaveText('Prompt history · one positive, one shared gallery');
+        // D24: disabled only while the selected pair's roles are loading.
+        await expect(send).toBeDisabled();releaseDetail();
+        await expect(recorded(page)).toBeVisible();await expect(send).toBeEnabled();
+    } finally {releaseDetail();}
+    const heading=historyHeading(page),title=await heading.locator('h1').textContent();
+    const actions=heading.locator('.heading-actions > button');
+    await expect(actions).toHaveCount(3);
+    expect(await actions.evaluateAll(nodes=>nodes.map(node=>node.textContent.trim()))).toEqual(['← Prompt library','Edit metadata','Send to ComfyUI']);
+    await expect(actions.nth(2)).toHaveClass('send');
+    await expect(actions.nth(2)).toHaveAccessibleName(`Send prompt pair to ComfyUI: ${title}`);
+    for(const action of [actions.nth(0),actions.nth(1)]) await expect(action).toBeEnabled();
+    const boxes=await actions.evaluateAll(nodes=>nodes.map(node=>{const box=node.getBoundingClientRect();return {y:box.y,height:box.height};}));
+    expect(new Set(boxes.map(box=>box.y)).size).toBe(1);
+    const row=await heading.locator('.heading-actions').evaluate(node=>node.getBoundingClientRect().height);
+    expect(row).toBe(boxes[0].height);
+});
+test('summary meta uses recorded runs',async({page,request})=>{
+    const f=page.fixture;await open(page,f.positive_id);
+    const detail=await(await request.get(`/prompt_manager/library/${f.positive_id}`)).json(),runs=(await historyRead(request,f.positive_id)).recorded_run_count;
+    const surface=summary(page),title=await historyHeading(page).locator('h1').textContent();
+    await expect(surface).toHaveCount(1);
+    await expect(surface.locator(':scope > span.chip')).toHaveText(detail.positive.category || 'Uncategorized');
+    const plural=(count,word)=>`${count} ${count===1?word:`${word}s`}`;
+    await expect(surface.locator(':scope > .card-meta > span')).toHaveText([plural(runs,'tracked run'),plural(detail.positive.image_count,'image'),plural(detail.positive.variant_count,'negative variant')]);
+    // The concept order: category chip, positive block, selected negative block, then the meta line.
+    expect(await surface.evaluate(node=>[...node.querySelectorAll('.chip, .prompt-section, .card-meta')].filter(item=>item.checkVisibility()).map(item=>item.className))).toEqual(['chip','prompt-section positive','prompt-section negative','card-meta']);
+    for(const name of ['Copy positive prompt','Send positive prompt to ComfyUI','Copy negative prompt','Send negative prompt to ComfyUI'])
+        await expect(saved(page).getByRole('button',{name:`${name}: ${title}`,exact:true})).toBeVisible();
+    await expect(surface.locator('.prompt-section').first()).toHaveCSS('border-top-width','1px');
+});
+
+// #249 F2: the concept's negative variants panel (app.js a598, style.css 1059-1154) and its two dialogs (D26).
+const variantsPanel=page=>page.getByRole('region',{name:'Saved negative variants',exact:true});
+const modalDialog=(page,name)=>page.getByRole('dialog',{name,exact:true});
+test('variants panel matches the concept',async({page})=>{
+    const f=page.fixture;await open(page,f.canonical_id);const panel=variantsPanel(page);
+    await expect(panel).toHaveClass('surface timeline-panel');
+    const heading=panel.locator(':scope > .panel-heading');
+    await expect(heading.locator(':scope > div > h2')).toHaveText('Negative variants');
+    await expect(heading.locator(':scope > div > p.small')).toHaveText('Choose a red dot to change the negative and filter this gallery.');
+    const actions=heading.locator(':scope > .row-actions > button');
+    expect(await actions.evaluateAll(nodes=>nodes.map(node=>node.textContent))).toEqual(['Compare negatives','+ Add negative','Show archived (0)']);
+    const compare=actions.nth(0);await expect(compare).toHaveAttribute('aria-pressed','false');
+    await compare.click();await expect(compare).toHaveAttribute('aria-pressed','true');await compare.click();await expect(compare).toHaveAttribute('aria-pressed','false');
+    const timeline=panel.locator(':scope > .timeline');
+    await expect(timeline.locator(':scope > .positive-lane > span')).toHaveText('Positive prompt · unchanged');
+    const lanes=timeline.locator(':scope > .variant-lane');await expect(lanes).toHaveCount(3);
+    // Newest saved pair first, as the bounded variant page reads; every lane is offset 38 + 47i.
+    const names=['No negative','Clean geometry','Quality baseline'],runs=['0 runs','2 runs','2 runs'];
+    for(const [index,name] of names.entries()) {
+        const lane=lanes.nth(index);
+        await expect(lane).toHaveAttribute('style',`--lane-offset: ${38+index*47}px;`);
+        const dot=lane.locator(':scope > button.variant-dot');
+        await expect(dot).toHaveText('−');await expect(dot).toHaveAccessibleName(`Select negative ${name}`);
+        await expect(dot).toHaveAttribute('aria-pressed',String(index===0));
+        await expect(lane.locator(':scope > span')).toHaveText(`${name} · ${runs[index]}`);
+        expect(await lane.evaluate(node=>[...node.children].filter(child=>!child.hidden).map(child=>child.tagName.toLowerCase()+'.'+child.className))).toEqual(index===0?['button.variant-dot','span.']:['button.variant-dot','span.','button.run-dot']);
+    }
+    await lanes.nth(2).locator('.variant-dot').click();await expect(lanes.nth(2).locator('.variant-dot')).toHaveAttribute('aria-pressed','true');
+    await expect(lanes.nth(0).locator('.variant-dot')).toHaveAttribute('aria-pressed','false');
+    await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(2);
+    const lower=panel.locator(':scope > .timeline-lower');
+    await expect(lower.locator(':scope > span.small')).toHaveText('Green + positive · red − negative · small dot repeat run');
+    await expect(lower.locator(':scope > button')).toHaveText('All images for this positive');
+    await expect(lower.locator(':scope > button')).not.toHaveAttribute('aria-pressed',/.*/);
+    await expect(panel).not.toContainText('Saved combinations, not an execution timeline.');
+    // The concept tokens reach the lanes (style.css 1096-1137).
+    await expect(lanes.first()).toHaveCSS('height','57px');await expect(lanes.nth(1)).toHaveCSS('margin-left','85px');
+    await expect(lanes.first().locator('.variant-dot')).toHaveCSS('border-radius','50%');
+    await expect(lanes.nth(1).locator('.run-dot')).toHaveCSS('left','190px');
+});
+test('run dot appears only for pairs with more than one run and opens its run',async({page})=>{
+    const f=page.fixture;await open(page,f.canonical_id);const panel=variantsPanel(page);
+    await expect(panel.getByRole('button',{name:/^Show repeat run for /})).toHaveCount(2);
+    await expect(panel.getByRole('button',{name:'Show repeat run for No negative',exact:true})).toHaveCount(0);
+    // D45: the lane text wraps before the run dot, and a coarse pointer reaches the 12px dot through a 44px target.
+    for(const lane of await panel.locator('.variant-lane:has(> .run-dot:not([hidden]))').all()) {
+        const [text,dot]=await Promise.all([lane.locator(':scope > span').boundingBox(),lane.locator(':scope > .run-dot').boundingBox()]);
+        expect(text.width).toBeLessThanOrEqual(139.5);expect(text.x+text.width).toBeLessThan(dot.x);
+    }
+    if(await page.evaluate(()=>matchMedia('(pointer: coarse)').matches)) {
+        const dot=panel.getByRole('button',{name:'Show repeat run for Quality baseline',exact:true});await dot.scrollIntoViewIfNeeded();
+        const reach=await dot.evaluate(node=>{
+            const box=node.getBoundingClientRect(),x=box.x+box.width/2,y=box.y+box.height/2;
+            return [[x-20,y],[x+20,y],[x,y-20],[x,y+20]].map(([px,py])=>{const hit=document.elementFromPoint(px,py);return hit?.closest('button')===node?'dot':`${hit?.tagName}.${hit?.className}`;});
+        });
+        expect(reach).toEqual(['dot','dot','dot','dot']);
+    }
+    // The baseline has a recorded execution: the dot opens Recorded run for it.
+    const baseline=panel.getByRole('button',{name:'Show repeat run for Quality baseline',exact:true});await baseline.click();
+    await expect(dialog(page)).toBeVisible();await expect(dialog(page)).toContainText(f.canonical_run);
+    await dialog(page).getByRole('button',{name:'Close recorded run',exact:true}).click();await expect(dialog(page)).toHaveCount(0);
+    // Clean geometry was counted but never recorded: Repeat run shows its newest linked image only.
+    const clean=panel.getByRole('button',{name:'Show repeat run for Clean geometry',exact:true});
+    const reads=[];page.on('request',request=>{const url=new URL(request.url());if(url.pathname===`/prompt_manager/library/${f.canonical_id}/images`)reads.push(url.searchParams);});
+    await clean.click();const repeat=modalDialog(page,'Repeat run');await expect(repeat).toBeVisible();
+    await expect(repeat.locator('#modal-body > p.small')).toHaveText('Same positive and negative, another execution.');
+    await expect(repeat.locator('#modal-body > .spaced-15 article[data-image-key]')).toHaveCount(1);
+    // D47: as in the concept (a1291-1304), the dialog title names the image; no collection heading or count repeats it.
+    await expect(repeat.locator('.section-caption')).toHaveCount(0);
+    await expect(repeat.getByRole('heading',{name:'Linked images',exact:true})).toHaveCount(0);
+    await expect(repeat.getByText(/ loaded · /)).toHaveCount(0);
+    expect(await repeat.evaluate(node=>[...node.querySelectorAll('h1, h2')].filter(item=>!item.closest('aside')).map(item=>item.textContent))).toEqual(['Repeat run']);
+    expect(reads.at(-1).get('pair_id')).toBe(String(f.clean_pair));expect(reads.at(-1).get('limit')).toBe('1');
+    await page.keyboard.press('Escape');await expect(repeat).toHaveCount(0);await expect(clean).toBeFocused();
+});
+test('all images dialog lists every image for the positive',async({page,request})=>{
+    const f=page.fixture;await open(page,f.detail_id);
+    const detail=await(await request.get(`/prompt_manager/library/${f.detail_id}`)).json();
+    const all=variantsPanel(page).getByRole('button',{name:'All images for this positive',exact:true});
+    // Opening on the first lane, the shared gallery shows that lane only.
+    await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(0);
+    await all.click();const listing=modalDialog(page,'All images for this positive');await expect(listing).toBeVisible();
+    await expect(listing.locator('article[data-image-key]')).toHaveCount(detail.positive.image_count);
+    await page.keyboard.press('Escape');await expect(listing).toHaveCount(0);await expect(all).toBeFocused();
+    await expect(gallery(page).locator('article[data-image-key]')).toHaveCount(0);
+    // Leaving the route closes an open dialog and its gallery.
+    await all.click();await expect(listing.locator('article[data-image-key]')).toHaveCount(detail.positive.image_count);
+    await page.evaluate(()=>{location.hash='#/overview';});await expect(page.locator('#workspace-main h1')).toHaveText('Overview');
+    await expect(page.locator('dialog[open]')).toHaveCount(0);await expect(page.locator('#modal')).toHaveCount(0);
+});
+test('compare toggles, follows the selected dot and stacks at 390',async({page})=>{
+    const f=page.fixture;await open(page,f.canonical_id);const panel=variantsPanel(page);
+    const compare=panel.getByRole('button',{name:'Compare negatives',exact:true});
+    const section=page.locator('.library-history .timeline-panel + section.surface');
+    await expect(section).toHaveCount(0);
+    await compare.click();await expect(compare).toHaveAttribute('aria-pressed','true');
+    // The concept section (app.js a599-616) follows the timeline panel; the baseline is the oldest active lane (D25).
+    await expect(section).toHaveCount(1);
+    expect(await section.evaluate(node=>[...node.children].map(child=>child.tagName.toLowerCase()+(child.className?'.'+child.className:'')))).toEqual(['h2','p','div.compare-grid','p.small','p.small']);
+    await expect(section.locator(':scope > h2')).toHaveText('Compare negative variants');
+    await expect(section.locator(':scope > p').first()).toHaveText('Baseline compared with No negative. Choose another red dot to change the comparison.');
+    const items=section.locator(':scope > .compare-grid > .compare-item');await expect(items).toHaveCount(2);
+    await expect(items.nth(0).locator('.prompt-section.negative .prompt-text')).toHaveText('blurred edges, watermark');
+    await expect(items.nth(1).locator('.prompt-section.negative .prompt-text')).toHaveText('No negative prompt (explicitly empty)');
+    await expect(items.nth(0).locator('.prompt-section.positive')).toHaveCount(0);
+    // D46: the two blocks are named apart, so no region or action name repeats on the page.
+    await expect(section.getByRole('region',{name:'Baseline negative prompt',exact:true})).toBeVisible();
+    await expect(section.getByRole('region',{name:'Selected negative prompt',exact:true})).toBeVisible();
+    await expect(section.locator(':scope > p.small').first()).toHaveText('Added terms');
+    await expect(section.locator(':scope > p.small').nth(1)).toHaveText('No added terms.');
+    await expect(section.locator('.diff-added')).toHaveCount(0);
+    // Another dot updates the same section in place.
+    const node=await section.elementHandle();
+    await panel.getByRole('button',{name:'Select negative Clean geometry',exact:true}).click();
+    await expect(section.locator(':scope > p').first()).toHaveText('Baseline compared with Clean geometry. Choose another red dot to change the comparison.');
+    await expect(items.nth(1).locator('.prompt-text')).toHaveText('flat light');
+    await expect(section.locator(':scope > span.diff-added')).toHaveText(['+ flat light']);
+    await expect(section.locator(':scope > p.small')).toHaveCount(1);
+    expect(await node.evaluate(element=>element.isConnected)).toBe(true);
+    await expect(section.locator('.diff-added')).toHaveCSS('display','inline-block');
+    await expect(section.locator('.compare-item').first()).toHaveCSS('padding','15px');
+    await page.setViewportSize({width:1600,height:1100});
+    let boxes=await items.evaluateAll(nodes=>nodes.map(node=>node.getBoundingClientRect().toJSON()));
+    expect(boxes[1].x).toBeGreaterThan(boxes[0].x+boxes[0].width-1);expect(Math.abs(boxes[1].y-boxes[0].y)).toBeLessThan(1);
+    await page.setViewportSize({width:390,height:844});
+    boxes=await items.evaluateAll(nodes=>nodes.map(node=>node.getBoundingClientRect().toJSON()));
+    expect(Math.abs(boxes[1].x-boxes[0].x)).toBeLessThan(1);expect(boxes[1].y).toBeGreaterThanOrEqual(boxes[0].y+boxes[0].height);
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth-document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+    await panel.getByRole('button',{name:'Select negative Quality baseline',exact:true}).click();
+    await expect(section.locator(':scope > p').first()).toHaveText('Baseline compared with Quality baseline. Choose another red dot to change the comparison.');
+    await expect(section.locator(':scope > p.small').nth(1)).toHaveText('No added terms.');
+    await compare.click();await expect(compare).toHaveAttribute('aria-pressed','false');await expect(section).toHaveCount(0);
+});
+test('compare waits for the page holding the oldest active negative',async({page})=>{
+    const f=page.fixture;
+    // A bounded first page that does not reach the oldest saved pair: the baseline is not guessed from the newest lanes (D46).
+    await page.route(new RegExp(`/prompt_manager/library/${f.canonical_id}\\?`),async route=>{
+        const url=new URL(route.request().url());if(url.searchParams.has('variant_cursor') || url.searchParams.get('archive')) return route.continue();
+        const response=await route.fetch(),body=await response.json();
+        await route.fulfill({response,json:{...body,variants:body.variants.slice(0,2),variants_has_more:true,variants_next_cursor:'held'}});
+    });
+    await open(page,f.canonical_id);const panel=variantsPanel(page);
+    await panel.getByRole('button',{name:'Compare negatives',exact:true}).click();
+    const section=page.locator('.library-history .timeline-panel + section.surface');
+    await expect(section.locator(':scope > h2')).toHaveText('Compare negative variants');
+    await expect(section.locator(':scope > p.small')).toHaveText('Load more negative variants to reach the baseline.');
+    await expect(section.locator('.compare-grid')).toHaveCount(0);
+    await page.unroute(new RegExp(`/prompt_manager/library/${f.canonical_id}\\?`));
+});
+test('run dot falls back to Repeat run when the lookup fails or Recorded run cannot open',async({page})=>{
+    const f=page.fixture;
+    await page.route(/\/history\/pairs\/\d+\/newest/,route=>route.fulfill({status:503,json:{success:false}}));
+    await open(page,f.canonical_id);const panel=variantsPanel(page);
+    const baseline=panel.getByRole('button',{name:'Show repeat run for Quality baseline',exact:true});
+    await baseline.click();const repeat=modalDialog(page,'Repeat run');await expect(repeat).toBeVisible();
+    await expect(page.locator('#workspace-toast')).toHaveText('Recorded runs could not be read. Showing the newest linked image.');
+    await expect(dialog(page)).toHaveCount(0);
+    await page.keyboard.press('Escape');await expect(repeat).toHaveCount(0);await expect(baseline).toBeFocused();
+    await page.unroute(/\/history\/pairs\/\d+\/newest/);
+    // The lookup names a run, but the recorded history never loaded, so Recorded run cannot open: Repeat run, no toast.
+    await page.route(/\/library\/\d+\/history\?/,route=>route.fulfill({status:503,json:{success:false}}));
+    await page.reload();await expect(recorded(page).getByRole('button',{name:'Retry recorded history',exact:true})).toBeVisible();
+    await page.locator('#workspace-toast').evaluate(node=>{node.textContent='';});
+    const newest=page.waitForResponse(response=>/\/history\/pairs\/\d+\/newest/.test(response.url()));
+    await variantsPanel(page).getByRole('button',{name:'Show repeat run for Quality baseline',exact:true}).click();
+    expect((await(await newest).json()).run.run_id).toBe(f.canonical_run);
+    await expect(modalDialog(page,'Repeat run')).toBeVisible();await expect(dialog(page)).toHaveCount(0);
+    await expect(page.locator('#workspace-toast')).toHaveText('');
+});
+test('an archived pair\'s Repeat run reads the archived gallery',async({page,request})=>{
+    const f=page.fixture;
+    await expect(await request.patch(`/prompt_manager/pairs/${f.clean_pair}`,{data:{archived:true}})).toBeOK();
+    await open(page,f.canonical_id);const panel=variantsPanel(page);
+    await panel.getByRole('button',{name:'Show archived (1)',exact:true}).click();
+    const reads=[];page.on('request',request=>{const url=new URL(request.url());if(url.pathname===`/prompt_manager/library/${f.canonical_id}/images`)reads.push(url.searchParams);});
+    await panel.getByRole('button',{name:'Show repeat run for Clean geometry',exact:true}).click();
+    const repeat=modalDialog(page,'Repeat run');await expect(repeat.locator('.spaced-15 article[data-image-key]')).toHaveCount(1);
+    expect(reads.at(-1).get('pair_id')).toBe(String(f.clean_pair));expect(reads.at(-1).get('archive')).toBe('archived');
+    // Each open replaces the previous dialog and its gallery.
+    await page.keyboard.press('Escape');await panel.getByRole('button',{name:'All images for this positive',exact:true}).click();
+    await expect(modalDialog(page,'All images for this positive')).toBeVisible();await expect(page.locator('dialog[open]')).toHaveCount(1);
+});
+test('Compare negatives is disabled without an active variant',async({page,request})=>{
+    const f=page.fixture,detail=await(await request.get(`/prompt_manager/library/${f.canonical_id}`)).json();
+    for(const variant of detail.variants) await expect(await request.patch(`/prompt_manager/pairs/${variant.id}`,{data:{archived:true}})).toBeOK();
+    await open(page,f.canonical_id);const compare=variantsPanel(page).getByRole('button',{name:'Compare negatives',exact:true});
+    await expect(compare).toBeDisabled();await expect(compare).toHaveAttribute('aria-pressed','false');
+    await expect(page.locator('.library-history .timeline-panel + section.surface')).toHaveCount(0);
+});
+test('dot names never repeat for trimmed titles or titles that read like a fallback',async({page,request})=>{
+    const f=page.fixture,detail=await(await request.get(`/prompt_manager/library/${f.canonical_id}`)).json();
+    const byTitle=Object.fromEntries(detail.variants.map(variant=>[variant.title,variant.id]));
+    await expect(await request.patch(`/prompt_manager/pairs/${byTitle['No negative']}`,{data:{title:'variant 2'}})).toBeOK();
+    await expect(await request.patch(`/prompt_manager/pairs/${byTitle['Quality baseline']}`,{data:{title:' Clean geometry '}})).toBeOK();
+    await open(page,f.canonical_id);
+    const names=await variantsPanel(page).locator('.variant-dot').evaluateAll(nodes=>nodes.map(node=>node.getAttribute('aria-label')));
+    expect(new Set(names).size).toBe(names.length);
+    expect(names).toEqual(['Select negative variant 1','Select negative variant 2','Select negative variant 3']);
+});
+// #249 F4: the concept's shared gallery (app.js a616-621, style.css 1546-1548) of PR C media cards (C3 activation).
+test('shared gallery uses concept cards, image opens the viewer, empty copy',async({page,request})=>{
+    const f=page.fixture;await open(page,f.canonical_id);
+    const section=gallery(page),heading=section.locator(':scope > .panel-heading');
+    expect(await section.evaluate(node=>`${node.tagName.toLowerCase()}.${node.className}`)).toBe('section.history-gallery');
+    await expect(heading.locator(':scope > h2')).toHaveText('Shared gallery');
+    // The page opens on the newest lane, a saved variant with no runs: the concept's empty copy.
+    await expect(heading.locator(':scope > span.small')).toHaveText('No negative · same positive prompt');
+    await expect(section.locator('.empty')).toHaveText('Saved variant · no runs yet.');await expect(section.locator('.empty')).toBeVisible();
+    await expect(section.locator('article[data-image-key]')).toHaveCount(0);
+    // D47 (maintainer ruling 2026-10-21): the concept's "Shared gallery" heading is the gallery's only heading, so the
+    // collection's "Linked images" heading and its "N loaded · N linked images" count are gone; the layout row and the
+    // selected-image side panel stay.
+    await expect(section.locator('.section-caption')).toHaveCount(0);
+    await expect(section.getByRole('heading',{name:'Linked images',exact:true})).toHaveCount(0);
+    await expect(section.getByText(/ loaded · /)).toHaveCount(0);
+    // Outside the side panel (whose own heading names the selected image), the gallery has one section heading.
+    expect(await section.evaluate(node=>[...node.querySelectorAll('h1, h2')].filter(item=>!item.closest('aside')).map(item=>item.textContent))).toEqual(['Shared gallery']);
+    await expect(section.getByRole('group',{name:'Image layout',exact:true})).toBeVisible();
+    await expect(section.getByRole('combobox',{name:'Thumbnail size',exact:true})).toBeVisible();
+    await expect(section.getByRole('complementary',{name:'Selected image details',exact:true})).toBeVisible();
+    // As in the concept, the gallery follows the variants panel; recorded executions (#209) stay below it.
+    const order=await page.locator('.library-history').evaluate(node=>[...node.querySelectorAll('section[aria-label]')].map(item=>item.getAttribute('aria-label')).filter(name=>['Saved negative variants','Shared gallery','Recorded executions'].includes(name)));
+    expect(order).toEqual(['Saved negative variants','Shared gallery','Recorded executions']);
+    const dot=variantsPanel(page).getByRole('button',{name:'Select negative Quality baseline',exact:true});await dot.click();await expect(dot).toHaveAttribute('aria-pressed','true');
+    await expect(heading.locator(':scope > span.small')).toHaveText('Quality baseline · same positive prompt');
+    const cards=section.locator('article.media-card[data-image-key]');await expect(cards).toHaveCount(2);
+    await expect(section.locator('.empty')).toBeHidden();
+    const details=await(await request.get(`/prompt_manager/library/${f.canonical_id}`)).json();
+    const pair=details.variants.find(variant=>variant.title==='Quality baseline').id;
+    const listing=await(await request.get(`/prompt_manager/library/${f.canonical_id}/images?pair_id=${pair}`)).json();
+    const first=cards.first(),filename=(await first.locator('.image-open').getAttribute('aria-label')).replace(/^Open /,'');
+    const image=listing.images.find(item=>item.filename===filename);expect(typeof image.favorite).toBe('boolean');
+    // The concept card: art (open button + overlays), then the info row; the star where the read returns favorite and
+    // no checkbox (the selection bar stays Images-only, #259).
+    expect(await first.evaluate(node=>[...node.children].map(child=>child.className))).toEqual(['media-art','media-info']);
+    expect(await first.locator(':scope > .media-art').evaluate(node=>[...node.children].map(child=>`${child.tagName.toLowerCase()}.${child.className}`))).toEqual(['button.image-open','div.image-overlays']);
+    await expect(first.locator('.image-overlays input[type="checkbox"]')).toHaveCount(0);
+    const star=first.locator('.image-overlays > button.star-button');
+    await expect(star).toHaveAccessibleName(`Favorite ${filename}`);await expect(star).toHaveAttribute('aria-pressed',String(image.favorite));
+    await expect(star).toHaveText(image.favorite?'★':'☆');
+    await expect(first.locator('.media-info h3')).toHaveCount(1);
+    await expect(first.locator('.image-card-actions > button.icon-btn:first-child')).toHaveAccessibleName(`Inspect ${filename}`);
+    // C3 activation: the image opens the viewer and Escape returns focus to it.
+    const openButton=first.locator('.image-open');await openButton.click();
+    const viewer=page.locator('dialog#viewer-dialog');await expect(viewer).toBeVisible();
+    await page.keyboard.press('Escape');await expect(viewer).toBeHidden();await expect(openButton).toBeFocused();
+    await expect(section.locator(':scope > .panel-heading')).toHaveCSS('justify-content','space-between');
+    await expect(section).toHaveCSS('margin-top','24px');
+    // D47 (maintainer ruling 2026-10-21) covers the history page's dialogs too: the All images dialog is named by its
+    // own title, with no "Linked images" heading or "N loaded · N linked images" count, as the concept's (a1282-1290).
+    await variantsPanel(page).getByRole('button',{name:'All images for this positive',exact:true}).click();
+    const all=page.getByRole('dialog',{name:'All images for this positive',exact:true});
+    await expect(all.locator('article[data-image-key]').first()).toBeVisible();
+    await expect(all.locator('.section-caption')).toHaveCount(0);
+    await expect(all.getByRole('heading',{name:'Linked images',exact:true})).toHaveCount(0);
+    await expect(all.getByText(/ loaded · /)).toHaveCount(0);
+    expect(await all.evaluate(node=>[...node.querySelectorAll('h1, h2')].filter(item=>!item.closest('aside')).map(item=>item.textContent))).toEqual(['All images for this positive']);
+    await page.keyboard.press('Escape');await expect(all).toHaveCount(0);
+    // At 390px the heading stays inside the gallery and the page never scrolls sideways.
+    await page.setViewportSize({width:390,height:844});
+    await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth-document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+    const [box,text]=await Promise.all([section.boundingBox(),heading.locator(':scope > span.small').boundingBox()]);
+    expect(text.x+text.width).toBeLessThanOrEqual(box.x+box.width+0.5);
 });

@@ -3,58 +3,107 @@
 import asyncio
 import contextlib
 from contextlib import closing
-import datetime
+import functools
 import hashlib
 import json
+import math
 import os
 import sqlite3
-import tempfile
 import threading
+import time
+import urllib.parse
 from pathlib import Path
 
 from aiohttp import web
 
 from .prompts import thumbnail_url_for
-from .scan_job import ScanJob
+from . import thumbnail_settings
+from .jobs import (
+    DEFAULT_SCAN_SCOPE,
+    SCAN_GROUP_NAMES,
+    SCAN_GROUPS,
+    SCAN_SCOPES,
+    DUPLICATE_CLEANUP_JOB_KIND,
+    DUPLICATES_JOB_KIND,
+    MAINTENANCE_JOB_KIND,
+    JobBusy,
+)
 
 try:
     from ...utils.parallel import map_parallel
-    from ...utils.validators import validate_result_timeout, validate_worker_threads
 except ImportError:
     from utils.parallel import map_parallel
-    from utils.validators import validate_result_timeout, validate_worker_threads
 
 try:
-    from ...database.operations import PromptDatabase
-    from ...database.pair_ingestion import ingest_resolved_pair
-    from ...utils.generation_params import (
-        PLACEHOLDERS,
-        GenerationParamsError,
-        extract_generation_params,
-        parse_js_json,
+    from ...utils import exit_signal
+    from ...utils.media_folders import (
+        in_trash_below_roots,
+        in_trash_folder,
+        is_skipped_folder,
     )
-    from ...utils.prompt_pair_resolver import resolve_prompt_pair
 except ImportError:
-    from database.operations import PromptDatabase
-    from database.pair_ingestion import ingest_resolved_pair
-    from utils.generation_params import (
-        PLACEHOLDERS,
-        GenerationParamsError,
-        extract_generation_params,
-        parse_js_json,
+    from utils import exit_signal
+    from utils.media_folders import (
+        in_trash_below_roots,
+        in_trash_folder,
+        is_skipped_folder,
     )
-    from utils.prompt_pair_resolver import resolve_prompt_pair
+
+try:
+    from ...database.image_removal import mark_hides
+    from ...database.pair_ingestion import SCAN_MARKS, ingest_resolved_pair
+    from ...database.run_attribution import (
+        RecordedOutput,
+        host_output_directory,
+        named_prompt,
+        recorded_runs,
+    )
+    from ...database.scanned_prompts import (
+        link_stored_prompt_or_raise,
+        store_scanned_prompt,
+    )
+    from ...utils.file_prompt import (
+        NEVER,
+        NOT_SAVED,
+        NOT_SAVED_WIRED,
+        PAIR,
+        Policy,
+        decide_file_prompt,
+    )
+except ImportError:
+    from database.image_removal import mark_hides
+    from database.pair_ingestion import SCAN_MARKS, ingest_resolved_pair
+    from database.run_attribution import (
+        RecordedOutput,
+        host_output_directory,
+        named_prompt,
+        recorded_runs,
+    )
+    from database.scanned_prompts import (
+        link_stored_prompt_or_raise,
+        store_scanned_prompt,
+    )
+    from utils.file_prompt import (
+        NEVER,
+        NOT_SAVED,
+        NOT_SAVED_WIRED,
+        PAIR,
+        Policy,
+        decide_file_prompt,
+    )
 
 
 try:
-    from ...utils.hashing import generate_prompt_hash
+    from ...database.library import display_title
 except ImportError:
-    from utils.hashing import generate_prompt_hash
+    from database.library import display_title
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff")
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".wmv")
 SCAN_BATCH_SIZE = 50  # Files per executor call during the output scan
-MAX_SAFETY_BACKUPS = 10  # '<db>.backup_*' files kept next to the live database
+# '<db>.backup_*' files kept next to the live database: one pool for the
+# restore backups and the maintenance safety backups (py/api/maintenance.py).
+MAX_SAFETY_BACKUPS = 10
 MAX_SCAN_FILES = 50_000  # Upper bound on media files one scan will look at
 SCAN_COUNT_KEYS = (
     "processed",
@@ -75,15 +124,17 @@ MAX_SCAN_DEPTH = 12  # Directory levels below an output root that are scanned
 # the common single-f TIFF spelling. Anything else inside the output
 # directory (databases, scripts, notes) is never a "duplicate image".
 DELETABLE_MEDIA_EXTENSIONS = frozenset(IMAGE_EXTENSIONS + VIDEO_EXTENSIONS + (".tif",))
+DUPLICATE_FIND_LEGACY_TITLE = "Find duplicate image files (gallery page)"
 
 
 def _collect_media_files(output_dirs, extensions):
     """Media files under ``output_dirs`` (blocking), bounded and symlink-free.
 
-    Walks each root without following symlinks, skips ``thumbnails``
-    directories and symlinked files, never descends more than MAX_SCAN_DEPTH
-    levels and stops after MAX_SCAN_FILES files in total. Extensions match
-    case-insensitively and each path is listed once.
+    Walks each root without following symlinks, skips ``thumbnails`` and
+    trash folders (``utils.media_folders``) and symlinked files, never
+    descends more than MAX_SCAN_DEPTH levels and stops after MAX_SCAN_FILES
+    files in total. Extensions match case-insensitively and each path is
+    listed once.
     """
     wanted = {ext.lower() for ext in extensions}
     found = []
@@ -93,11 +144,12 @@ def _collect_media_files(output_dirs, extensions):
         if not os.path.isdir(root):
             continue
         for current, dirnames, filenames in os.walk(root, followlinks=False):
+            exit_signal.checkpoint()  # #376: stop between directories at exit
             depth = 0 if current == root else len(Path(current).relative_to(root).parts)
             dirnames[:] = sorted(
                 d
                 for d in dirnames
-                if d != "thumbnails"
+                if not is_skipped_folder(d)
                 and depth < MAX_SCAN_DEPTH
                 and not os.path.islink(os.path.join(current, d))
             )
@@ -117,9 +169,59 @@ def _collect_media_files(output_dirs, extensions):
     return found
 
 
-def _thumbnail_rel_path(rel_path, thumbnail_ext):
-    """Relative path of the thumbnail the gallery would generate for ``rel_path``."""
-    return f"thumbnails/{rel_path.with_suffix('').as_posix()}_thumb{thumbnail_ext}"
+def _physical_file_key(path, stat):
+    """What tells two physical files apart: ``(st_dev, st_ino)``.
+
+    A filesystem that reports no inode (``st_ino`` 0, some network or FAT
+    volumes on Windows) falls back to the resolved, case-folded path.
+    """
+    if stat.st_ino:
+        return ("inode", (stat.st_dev, stat.st_ino))
+    return ("path", os.path.normcase(os.path.realpath(str(path))))
+
+
+def _other_sources(output_path, rel_path):
+    """Whether another media file shares *rel_path*'s stem in its folder."""
+    folder = Path(output_path) / Path(rel_path).parent
+    stem = Path(rel_path).stem
+    own = Path(rel_path).suffix.lower()
+    for extension in IMAGE_EXTENSIONS + VIDEO_EXTENSIONS:
+        if extension == own:
+            continue
+        for name in (stem + extension, stem + extension.upper()):
+            if (folder / name).is_file():
+                return True
+    return False
+
+
+def _remove_thumbnail(output_path, rel_path, logger=None):
+    """Remove the previews of ``rel_path`` under ``output_path``, if any.
+
+    Shared by the legacy duplicate delete and the reviewed removal job.
+    Every preview the file owns goes, in any format (#317); a preview name
+    another same-stem file still shares (``x_thumb.webp`` of ``x.png`` and
+    ``x.mp4``, ruling R2) stays for it. A preview that is a link, or one that
+    cannot be removed, is left alone (a stale preview never fails a removal).
+    Returns whether one was removed.
+    """
+    output_path = Path(output_path)
+    rel_path = Path(rel_path)
+    shared = _other_sources(output_path, rel_path)
+    removed = False
+    for thumbnail_path in thumbnail_settings.owned_thumbnails(output_path, rel_path):
+        extension = thumbnail_path.suffix.lower()
+        if shared and extension in thumbnail_settings.WRITTEN_EXTENSIONS:
+            continue
+        try:
+            os.remove(thumbnail_path)
+        except OSError as e:
+            if logger is not None:
+                logger.warning(f"Could not delete thumbnail for {rel_path}: {e}")
+            continue
+        removed = True
+        if logger is not None:
+            logger.debug(f"Deleted associated thumbnail: {thumbnail_path}")
+    return removed
 
 
 async def _read_json(request):
@@ -136,6 +238,154 @@ async def _read_json(request):
 def _sse(payload):
     """Encode one server-sent event."""
     return f"data: {json.dumps(payload)}\n\n"
+
+
+SCAN_JOB_KIND = "scan"
+SCAN_JOB_TITLE = "Scan for metadata"
+# The legacy final event type of a scan and the job state it ends in.
+SCAN_FINAL_STATES = {
+    "complete": "finished",
+    "cancelled": "cancelled",
+    "error": "failed",
+}
+# The scope as the scan log's first line names it (the review dialog's words).
+SCAN_SCOPE_LOG = {
+    "new": "new and unresolved files",
+    "all": "all files",
+    "returned": "images returned to the library",
+}
+RETURN_JOB_TITLE = "Return images to the library"  # #498
+MIN_BATCHES_FOR_ESTIMATE = 2  # "about X min left" waits for this many batches
+# Log line prefix per outcome group (spec: + added, = known, ? review, ! error,
+# - no usable metadata).
+SCAN_LOG_PREFIXES = {
+    "added": "+",
+    "known": "=",
+    "review": "?",
+    "errors": "!",
+    "no_metadata": "-",
+}
+# What an outcome row says about a file: where it went (with the prompt's
+# title) or why it was skipped. "error" is a file whose ingestion raised;
+# None is a file without prompt metadata.
+SCAN_TITLED_DETAILS = {
+    "added": "Added to the Library as “{title}”",
+    "linked": "Linked to “{title}”",
+    "enriched": "Metadata added to “{title}”",
+    "unchanged": "Already linked to “{title}”",
+}
+SCAN_DETAILS = {
+    "added": "Added to the Library",
+    "linked": "Linked to an existing prompt",
+    "enriched": "Metadata added to its prompt",
+    "unchanged": "Already linked to its prompt",
+    "skipped": "Skipped · already linked",
+    "ambiguous": "Needs review: more than one prompt could match",
+    "unresolved": "Needs review: the prompt could not be traced in the workflow",
+    "conflict": "Kept: already linked to a different prompt",
+    "failed": "Error: the prompt could not be stored",
+    "error": "Error: the file could not be processed (see the server log)",
+    "found": "Metadata found, but no prompt text to store",
+    "not_saved": "Skipped · its PromptManager node does not save to the library",
+    "not_saved_wired": (
+        "Skipped · its Save to library switch is wired from another node, so only "
+        "the run itself can link it"
+    ),
+    None: "No prompt metadata in the file",
+}
+
+
+def _plural(count, word):
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def _time_left(done, total, batches, elapsed):
+    """ " · about X min left" once enough batches ran, else "" (D56).
+
+    Shared by every Activity job that reports "Processing file N of M": the
+    scan counts its batches, the image tagging job each file.
+    """
+    if batches < MIN_BATCHES_FOR_ESTIMATE or done <= 0 or done >= total:
+        return ""
+    minutes = max(1, math.ceil(elapsed / done * (total - done) / 60))
+    return f" · about {minutes} min left"
+
+
+def new_review_counts():
+    """The scan's Needs review tally: ``added`` new items, ``queued`` files
+    in the queue after this scan (new or already there), ``settled`` items
+    removed because their file is linked now, ``untraced`` items removed
+    because they offer nothing to choose, and ``errors``."""
+    return {"added": 0, "queued": 0, "settled": 0, "untraced": 0, "errors": 0}
+
+
+def _review_scope(review):
+    """The scan job's ``scope`` keys for its Needs review tally.
+
+    ``review_items`` is the number of this scan's files that are in the
+    pending queue after it: the review group's ambiguous files, less those a
+    capture could not read or a decision already settled.
+    """
+    return {
+        "review_items": review["queued"],
+        "review_added": review["added"],
+        "review_settled": review["settled"],
+        "review_untraced": review["untraced"],
+        "review_errors": review["errors"],
+    }
+
+
+def _scan_status_line(done, total, batches, elapsed):
+    """ "Processing file N of M", with an estimate once enough batches ran."""
+    line = f"Processing file {done:,} of {total:,}"
+    return line + _time_left(done, total, batches, elapsed)
+
+
+def _file_size(path):
+    """``path``'s size on disk, or None when it cannot be read."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def _scan_roots(output_dirs):
+    """(absolute root, public label, listing index), the most specific first.
+
+    The index is the root's place in ``output_dirs`` (``_get_all_output_dirs``),
+    the ``root_index`` the workspace listing names it by.
+    """
+    public_path, _ = _public_helpers()
+    roots = [
+        (os.path.abspath(str(d)), public_path(d), index)
+        for index, d in enumerate(output_dirs)
+    ]
+    return sorted(roots, key=lambda root: len(root[0]), reverse=True)
+
+
+def _scan_location(media_file, roots):
+    """``media_file`` relative to its output root, that root's label and index."""
+    full = os.path.abspath(str(media_file))
+    folded = os.path.normcase(full)
+    for root, label, index in roots:
+        base = os.path.normcase(root).rstrip("\\/") + os.sep
+        if folded.startswith(base):
+            return Path(os.path.relpath(full, root)).as_posix(), label, index
+    return Path(full).name, "", None
+
+
+def _scan_outcome(media_file, roots, status, title=None):
+    """The (group, row, log line) one scanned file records in its job."""
+    if status in SCAN_GROUPS:
+        group = SCAN_GROUPS[status]
+    else:
+        group = "errors" if status == "error" else "no_metadata"
+    template = SCAN_TITLED_DETAILS.get(status) if title else None
+    detail = template.format(title=title) if template else SCAN_DETAILS[status]
+    path, label, index = _scan_location(media_file, roots)
+    row = {"path": path, "root": label, "root_index": index, "detail": detail}
+    where = f"{label}/{path}" if label else path
+    return group, row, f"{SCAN_LOG_PREFIXES[group]} {where} · {detail}"
 
 
 def _inspect_restore_upload(path):
@@ -260,15 +510,36 @@ def _diagnose_dependencies():
     }
 
 
-def _diagnose_output_dirs(configured_dirs):
+def legacy_checks(db_path, public_path=None):
+    """The four checks of ``GET /diagnostics`` (blocking).
+
+    Shared with the diagnostic report (``py/api/diagnostics_report.py``),
+    which passes its own ``public_path`` so a folder outside ComfyUI is never
+    named.
+    """
+    from ..config import GalleryConfig
+
+    return {
+        "database": _diagnose_database(db_path),
+        "dependencies": _diagnose_dependencies(),
+        "comfyui_output": _diagnose_output_dirs(
+            GalleryConfig.MONITORING_DIRECTORIES, public_path
+        ),
+        "image_monitor": _diagnose_image_monitor(public_path),
+    }
+
+
+def _diagnose_output_dirs(configured_dirs, public_path=None):
     """Configured gallery roots, ComfyUI's output dir, or relative fallbacks."""
     _public_path, _ = _public_helpers()
+    _public_path = public_path or _public_path
     candidates = list(configured_dirs)
     try:
         import folder_paths
 
         candidates.append(folder_paths.get_output_directory())
     except ImportError:
+        # outside ComfyUI there is no output folder to add
         pass
 
     output_dirs = []
@@ -296,9 +567,10 @@ def _diagnose_output_dirs(configured_dirs):
     }
 
 
-def _diagnose_image_monitor():
+def _diagnose_image_monitor(public_path=None):
     """Status of the running image monitor, with public directory names."""
     _public_path, _public_error = _public_helpers()
+    _public_path = public_path or _public_path
     try:
         monitor = _current_image_monitor()
         if monitor is None:
@@ -327,6 +599,62 @@ def _image_monitor_module():
 def _current_image_monitor():
     """The running ImageMonitor singleton, or None when not started."""
     return getattr(_image_monitor_module(), "_monitor_instance", None)
+
+
+class _BatchHistory:
+    """A scan batch's recorded-history lookup, made on the first file needing it.
+
+    Most files link through their metadata and never ask; the first one that
+    does triggers one ``recorded_runs`` pass for the whole batch, from which
+    both the stored prompt (``get``) and the recorded saver (``recorded``)
+    of every file are read. A failure is logged and names nothing.
+    """
+
+    def __init__(self, api, media_files):
+        self._api = api
+        self._files = [str(path) for path in media_files]
+        self._runs = None
+        self._prompts = {}
+
+    def _found(self):
+        if self._runs is None:
+            try:
+                self._runs = recorded_runs(
+                    self._api.db, self._files, host_output_directory(), None
+                )
+            except Exception:
+                self._api.logger.warning(
+                    "History attribution failed for a scan batch", exc_info=True
+                )
+                self._runs = {}
+        return self._runs
+
+    def get(self, path):
+        """The stored prompt id history attributes to ``path``, else None."""
+        found = self._found().get(path)
+        if found is None:
+            return None
+        run_id = found[0]
+        if run_id not in self._prompts:
+            try:
+                self._prompts[run_id] = named_prompt(self._api.db, run_id)
+            except Exception:
+                self._api.logger.warning(
+                    "History attribution failed for a scan batch", exc_info=True
+                )
+                self._prompts[run_id] = None
+        return self._prompts[run_id]
+
+    def recorded(self, path):
+        """``RecordedOutput(saver, {})`` for an attributed file, else None.
+
+        ``saver`` is set only when the run reported the file from one node.
+        """
+        found = self._found().get(path)
+        if found is None:
+            return None
+        nodes = found[1]
+        return RecordedOutput(next(iter(nodes)) if len(nodes) == 1 else None, {})
 
 
 class AdminRoutesMixin:
@@ -361,14 +689,6 @@ class AdminRoutesMixin:
         async def get_stats_route(request):
             return await self.get_statistics(request)
 
-        @routes.get("/prompt_manager/settings")
-        async def get_settings_route(request):
-            return await self.get_settings(request)
-
-        @routes.post("/prompt_manager/settings")
-        async def save_settings_route(request):
-            return await self.save_settings(request)
-
         @routes.get("/prompt_manager/backup")
         async def backup_database_route(request):
             return await self.backup_database(request)
@@ -400,12 +720,21 @@ class AdminRoutesMixin:
     LONG_JOB_DUPLICATES = "duplicates"
 
     async def scan_duplicates_endpoint(self, request):
-        """Scan for duplicate images without removing them (single flight)."""
-        job = self._acquire_long_job(self.LONG_JOB_DUPLICATES)
-        if job is None:
-            return self._long_job_busy_response("Duplicate scan")
-        async with job:
-            return await self._scan_duplicates(request)
+        """Scan for duplicate images without removing them.
+
+        Holds the ``duplicates`` kind on the registry (a ``read`` hold, so it
+        is listed in Activity), so it is single flight with every duplicate
+        find, and it is refused while a duplicate removal runs.
+        """
+        cleanup = self._jobs.active(DUPLICATE_CLEANUP_JOB_KIND)
+        if cleanup is not None:
+            return self._long_job_busy_response(cleanup.title)
+        return await self._run_held(
+            DUPLICATES_JOB_KIND,
+            DUPLICATE_FIND_LEGACY_TITLE,
+            "read",
+            functools.partial(self._scan_duplicates, request),
+        )
 
     async def _scan_duplicates(self, request):
         try:
@@ -427,24 +756,29 @@ class AdminRoutesMixin:
             )
 
     async def scan_duplicates_stream(self, request):
-        """Run the duplicate scan as a background job and stream its progress.
+        """Stream a duplicate find to the legacy gallery (its event shapes).
 
-        A request while a scan is running attaches to it. The job holds the
-        duplicates lock, so a delete is refused (409) until it finishes.
+        Starts the registry's ``duplicates`` job over the gallery's output
+        folder, or attaches to the running one when it covers that folder
+        (one started in the workspace, for instance). A held legacy scan, a
+        find that does not cover the folder or a running removal answers the
+        legacy 409. The job outlives the request.
         """
-        job = self._duplicate_job
-        if job is None or job.finished:
-            guard = self._acquire_long_job(self.LONG_JOB_DUPLICATES)
-            if guard is None:
-                return self._long_job_busy_response("Duplicate scan or delete")
-            job = ScanJob()
-            self._duplicate_job = job
-            job.task = asyncio.ensure_future(self._run_duplicate_job(job, guard))
+        job = self._jobs.active(DUPLICATES_JOB_KIND)
+        if job is None:
+            try:
+                job = self._start_duplicate_find(origin="gallery")
+            except JobBusy as busy:
+                return self._long_job_busy_response(busy.running.title)
+        else:
+            legacy_dir = await self._run_in_executor(self._find_comfyui_output_dir)
+            if not self._find_covers(job, legacy_dir):
+                return self._long_job_busy_response(job.title)
         return await self._stream_scan_job(request, job)
 
     async def scan_duplicates_status(self, request):
-        """Whether a duplicate scan is running, and its latest event."""
-        job = self._duplicate_job
+        """Whether a duplicate find is running, and its latest legacy event."""
+        job = self._latest_duplicate_find()
         return web.json_response(
             {
                 "success": True,
@@ -453,64 +787,16 @@ class AdminRoutesMixin:
             }
         )
 
-    async def _run_duplicate_job(self, job, guard):
-        loop = asyncio.get_running_loop()
-        counts = {"processed": 0}
-
-        def report(done, total):
-            # Called from worker threads; hand the event to the loop.
-            counts["processed"] = done
-            pct = int(done / total * 100) if total else 100
-            loop.call_soon_threadsafe(
-                job.publish,
-                {
-                    "type": "progress",
-                    "progress": pct,
-                    "status": f"Hashing file {done}/{total}...",
-                    "processed": done,
-                    "found": 0,
-                },
-            )
-
-        try:
-            async with guard:
-                job.publish(
-                    {
-                        "type": "progress",
-                        "progress": 0,
-                        "status": "Collecting media files...",
-                        "processed": 0,
-                        "found": 0,
-                    }
-                )
-                output_dir = await self._run_in_executor(self._find_comfyui_output_dir)
-                groups = await self._run_in_executor(
-                    self._find_duplicate_images_sync, output_dir, report
-                )
-                job.publish(
-                    {
-                        "type": "complete",
-                        "processed": counts["processed"],
-                        "found": len(groups),
-                        "duplicates": groups,
-                        "message": f"Found {len(groups)} groups of duplicate images",
-                    }
-                )
-        except Exception:
-            self.logger.exception("Duplicate scan error")
-            job.publish(
-                {
-                    "type": "error",
-                    "message": (
-                        "An internal error occurred. Check server logs for details."
-                    ),
-                }
-            )
-        finally:
-            job.finish()
-
     async def cleanup_duplicates_endpoint(self, request):
-        """Cleanup duplicate prompts endpoint."""
+        """Cleanup duplicate prompts endpoint (holds the registry: records)."""
+        return await self._run_held(
+            MAINTENANCE_JOB_KIND,
+            "Prompt cleanup (admin page)",
+            "records",
+            self._cleanup_duplicates,
+        )
+
+    async def _cleanup_duplicates(self):
         try:
             removed_count = await self._run_in_executor(self.db.cleanup_duplicates)
 
@@ -537,31 +823,128 @@ class AdminRoutesMixin:
     def _find_duplicate_images_sync(self, output_dir, progress=None):
         """Group media files under ``output_dir`` by content hash (blocking).
 
-        Files are hashed on ``PromptManagerConfig.WORKER_THREADS`` threads.
-        ``progress(done, total)`` is called from those threads about every
-        percent and once at the end.
+        The legacy response shape over ``_hash_media_groups``, which the
+        workspace's duplicate find shares.
         """
-        from ..config import PromptManagerConfig
-
         if not output_dir or not os.path.isdir(output_dir):
             self.logger.warning("ComfyUI output directory not found")
             return []
+        groups = self._hash_media_groups([os.path.abspath(output_dir)], progress)
+        duplicates = self._legacy_duplicate_groups(groups, output_dir)
+        self.logger.info(f"Found {len(duplicates)} groups of duplicate images")
+        return duplicates
 
-        output_path = Path(output_dir)
+    def _legacy_duplicate_groups(self, groups, output_dir):
+        """``_hash_media_groups`` groups as the legacy gallery reads them.
+
+        Only the files under ``output_dir`` count (paths are relative to it);
+        a group needs two of them. A file that vanished since it was hashed
+        is left out. Each ``url`` names the source ``output_dir`` is
+        (``?root=``) when it is one, so View Full never opens another
+        source's file at the same path.
+        """
+        output_path = Path(os.path.abspath(output_dir))
+        identity = os.path.normcase(os.path.realpath(str(output_path)))
+        root_index = next(
+            (
+                index
+                for index, root in enumerate(self._get_all_output_dirs())
+                if os.path.normcase(os.path.realpath(str(root))) == identity
+            ),
+            None,
+        )
+        base = os.path.normcase(str(output_path)).rstrip("\\/") + os.sep
+        duplicates = []
+        for group in groups:
+            images = []
+            for record in group["files"]:
+                if not os.path.normcase(record["abs"]).startswith(base):
+                    continue
+                try:
+                    images.append(
+                        self._describe_media_file(
+                            Path(record["abs"]),
+                            output_path,
+                            file_hash=group["hash"],
+                            root_index=root_index,
+                        )
+                    )
+                except (OSError, ValueError) as e:
+                    self.logger.error(
+                        f"Error describing {Path(record['abs']).name}: {e}"
+                    )
+            if len(images) > 1:
+                duplicates.append(
+                    {"hash": group["hash"], "images": images, "count": len(images)}
+                )
+        return duplicates
+
+    def _hash_media_groups(self, roots, progress=None, stop=None):
+        """Content-identical media files under ``roots`` (blocking).
+
+        Each root is walked as ``_collect_media_files`` walks (no symlinks,
+        no ``thumbnails``, bounded). A physical file is listed once, under
+        the first root that holds it: files are told apart by ``(st_dev,
+        st_ino)``, so a source listed twice under two spellings (a symlink, a
+        bind mount, a case variant), a source inside another one or a
+        hardlink is one file, never a copy of itself. At most MAX_SCAN_FILES
+        files are read. Files
+        are hashed on ``PromptManagerConfig.WORKER_THREADS`` threads;
+        ``progress(done, total)`` is called from those threads about every
+        percent and once at the end, and ``stop()`` true skips the files not
+        yet read. Returns ``[{hash, size, files:[{slot, abs, rel, size,
+        mtime, mtime_ns, inode}]}]`` for every hash shared by two or more
+        files (``inode`` is ``[st_dev, st_ino]``), ``slot``
+        being the root's place in ``roots`` and the files oldest first.
+        """
+        from ..config import PromptManagerConfig
+
         extensions = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
-        media_files = _collect_media_files([output_path], extensions)
+        media_files = []
+        seen = set()
+        # #480: a file removed from the library is never a copy or a keeper.
+        marks = self._removal_marks()
+        for slot, root in enumerate(roots):
+            for path in _collect_media_files([root], extensions):
+                try:
+                    # os.stat, not Path.stat: one stat call for every check
+                    # (Python 3.10's Path.stat bypasses a patched os.stat).
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                locator = os.path.normcase(os.path.realpath(str(path)))
+                if locator in marks and mark_hides(marks, locator, path):
+                    continue
+                key = _physical_file_key(path, stat)
+                if key not in seen:
+                    seen.add(key)
+                    media_files.append((slot, root, path, stat))
+                if len(media_files) >= MAX_SCAN_FILES:
+                    break
+        media_files = media_files[:MAX_SCAN_FILES]
         total = len(media_files)
         self.logger.info(f"Found {total} media files to analyze")
         step = max(1, total // 100)
         counter = {"done": 0}
         lock = threading.Lock()
 
-        def describe(media_path):
-            try:
-                info = self._describe_media_file(media_path, output_path)
-            except Exception as e:
-                self.logger.error(f"Error processing file {media_path.name}: {e}")
-                info = None
+        def describe(item):
+            slot, root, media_path, stat = item
+            info = None
+            if stop is None or not stop():
+                try:
+                    info = {
+                        "slot": slot,
+                        "abs": str(media_path),
+                        "rel": Path(os.path.relpath(str(media_path), root)).as_posix(),
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                        "mtime_ns": stat.st_mtime_ns,
+                        "inode": [stat.st_dev, stat.st_ino],
+                        "hash": self._calculate_file_hash(media_path),
+                    }
+                except Exception as e:
+                    self.logger.error(f"Error processing file {media_path.name}: {e}")
             with lock:
                 counter["done"] += 1
                 done = counter["done"]
@@ -575,45 +958,56 @@ class AdminRoutesMixin:
 
         infos = map_parallel(describe, media_files, PromptManagerConfig.WORKER_THREADS)
 
-        file_hashes = {}
+        by_hash = {}
         for info in infos:
             if info is not None:
-                file_hashes.setdefault(info["hash"], []).append(info)
-
-        duplicates = []
-        for file_hash, images in file_hashes.items():
-            if len(images) > 1:
-                images.sort(key=lambda x: x["modified_time"])
-                duplicates.append(
-                    {"hash": file_hash, "images": images, "count": len(images)}
+                by_hash.setdefault(info.pop("hash"), []).append(info)
+        groups = []
+        for file_hash, files in by_hash.items():
+            if len(files) > 1:
+                files.sort(key=lambda record: (record["mtime"], record["abs"]))
+                groups.append(
+                    {"hash": file_hash, "size": files[0]["size"], "files": files}
                 )
+        return groups
 
-        self.logger.info(f"Found {len(duplicates)} groups of duplicate images")
-        return duplicates
-
-    def _describe_media_file(self, media_path, output_path):
-        """Hash one media file and describe it for the duplicates response."""
+    def _describe_media_file(
+        self, media_path, output_path, file_hash=None, root_index=None
+    ):
+        """Describe one media file for the duplicates response (hashing it
+        unless ``file_hash`` is given). With ``root_index`` the ``url`` names
+        that source and its path is URL-encoded."""
         stat = media_path.stat()
         rel_path = media_path.relative_to(output_path)
         extension = media_path.suffix.lower()
         is_video = extension in VIDEO_EXTENSIONS
 
-        thumb_rel = _thumbnail_rel_path(rel_path, ".jpg" if is_video else extension)
-        thumbnail_url = thumbnail_url_for(thumb_rel, output_path / thumb_rel)
+        existing = thumbnail_settings.existing_thumbnail(output_path, rel_path)
+        thumbnail_url = None
+        if existing is not None:
+            thumb_rel = (
+                thumbnail_settings.thumbnail_stem_rel(rel_path) + existing.suffix
+            )
+            thumbnail_url = thumbnail_url_for(thumb_rel, existing)
+        if root_index is None:
+            url = f"/prompt_manager/images/serve/{rel_path.as_posix()}"
+        else:
+            encoded = urllib.parse.quote(rel_path.as_posix(), safe="/")
+            url = f"/prompt_manager/images/serve/{encoded}?root={root_index}"
 
         return {
             "id": str(hash(str(media_path))),
             "filename": media_path.name,
             "path": str(rel_path),
             "relative_path": str(rel_path),
-            "url": f"/prompt_manager/images/serve/{rel_path.as_posix()}",
+            "url": url,
             "thumbnail_url": thumbnail_url,
             "size": stat.st_size,
             "modified_time": stat.st_mtime,
             "extension": extension,
             "media_type": "video" if is_video else "image",
             "is_video": is_video,
-            "hash": self._calculate_file_hash(media_path),
+            "hash": file_hash or self._calculate_file_hash(media_path),
         }
 
     def _calculate_file_hash(self, file_path):
@@ -625,30 +1019,40 @@ class AdminRoutesMixin:
         return hash_sha256.hexdigest()
 
     async def delete_duplicate_images_endpoint(self, request):
-        """Delete duplicate image files from disk (single flight with the scan)."""
-        job = self._acquire_long_job(self.LONG_JOB_DUPLICATES)
-        if job is None:
-            return self._long_job_busy_response("Duplicate scan or delete")
-        async with job:
-            return await self._delete_duplicate_images(request)
+        """Delete duplicate image files from disk.
 
-    async def _delete_duplicate_images(self, request):
+        Refused while a duplicate find runs, and a records hold on the
+        registry, so no scan, restore, removal or tagging job runs meanwhile.
+        A body without paths is refused before the hold (it is no job).
+        """
+        data, error_response = await _read_json(request)
+        if error_response is not None:
+            return error_response
+        image_paths = data.get("image_paths", [])
+        if not image_paths or not isinstance(image_paths, list):
+            return web.json_response(
+                {"success": False, "error": "No image paths provided"},
+                status=400,
+            )
+        find = self._jobs.active(DUPLICATES_JOB_KIND)
+        if find is not None:
+            return self._long_job_busy_response(find.title)
+        return await self._run_held(
+            DUPLICATE_CLEANUP_JOB_KIND,
+            "Duplicate image delete (gallery page)",
+            "records",
+            functools.partial(self._delete_duplicate_images, image_paths),
+        )
+
+    async def _delete_duplicate_images(self, image_paths):
         try:
-            data, error_response = await _read_json(request)
-            if error_response is not None:
-                return error_response
-            image_paths = data.get("image_paths", [])
-
-            if not image_paths or not isinstance(image_paths, list):
-                return web.json_response(
-                    {"success": False, "error": "No image paths provided"},
-                    status=400,
-                )
-
             output_dir = await self._run_in_executor(self._find_comfyui_output_dir)
             result = await self._run_in_executor(
                 self._delete_duplicate_images_sync, image_paths, output_dir
             )
+            if result["deleted_count"]:
+                # The cached listing would keep (and count) the deleted files.
+                self.invalidate_gallery_cache()
 
             response_data = {
                 "success": True,
@@ -694,13 +1098,21 @@ class AdminRoutesMixin:
         return result
 
     def _delete_one_duplicate(self, image_path, output_path):
-        """Delete one file and its thumbnail; return a failure reason or None."""
+        """Delete one file and its thumbnail; return a failure reason or None.
+
+        What is removed is exactly the folder's real path plus the name: a
+        link is removed itself, never its target, and the preview removed is
+        that name's. Both the link's place and what it leads to are checked.
+        """
         file_path = Path(image_path)
         if not file_path.is_absolute():
             file_path = output_path / file_path
 
         try:
-            rel_path = file_path.resolve().relative_to(output_path.resolve())
+            real_root = output_path.resolve()
+            rel_path = file_path.resolve().relative_to(real_root)
+            exact = Path(os.path.realpath(file_path.parent)) / file_path.name
+            exact_rel = exact.relative_to(real_root)
         except ValueError:
             self.logger.warning(
                 f"Attempted to delete file outside output directory: {image_path}"
@@ -709,22 +1121,19 @@ class AdminRoutesMixin:
 
         if file_path.suffix.lower() not in DELETABLE_MEDIA_EXTENSIONS:
             return "not a media file"
-        if "thumbnails" in rel_path.parts:
+        if "thumbnails" in rel_path.parts or "thumbnails" in exact_rel.parts:
             return "thumbnails are managed by the gallery"
+        if in_trash_below_roots(file_path, [output_path]) or in_trash_folder(
+            str(exact_rel)
+        ):
+            return "it is in a trash folder"  # never unlinked from a trash (#543)
 
         if not file_path.is_file():
             return "file not found"
 
-        os.remove(file_path)
+        os.remove(exact)
         self.logger.info(f"Deleted duplicate image: {image_path}")
-
-        thumbnail_path = output_path / _thumbnail_rel_path(rel_path, file_path.suffix)
-        try:
-            if thumbnail_path.exists():
-                os.remove(thumbnail_path)
-                self.logger.debug(f"Deleted associated thumbnail: {thumbnail_path}")
-        except OSError as e:
-            self.logger.warning(f"Could not delete thumbnail for {image_path}: {e}")
+        _remove_thumbnail(real_root, exact_rel, self.logger)
         return None
 
     async def get_statistics(self, request):
@@ -741,221 +1150,10 @@ class AdminRoutesMixin:
                 status=500,
             )
 
-    async def get_settings(self, request):
-        """Get current settings."""
-        try:
-            from ..config import PromptManagerConfig, GalleryConfig
-
-            root_paths = [
-                self._public_path(d) for d in GalleryConfig.MONITORING_DIRECTORIES
-            ]
-            return web.json_response(
-                {
-                    "success": True,
-                    "settings": {
-                        "result_timeout": PromptManagerConfig.RESULT_TIMEOUT,
-                        "webui_display_mode": PromptManagerConfig.WEBUI_DISPLAY_MODE,
-                        "infinite_scroll": PromptManagerConfig.INFINITE_SCROLL,
-                        "worker_threads": PromptManagerConfig.WORKER_THREADS,
-                        "cpu_count": PromptManagerConfig.max_worker_threads(),
-                        "gallery_root_paths": root_paths,
-                        "gallery_root_path": root_paths[0] if root_paths else "",
-                        "monitored_directories": [
-                            self._public_path(d) for d in self._monitored_directories()
-                        ],
-                    },
-                }
-            )
-        except Exception as e:
-            self.logger.error(f"Get settings error: {e}", exc_info=True)
-            return web.json_response(
-                {"success": False, "error": "Failed to get settings"},
-                status=500,
-            )
-
-    def _monitored_directories(self):
-        """Directories the running image monitor watches, else the configured roots."""
-        from ..config import GalleryConfig
-
-        monitor = _current_image_monitor()
-        if monitor is not None:
-            return list(getattr(monitor, "monitored_directories", []))
-        return list(GalleryConfig.MONITORING_DIRECTORIES)
-
-    async def save_settings(self, request):
-        """Save settings: the whole payload is validated before anything changes."""
-        try:
-            from ..config import PromptManagerConfig
-
-            data, error_response = await _read_json(request)
-            if error_response is not None:
-                return error_response
-
-            try:
-                updates = self._validate_settings(data)
-            except ValueError as ve:
-                return web.json_response(
-                    {"success": False, "error": str(ve)}, status=400
-                )
-
-            new_roots, error = self._parse_gallery_roots(data)
-            if error:
-                return web.json_response({"success": False, "error": error}, status=400)
-
-            for name, value in updates.items():
-                setattr(PromptManagerConfig, name, value)
-            restart_required = False
-            if new_roots is not None:
-                restart_required = self._apply_gallery_roots(new_roots)
-
-            self._persist_settings()
-
-            return web.json_response(
-                {
-                    "success": True,
-                    "message": "Settings saved successfully",
-                    "restart_required": restart_required,
-                }
-            )
-        except Exception as e:
-            self.logger.error(f"Save settings error: {e}", exc_info=True)
-            return web.json_response(
-                {"success": False, "error": "Failed to save settings"},
-                status=500,
-            )
-
-    @staticmethod
-    def _validate_settings(data):
-        """Scalar settings of a payload as ``{CONFIG_ATTR: value}``.
-
-        Raises ValueError with a user-facing message on the first bad value;
-        nothing is applied until every value passed.
-        """
-        from ..config import PromptManagerConfig
-
-        updates = {}
-        if "result_timeout" in data:
-            updates["RESULT_TIMEOUT"] = validate_result_timeout(data["result_timeout"])
-        if "webui_display_mode" in data:
-            mode = data["webui_display_mode"]
-            if mode not in ("popup", "newtab"):
-                raise ValueError("webui_display_mode must be 'popup' or 'newtab'")
-            updates["WEBUI_DISPLAY_MODE"] = mode
-        if "infinite_scroll" in data:
-            if not isinstance(data["infinite_scroll"], bool):
-                raise ValueError("infinite_scroll must be true or false")
-            updates["INFINITE_SCROLL"] = data["infinite_scroll"]
-        if "worker_threads" in data:
-            updates["WORKER_THREADS"] = validate_worker_threads(
-                data["worker_threads"], PromptManagerConfig.max_worker_threads()
-            )
-        return updates
-
-    def _parse_gallery_roots(self, data):
-        """Extract and validate gallery roots from a settings payload.
-
-        Accepts ``gallery_root_paths`` (list, preferred) or the legacy single
-        ``gallery_root_path`` string. Blank entries are dropped.
-
-        Returns:
-            (roots, error): ``roots`` is the validated list, or ``None`` when
-            the payload carries no gallery root key; ``error`` is a message
-            when validation failed (and ``roots`` is then ``None``).
-        """
-        if "gallery_root_paths" in data:
-            raw = data["gallery_root_paths"]
-            if not isinstance(raw, list):
-                return None, "gallery_root_paths must be a list"
-        elif "gallery_root_path" in data:
-            raw = [data["gallery_root_path"]]
-        else:
-            return None, None
-
-        from ..config import GalleryConfig
-
-        roots = []
-        for entry in raw:
-            if not isinstance(entry, str):
-                return None, "Gallery root paths must be strings"
-            entry = entry.strip()
-            if not entry:
-                continue
-            ok, reason = GalleryConfig.validate_gallery_root(entry)
-            if not ok:
-                return (
-                    None,
-                    f"Invalid gallery root '{os.path.basename(entry)}': {reason}",
-                )
-            roots.append(GalleryConfig.resolve_gallery_root(entry))
-        return roots, None
-
-    def _apply_gallery_roots(self, roots):
-        """Install validated gallery roots; returns True when they changed."""
-        from ..config import GalleryConfig
-
-        if roots == list(GalleryConfig.MONITORING_DIRECTORIES):
-            return False
-        GalleryConfig.MONITORING_DIRECTORIES = roots
-        self._cached_output_dir = None
-        self.reset_gallery_roots_cache()
-        return True
-
-    def _persist_settings(self):
-        """Merge the user-editable settings into the configured config.json.
-
-        Only the keys this endpoint owns are rewritten; every other section
-        (integrations, database, performance, ...) and every other key in
-        ``web_ui``/``gallery`` is kept as it was. A config file that cannot
-        be parsed is replaced.
-        """
-        from ..config import GalleryConfig, PromptManagerConfig, write_private_json
-
-        config_file = PromptManagerConfig.get_config_path()
-        existing = self._read_config_file(config_file)
-        web_ui = dict(existing.get("web_ui") or {})
-        web_ui["result_timeout"] = PromptManagerConfig.RESULT_TIMEOUT
-        web_ui["webui_display_mode"] = PromptManagerConfig.WEBUI_DISPLAY_MODE
-        web_ui["infinite_scroll"] = PromptManagerConfig.INFINITE_SCROLL
-        gallery = dict(existing.get("gallery") or {})
-        monitoring = dict(gallery.get("monitoring") or {})
-        monitoring["directories"] = list(GalleryConfig.MONITORING_DIRECTORIES)
-        gallery["monitoring"] = monitoring
-        performance = dict(existing.get("performance") or {})
-        performance["worker_threads"] = PromptManagerConfig.WORKER_THREADS
-        config_data = {
-            **existing,
-            "web_ui": web_ui,
-            "gallery": gallery,
-            "performance": performance,
-        }
-        try:
-            write_private_json(config_file, config_data)
-            self.logger.info(f"Settings saved to {config_file}")
-        except OSError as save_err:
-            self.logger.warning(f"Could not save config file: {save_err}")
-
-    def _read_config_file(self, config_file):
-        """Current contents of config.json as a dict, or {} when unusable."""
-        try:
-            with open(config_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
-
     async def run_diagnostics(self, request):
         """Run comprehensive system diagnostics and health checks."""
         try:
-            from ..config import GalleryConfig
-
-            results = {
-                "database": _diagnose_database(self.db.model.db_path),
-                "dependencies": _diagnose_dependencies(),
-                "comfyui_output": _diagnose_output_dirs(
-                    GalleryConfig.MONITORING_DIRECTORIES
-                ),
-                "image_monitor": _diagnose_image_monitor(),
-            }
+            results = legacy_checks(self.db.model.db_path)
             return web.json_response({"success": True, "diagnostics": results})
 
         except Exception as e:
@@ -1035,6 +1233,11 @@ class AdminRoutesMixin:
         "vacuum",
         "cleanup_orphaned_images",
     )
+    # Operations that only read; a run of only these holds the registry as
+    # "read", every other run as "records".
+    READ_ONLY_MAINTENANCE_OPERATIONS = frozenset(
+        {"check_hash_duplicates", "statistics", "check_consistency"}
+    )
 
     async def run_maintenance(self, request):
         """Perform database maintenance operations and report each outcome."""
@@ -1047,7 +1250,27 @@ class AdminRoutesMixin:
             operations = data.get(
                 "operations", list(self.DEFAULT_MAINTENANCE_OPERATIONS)
             )
+        except Exception as e:
+            self.logger.error(f"Maintenance error: {e}", exc_info=True)
+            return web.json_response(
+                {"success": False, "error": "Maintenance failed"}, status=500
+            )
+        writes = not (
+            isinstance(operations, list)
+            and all(
+                isinstance(name, str) and name in self.READ_ONLY_MAINTENANCE_OPERATIONS
+                for name in operations
+            )
+        )
+        return await self._run_held(
+            MAINTENANCE_JOB_KIND,
+            "Maintenance (admin page)",
+            "records" if writes else "read",
+            lambda: self._run_maintenance(operations),
+        )
 
+    async def _run_maintenance(self, operations):
+        try:
             results = await self._run_in_executor(
                 self._run_maintenance_operations, operations
             )
@@ -1104,8 +1327,10 @@ class AdminRoutesMixin:
                 db.cleanup_duplicates(), "duplicate prompts"
             ),
             "vacuum": vacuum,
+            # Only under sources that can be read now (never an unmounted drive).
             "cleanup_orphaned_images": lambda: count_result(
-                db.cleanup_missing_images(), "orphaned image records"
+                db.cleanup_missing_images(self._health_roots()),
+                "orphaned image records",
             ),
             "check_hash_duplicates": lambda: self._hash_duplicates_result(
                 db.check_hash_duplicates()
@@ -1146,187 +1371,21 @@ class AdminRoutesMixin:
             "message": f"Found {len(issues)} consistency issues",
         }
 
-    async def backup_database(self, request):
-        """Download a consistent copy of the prompts database (WAL included)."""
-        try:
-            model = self.db.model
-            db_path = model.db_path
-
-            if not os.path.exists(db_path):
-                return web.json_response(
-                    {"success": False, "error": "Database file not found"}, status=404
-                )
-
-            fd, temp_path = tempfile.mkstemp(suffix=".db")
-            os.close(fd)
-            try:
-                ok = await self._run_in_executor(model.backup_database, temp_path)
-                if not ok:
-                    return web.json_response(
-                        {"success": False, "error": "Failed to create database backup"},
-                        status=500,
-                    )
-                # Read once (the file is deleted right after) rather than
-                # streaming so the temp file never outlives the request.
-                with open(temp_path, "rb") as fh:
-                    file_data = fh.read()
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"prompts_backup_{timestamp}.db"
-
-            return web.Response(
-                body=file_data,
-                content_type="application/octet-stream",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Content-Length": str(len(file_data)),
-                },
-            )
-
-        except Exception as e:
-            self.logger.error(f"Backup error: {e}", exc_info=True)
-            return web.json_response(
-                {
-                    "success": False,
-                    "error": f"Failed to backup database: {self._public_error(e)}",
-                },
-                status=500,
-            )
-
-    async def restore_database(self, request):
-        """Restore the prompts database from an uploaded SQLite file.
-
-        The upload is streamed to a temp file (capped at restore_max_bytes),
-        verified with PromptModel.verify_database_file and only then copied
-        over the live database, which is backed up first.
-        """
-        max_bytes = getattr(self, "restore_max_bytes", 100 * 1024 * 1024)
-        temp_path = None
-        try:
-            reader = await request.multipart()
-            field = await reader.next()
-
-            if not field or field.name != "database_file":
-                return web.json_response(
-                    {
-                        "success": False,
-                        "error": (
-                            "No database file uploaded. "
-                            "Expected field name: database_file"
-                        ),
-                    },
-                    status=400,
-                )
-
-            fd, temp_path = tempfile.mkstemp(suffix=".db")
-            os.close(fd)
-            size = 0
-            with open(temp_path, "wb") as out:
-                while True:
-                    chunk = await field.read_chunk()
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > max_bytes:
-                        return web.json_response(
-                            {
-                                "success": False,
-                                "error": (
-                                    "File too large. Maximum size is "
-                                    f"{max_bytes // (1024 * 1024)}MB"
-                                ),
-                            },
-                            status=400,
-                        )
-                    out.write(chunk)
-
-            if size == 0:
-                return web.json_response(
-                    {"success": False, "error": "Uploaded file is empty"}, status=400
-                )
-
-            model = self.db.model
-            ok, reason = await self._run_in_executor(
-                model.verify_database_file, temp_path
-            )
-            if ok:
-                reason = await self._run_in_executor(_inspect_restore_upload, temp_path)
-                ok = reason is None
-            if not ok:
-                return web.json_response(
-                    {"success": False, "error": reason}, status=400
-                )
-
-            try:
-                backup_path = await self._run_in_executor(
-                    model.restore_from_file, temp_path
-                )
-            except sqlite3.OperationalError as exc:
-                if (
-                    getattr(exc, "_prompt_manager_restore_backup_created", False)
-                    is True
-                ):
-                    try:
-                        await self._run_in_executor(
-                            _prune_safety_backups, model.db_path
-                        )
-                    except Exception:
-                        self.logger.warning(
-                            "Could not prune safety backups after failed restore"
-                        )
-                raise
-            removed = await self._run_in_executor(_prune_safety_backups, model.db_path)
-            if removed:
-                self.logger.info(f"Removed {len(removed)} old safety backups")
-            previous = self.db
-            self.db = PromptDatabase(model.db_path)
-            # Its connections would otherwise linger (a file lock on Windows)
-            previous.close_all()
-            prompt_count = self.db.model.get_database_info().get("total_prompts", 0)
-
-            return web.json_response(
-                {
-                    "success": True,
-                    "message": (
-                        "Database restored successfully. "
-                        f"Found {prompt_count} prompts."
-                    ),
-                    "prompt_count": prompt_count,
-                    "backup_created": (
-                        self._public_path(backup_path) if backup_path else None
-                    ),
-                }
-            )
-
-        except Exception as e:
-            self.logger.error(f"Restore error: {e}", exc_info=True)
-            return web.json_response(
-                {
-                    "success": False,
-                    "error": f"Failed to restore database: {self._public_error(e)}",
-                },
-                status=500,
-            )
-        finally:
-            if temp_path:
-                for suffix in ("", "-wal", "-shm", "-journal"):
-                    if os.path.exists(temp_path + suffix):
-                        os.unlink(temp_path + suffix)
-
     async def scan_images(self, request):
         """Scan ComfyUI output images for prompt metadata and add them to the database.
 
-        The scan runs as a background task that outlives this request, so a
-        closed tab never leaves a half-finished scan. Progress streams as
-        server-sent events; while a scan is running, a new request attaches
-        to it instead of starting another one.
+        The scan runs as the registry's ``scan`` job, which outlives this
+        request, so a closed tab never leaves a half-finished scan. Progress
+        streams as the legacy server-sent events; while a scan is running
+        (started here or from the workspace), a new request attaches to it
+        instead of starting another one.
         """
-        job = self._scan_job
-        if job is None or job.finished:
-            job = self._start_scan_job()
+        job = self._jobs.active(SCAN_JOB_KIND)
+        if job is None:
+            try:
+                job = self._start_scan_job("all")
+            except JobBusy as busy:
+                return self._long_job_busy_response(busy.running.title)
         return await self._stream_scan_job(request, job)
 
     async def cancel_scan(self, request):
@@ -1348,19 +1407,57 @@ class AdminRoutesMixin:
             }
         )
 
-    def _start_scan_job(self):
-        """Create the job record synchronously, then run the scan as a task."""
-        job = ScanJob()
+    def _start_scan_job(
+        self, files=DEFAULT_SCAN_SCOPE, roots=None, output_dirs=None, returned=None
+    ):
+        """Register the scan job synchronously; its runner starts on the loop.
+
+        ``files`` is the scope (``SCAN_SCOPES``). ``roots`` selects sources by
+        their index in ``output_dirs`` (the effective sources the caller
+        resolved); None scans every source, resolved when the job starts.
+        Raises JobBusy while another record-changing job runs. ``returned``
+        (#498, ``[(path, locator)]``) makes it "Return images to the library":
+        those files' removal marks go first, then only they are scanned.
+        """
+        if files not in SCAN_SCOPES:
+            raise ValueError(f"Unknown scan scope: {files!r}")
+        if roots is not None and (
+            output_dirs is None or not roots or max(roots) >= len(output_dirs)
+        ):
+            raise ValueError("A scoped scan needs the sources its roots index")
+        scope = {"files": files, "roots": None if roots is None else list(roots)}
+        if returned is not None:
+            scope = {"files": "returned", "roots": None, "images": len(returned)}
+        job = self._jobs.start(
+            SCAN_JOB_KIND,
+            SCAN_JOB_TITLE if returned is None else RETURN_JOB_TITLE,
+            record_changing=True,
+            scope=scope,
+            runner=functools.partial(
+                self._run_scan_job, output_dirs=output_dirs, returned=returned
+            ),
+            groups=SCAN_GROUP_NAMES,
+        )
         self._scan_job = job
-        job.task = asyncio.ensure_future(self._run_scan_job(job))
         return job
 
-    async def _run_scan_job(self, job):
-        try:
-            async for payload in self._scan_images_events():
-                job.publish(payload)
-        finally:
-            job.finish()
+    async def _run_scan_job(self, job, output_dirs=None, returned=None):
+        final = None
+        extra = {} if returned is None else {"returned": returned}
+        async for payload in self._scan_images_events(job, output_dirs, **extra):
+            job.publish(payload)
+            final = payload.get("type")
+        state = SCAN_FINAL_STATES.get(final, "finished")
+        if state == "failed":
+            job.log_line(f"Scan failed · {job.status_line}")
+        else:
+            verb = "cancelled" if state == "cancelled" else "finished"
+            job.log_line(f"Scan {verb} · {_plural(job.processed, 'file')} processed")
+        job.finish(state)
+        await self._release_job_memory()
+        if state == "finished":
+            # After the scan, so the guarded thumbnail job is admitted (#249).
+            await self._hand_off_scan_thumbnails(job, output_dirs)
 
     async def _stream_scan_job(self, request, job):
         """Stream ``job`` as SSE; stop quietly if the client goes away."""
@@ -1386,72 +1483,168 @@ class AdminRoutesMixin:
             )
         return response
 
-    async def _scan_images_events(self):
-        """Yield progress payloads while scanning every configured output directory."""
+    async def _scan_images_events(self, job, output_dirs=None, returned=None):
+        """Yield progress payloads while scanning the output directories.
+
+        Every effective source is walked, or only those ``job.scope["roots"]``
+        selects (indexes into ``output_dirs``). The payloads are the legacy SSE
+        events, unchanged; ``job`` also gets its status line, totals and one
+        outcome per processed file. Rows keep each source's listing index.
+        """
         try:
             self.logger.info("Starting image scan operation")
-            output_dirs = self._get_all_output_dirs()
-            if not output_dirs:
+            if output_dirs is None:
+                output_dirs = self._get_all_output_dirs()
+            selected = job.scope.get("roots")
+            walked = (
+                output_dirs
+                if selected is None
+                else [output_dirs[index] for index in selected]
+            )
+            if not walked:
                 self.logger.error("No output directories found")
-                yield {
-                    "type": "error",
-                    "message": "No output directories found. "
-                    "Configure scan directories in Settings.",
-                }
+                message = (
+                    "No output directories found. "
+                    "Configure scan directories in Settings."
+                )
+                job.update(status_line=message)
+                yield {"type": "error", "message": message}
                 return
 
-            dir_names = [self._public_path(d) for d in output_dirs]
+            dir_names = [self._public_path(d) for d in walked]
+            folders = _plural(len(walked), "output folder")
+            job.scope["output_folders"] = len(walked)
+            scope = SCAN_SCOPE_LOG[job.scope.get("files", "all")]
+            job.log_line(f"Scan started · {folders} · {scope}")
+            job.update(status_line=f"Looking for media files in {folders}")
             yield self._scan_progress(
-                0, f"Scanning {len(output_dirs)} directory(ies) for media files..."
+                0, f"Scanning {len(walked)} directory(ies) for media files..."
             )
 
-            media_files = await self._run_in_executor(
-                self._collect_output_media_sync, output_dirs
-            )
+            if returned is None:
+                media_files = await self._run_in_executor(
+                    self._collect_output_media_sync, walked
+                )
+            else:
+                # #498: only the files whose marks this job deleted.
+                media_files = await self._run_in_executor(
+                    self._clear_returned_marks, returned
+                )
+                job.log_line(f"Returned {_plural(len(media_files), 'image')}")
             counts = dict.fromkeys(SCAN_COUNT_KEYS, 0)
+            job.update(
+                total=len(media_files),
+                status_line=_scan_status_line(0, len(media_files), 0, 0),
+            )
             if media_files:
                 yield self._scan_progress(
                     5, f"Found {len(media_files)} media files to process...", counts
                 )
-            async for event in self._scan_batches(media_files, counts):
+            roots = _scan_roots(output_dirs)
+            known = set()
+            if media_files and job.scope.get("files") != "all":
+                known = await self._known_scan_files(job, media_files)
+            review = new_review_counts()
+            job.scope.update(_review_scope(review))
+            async for event in self._scan_batches(
+                media_files, counts, job, roots, known, review
+            ):
                 yield event
+            self._log_review_items(job, review)
 
             self.logger.info(
                 f"Scan completed: processed={counts['processed']}, "
                 f"found={counts['found']}, new_prompts_added={counts['added']}, "
                 f"images_linked_to_existing={counts['linked']}"
             )
-            job = self._scan_job
-            final_type = "cancelled" if job and job.cancelled else "complete"
+            final_type = "cancelled" if job.cancelled else "complete"
+            if final_type == "complete":
+                job.update(progress=100)
             yield {"type": final_type, **counts, "directories": dir_names}
 
         except Exception:
             self.logger.exception("Scan error")
+            job.update(status_line="The scan stopped on an internal error.")
             yield {
                 "type": "error",
                 "message": "An internal error occurred. Check server logs for details.",
             }
 
-    async def _scan_batches(self, media_files, counts):
+    async def _known_scan_files(self, job, media_files):
+        """The "new" scope's skip set; a failed read falls back to reading all."""
+        try:
+            return await self._run_in_executor(self._known_scan_files_sync, media_files)
+        except Exception:
+            self.logger.warning(
+                "Known files could not be read; the scan reads every file",
+                exc_info=True,
+            )
+            job.log_line("Known files could not be read · reading every file")
+            return set()
+
+    def _known_scan_files_sync(self, media_files):
+        """Stat each scanned file and ask the database which are known (blocking)."""
+        sizes = {str(media_file): _file_size(media_file) for media_file in media_files}
+        return self.db.get_known_resolved_paths(sizes)
+
+    async def _scan_batches(
+        self, media_files, counts, job, roots=(), known=(), review=None
+    ):
         """Process ``media_files`` in executor batches, updating ``counts`` in place.
 
-        Yields one progress event per batch.
+        Records each file's outcome in ``job`` and yields one progress event
+        per batch. Files in ``known`` (path strings) are not read: they count
+        as processed and unchanged and are recorded as skipped. ``review``
+        counts the Needs review items the batches record (``job.scope``
+        ``review_items`` / ``review_errors`` follow it after every batch).
         """
         total = len(media_files)
+        started = time.monotonic()
+        batches = 0
         for batch_start in range(0, total, SCAN_BATCH_SIZE):
-            if self._scan_job and self._scan_job.cancelled:
+            if job.cancelled:
                 return
             batch = media_files[batch_start : batch_start + SCAN_BATCH_SIZE]
-            batch_results = await self._run_in_executor(
-                self._extract_batch_metadata_sync, batch
-            )
-            batch_counts = await self._run_in_executor(
-                self._ingest_scan_batch_sync, batch_results
-            )
-            for key in counts:
-                counts[key] += batch_counts[key]
+            # #480: a file removed from the library is not read or linked
+            # again while its bytes are unchanged.
+            removed = await self._run_in_executor(self._removed_paths, batch)
+            skipped = [f for f in batch if str(f) in known or str(f) in removed]
+            to_read = [
+                f for f in batch if str(f) not in known and str(f) not in removed
+            ]
+            outcomes = [_scan_outcome(f, roots, "skipped") for f in skipped]
+            counts["processed"] += len(skipped)
+            counts["unchanged"] += len(skipped)
+            if to_read:
+                batch_results = await self._run_in_executor(
+                    self._extract_batch_metadata_sync, to_read
+                )
+                batch_counts = await self._run_in_executor(
+                    self._ingest_scan_batch_sync,
+                    batch_results,
+                    roots=roots,
+                    outcomes=outcomes,
+                    review=review,
+                )
+                for key in counts:
+                    counts[key] += batch_counts[key]
+            if review is not None:
+                # After the batch's links: a file linked now leaves the queue.
+                await self._run_in_executor(
+                    self._settle_scanned_reviews, batch, roots, review
+                )
+                job.scope.update(_review_scope(review))
+            for group, row, log_line in outcomes:
+                job.record(group, row, log_line)
 
+            batches += 1
             done = min(batch_start + len(batch), total)
+            job.update(
+                processed=counts["processed"],
+                status_line=_scan_status_line(
+                    done, total, batches, time.monotonic() - started
+                ),
+            )
             yield self._scan_progress(
                 int(done / total * 100), f"Processing file {done}/{total}...", counts
             )
@@ -1476,9 +1669,10 @@ class AdminRoutesMixin:
     def _extract_batch_metadata_sync(self, file_batch):
         """Extract metadata from a batch of files in one executor call.
 
-        Files are read on ``PromptManagerConfig.WORKER_THREADS`` threads:
-        Pillow decodes the whole image to reach trailing text chunks and
-        releases the GIL while doing so.
+        Files are read on the long-lived job pool of
+        ``PromptManagerConfig.WORKER_THREADS`` threads (#523).
+        PNG text is read chunk by chunk without decoding pixels (#523); file
+        reads and ffprobe release the GIL.
         """
         from ..config import PromptManagerConfig
 
@@ -1490,127 +1684,210 @@ class AdminRoutesMixin:
 
         return map_parallel(extract, file_batch, PromptManagerConfig.WORKER_THREADS)
 
-    def _ingest_scan_batch_sync(self, batch_results):
-        """Store the prompts found in a metadata batch (blocking DB work)."""
+    def _ingest_scan_batch_sync(
+        self, batch_results, roots=(), outcomes=None, review=None
+    ):
+        """Store the prompts found in a metadata batch (blocking DB work).
+
+        Returns the legacy counts. When ``outcomes`` is a list, every processed
+        file appends its ``(group, row, log_line)`` for the scan job, with the
+        path relative to its root in ``roots`` (see ``_scan_roots``). A file
+        whose final outcome is ambiguous and unlinked (the resolver found it
+        ambiguous and the fallback did not link it) is recorded for Needs
+        review (best effort, counted in ``review`` when given); one a saved
+        row already links is reported ``unchanged`` and never queued. An
+        ambiguous file with nothing to choose is reported ``unresolved`` and
+        its pending items without a choice leave the queue.
+        """
         counts = dict.fromkeys(SCAN_COUNT_KEYS, 0)
+
+        def note(media_file, status, title=None):
+            if outcomes is not None:
+                outcomes.append(_scan_outcome(media_file, roots, status, title))
+
+        batch_results = list(batch_results)
+        history = _BatchHistory(self, [media for media, _meta in batch_results])
         for media_file, metadata in batch_results:
             if self._scan_job and self._scan_job.cancelled:
                 break
             counts["processed"] += 1
+            ambiguous, untraced, records = [], [], {}
             try:
-                outcome = self._ingest_scanned_file(media_file, metadata, detailed=True)
+                outcome = self._ingest_scanned_file(
+                    media_file,
+                    metadata,
+                    detailed=True,
+                    ambiguous=ambiguous,
+                    untraced=untraced,
+                    records=records,
+                    history=history,
+                )
             except Exception as e:
                 self.logger.error(f"Error processing {media_file.name}: {e}")
                 counts["failed"] += 1
+                note(media_file, "error")
                 continue
+            if ambiguous and outcome == "ambiguous":
+                if self._review_file_linked(media_file, roots):
+                    outcome = "unchanged"  # already linked: not a review case
+                else:
+                    # The records name the item versions that count; the
+                    # saver anchor (#390) is checked on the captured bytes.
+                    self._record_scanned_review(
+                        media_file,
+                        roots,
+                        review,
+                        scanned=(records.get("canonical"), None),
+                    )
+            elif untraced and outcome == "unresolved":
+                # Untraced by the default profile: the inspection profile may
+                # still offer a choice (queued for review, never linked).
+                outcome = self._untraced_scan_outcome(
+                    media_file, roots, records.get("canonical"), review
+                )
             if outcome is None:
+                note(media_file, None)
                 continue
             counts["found"] += 1
             status = outcome["status"] if isinstance(outcome, dict) else outcome
-            if status in (
-                "added",
-                "linked",
-                "enriched",
-                "unchanged",
-                "ambiguous",
-                "unresolved",
-                "conflict",
-                "failed",
-            ):
+            if status in SCAN_GROUPS:
                 counts[status] += 1
             if isinstance(outcome, dict):
                 counts["pairs_added"] += outcome.get("pairs_added", 0)
                 counts["pair_links_added"] += outcome.get("links_added", 0)
+                note(media_file, status, outcome.get("title"))
+            else:
+                note(media_file, status)
         return counts
 
-    @staticmethod
-    def _graph_prompt_text(metadata):
-        """The positive prompt the browser parser traces from the graphs, or None."""
-        records = {}
-        for key in ("prompt", "workflow"):
-            value = metadata.get(key)
-            records[key] = parse_js_json(value) if isinstance(value, str) else value
-        try:
-            positive = extract_generation_params(records)["positivePrompt"]
-        except GenerationParamsError:
-            return None
-        if not isinstance(positive, str) or positive == PLACEHOLDERS["positivePrompt"]:
-            return None
-        return positive.strip() or None
+    def _ingest_scanned_file(
+        self,
+        media_file,
+        metadata,
+        detailed=False,
+        ambiguous=None,
+        untraced=None,
+        records=None,
+        history=None,
+    ):
+        """Store the prompt the shared per-file decision names (#247).
 
-    def _ingest_scanned_file(self, media_file, metadata, detailed=False):
-        """Enrich exact pairs; retain legacy positive-only import for absent pairs."""
-        if not metadata:
-            return None
-        canonical = dict(metadata)
-        for key in ("prompt", "workflow"):
-            if isinstance(canonical.get(key), str):
-                try:
-                    canonical[key] = json.loads(canonical[key])
-                except (ValueError, TypeError):
-                    # Preserve malformed metadata for conservative resolver rejection.
-                    pass
-        if not canonical.get("prompt") and not canonical.get("parameters"):
-            return None
-        resolution = resolve_prompt_pair(canonical)
-        if resolution["state"] == "resolved":
-            result = ingest_resolved_pair(
-                self.db, str(media_file), canonical, resolution
-            )
-            return result if detailed else result["status"]
-        if canonical.get("prompt") and resolution["state"] in (
-            "ambiguous",
-            "unresolved",
-        ):
-            # The resolver could not decide: link the prompt the inspector and the
-            # legacy pages show for this file (the browser parser, in Python).
-            # Graphs without a recognized sampler keep the legacy extractor below.
-            prompt_text = self._graph_prompt_text(metadata)
-            if not prompt_text:
-                return resolution["state"]
-        elif resolution["state"] == "ambiguous":
-            return "ambiguous"
-        elif resolution["state"] == "unresolved" and not isinstance(
-            canonical.get("parameters"), str
-        ):
-            return resolution["state"]
-        else:
-            parsed = self._parse_comfyui_prompt(metadata)
-            if not (parsed.get("prompt") or parsed.get("parameters")):
-                return None
-            prompt_text = self._extract_readable_prompt(parsed)
-            if prompt_text is not None and not isinstance(prompt_text, str):
-                prompt_text = str(prompt_text)
-            if not (prompt_text and prompt_text.strip()):
-                return "found"
-            prompt_text = prompt_text.strip()
-
-        prompt_hash = generate_prompt_hash(prompt_text)
-        existing = self.db.get_prompt_by_hash(prompt_hash)
-        if existing:
-            try:
-                image_id = self.db.link_image_to_prompt(
-                    existing["id"], str(media_file), metadata=canonical
-                )
-            except Exception as e:
-                self.logger.error(
-                    f"Failed to link {media_file.name} to existing prompt: {e}"
-                )
-                return "found"
-            return "linked" if image_id else "unchanged"
-
-        prompt_id = self.db.save_prompt(
-            prompt_text,
-            "scanned",
-            ["auto-scanned"],
-            None,
-            f"Auto-scanned from {media_file.name}",
-            prompt_hash,
+        ``utils.file_prompt.decide_file_prompt`` (scan policy) decides; this
+        stores the result. Returns the file's scan status, or None without
+        prompt metadata. With ``detailed``, a stored or linked file returns a
+        dict instead: its ``status``, the prompt's display ``title`` and, for
+        a resolved pair, the pair counts. When the resolver finds the file
+        ambiguous (whether or not a later step then links it) and
+        ``ambiguous`` is a list, ``media_file`` is appended to it; only a file
+        that then returns ``"ambiguous"`` (nothing linked it) is a Needs
+        review case. An ambiguous result with nothing to choose
+        (``reviewable`` is False: fewer than two candidates carry a prompt)
+        goes to ``untraced`` instead and returns ``"unresolved"`` when nothing
+        links it. The parsed records of either ambiguous file go to
+        ``records["canonical"]`` when ``records`` is a dict. ``history`` is
+        the batch's lazy recorded-history lookup.
+        """
+        path = str(media_file)
+        if history is None:  # one file: history is still asked once
+            history = _BatchHistory(self, [media_file])
+        decision = decide_file_prompt(
+            metadata,
+            file_name=Path(path).name,
+            file_size=functools.partial(_file_size, media_file),
+            in_output=False,  # only the monitor policy reads it
+            lookup=functools.partial(history.recorded, path),
+            policy=Policy.SCAN,
         )
-        if not prompt_id:
-            return "found"
+        if decision.kind in (NOT_SAVED, NOT_SAVED_WIRED):
+            # Save to library off (#90): no write, recorded-run fallback or
+            # Needs review item
+            return decision.kind
+        self._note_review(media_file, decision, ambiguous, untraced, records)
+        if decision.kind == NEVER:
+            if decision.try_recorded_run:
+                linked = self._link_recorded_run(
+                    media_file, decision.canonical, detailed, history
+                )
+                if linked is not None:
+                    return linked
+            return decision.unlinked_status
+        if decision.kind == PAIR:
+            # A rerun after a library move re-checks the link rows.
+            result = self.db.survive_library_switch(
+                lambda: ingest_resolved_pair(
+                    self.db,
+                    path,
+                    decision.canonical,
+                    decision.resolution,
+                    marks=SCAN_MARKS,
+                )
+            )
+            if not detailed:
+                return result["status"]
+            title_text = decision.resolution["positive"]["text"]
+            return {**result, "title": self._scan_title(media_file, title_text)}
+        status, _prompt_id = store_scanned_prompt(
+            self.db, path, decision.canonical, decision.text, SCAN_MARKS
+        )
+        if not detailed or status not in SCAN_TITLED_DETAILS:
+            return status
+        return {"status": status, "title": self._scan_title(media_file, decision.text)}
+
+    @staticmethod
+    def _note_review(media_file, decision, ambiguous, untraced, records):
+        """Hand an ambiguous file to the batch's Needs review lists."""
+        if decision.review == "untraced":
+            if untraced is not None:
+                untraced.append(media_file)
+            if records is not None:
+                records["canonical"] = decision.canonical
+        elif decision.review == "ambiguous" and ambiguous is not None:
+            ambiguous.append(media_file)
+            if records is not None:
+                records["canonical"] = decision.canonical
+
+    def _link_recorded_run(self, media_file, canonical, detailed=False, history=None):
+        """Link a file recorded history attributes to one stored prompt (#342).
+
+        Returns the scan status (with ``detailed``, a stored or linked file's
+        ``{"status", "title"}``), or None when history names no single stored
+        prompt for the file (``database.run_attribution``). Never creates a
+        prompt. Works without any prompt metadata in the file. ``history`` is
+        the batch's lookup (``_BatchHistory``). A file already linked to
+        another prompt is a ``conflict``: one prompt per file.
+        """
+        if history is None:
+            history = _BatchHistory(self, [media_file])
+        prompt_id = history.get(str(media_file))
+        if prompt_id is None:
+            return None
         try:
-            self.db.link_image_to_prompt(prompt_id, str(media_file), metadata=canonical)
+            status = self.db.survive_library_switch(
+                lambda: link_stored_prompt_or_raise(
+                    self.db, str(media_file), canonical, prompt_id
+                )
+            )
         except Exception as e:
-            self.logger.error(f"Failed to link {media_file.name} to new prompt: {e}")
-        return "added"
+            self.logger.error(f"Failed to link {media_file.name} from history: {e}")
+            return "found"
+        if status is None:
+            return None
+        if not detailed or status not in SCAN_TITLED_DETAILS:
+            return status
+        prompt = self.db.get_prompt_by_id(prompt_id) or {}
+        return {
+            "status": status,
+            "title": self._scan_title(media_file, prompt.get("text") or ""),
+        }
+
+    def _scan_title(self, media_file, text):
+        """The linked prompt's Library title (its stored title, else ``text``'s
+        first line), as the Library and the inspector name it."""
+        try:
+            path = str(media_file)
+            summary = self.db.get_image_link_summaries([path], False).get(path)
+            if summary and summary.get("title"):
+                return summary["title"]
+        except Exception:
+            self.logger.warning("Scan row title could not be read; using its text")
+        return display_title((), text)

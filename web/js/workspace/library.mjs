@@ -1,18 +1,30 @@
-import {createScope,createButton,createField,createSelect} from '../shared/toolkit/core.js';
+import {createScope,createButton} from '../shared/toolkit/core.js';
 import {createPromptSender} from './prompt-sender.mjs';
 import {mountPromptBlocks} from './prompt-inspector.mjs';
 import {mountImages} from './images.mjs';
-import {createLibraryStream,createLibraryDetail,libraryPromptRoles} from './library-state.mjs';
+import {createLibraryStream,createLibraryDetail,libraryPromptRoles,LIBRARY_TAG_MODES,libraryFolderOptions} from './library-state.mjs';
 import {promptRoles} from './prompt-blocks.mjs';
 import {createLibraryEditor,showWorkspaceToast} from './library-editor.mjs';
 import {createLibraryEditorController} from './library-editor-state.mjs';
-import {layoutLibraryRows,visibleLibraryRows} from './library-layout.mjs';
+import {layoutLibraryRows,visibleLibraryRows,usedLabel} from './library-layout.mjs';
 import {createWorkspaceIcon} from './icons.mjs';
 import {mountRecordedHistory} from './history.mjs';
 import {countOf} from './plural.mjs';
+import {addedTerms} from './history-state.mjs';
 import {pageHeading} from './heading.mjs';
+import {mountToolbar} from './toolbar.mjs';
+import {libraryFilters,libraryViewState} from './saved-views.mjs';
+import {openRefineDialog,openContentDialog} from './workspace-dialogs.mjs';
+import {mountLibrarySelection} from './library-selection.mjs';
+import {scrollToPageTop} from './sticky-chrome.mjs';
+import {fallBackToOriginal,replaceOnError,showsThumbnail,thumbnailSource} from './thumbnail-support.mjs';
+import {COPY as DELETE_COPY,RESTORE_URL,archivedNoticeText,restoreOutcome,reviewPromptDelete} from './library-delete.mjs';
+import {createMoreMenu} from './more-menu.mjs';
 
 let shelfVisit=null;
+// #512: what a prompt page says when its prompt no longer exists (404).
+const PROMPT_GONE='This prompt no longer exists. It may have been deleted.';
+const HISTORY_DESCRIPTION='Prompt history · one positive, one shared gallery';
 // Every confirmed receipt advances this; a shelf mounted before it never restores its cached stream.
 let writeGeneration=0, focusHeadingOnMount=false, savedParentId=null;
 // The pair one reconciled save names, taken once by the history it opens (the concept selects it after a save, app.js 986).
@@ -23,11 +35,17 @@ const selectedPairs=new Map();
 // Parent metadata a reuse did not apply, kept for an explicit Edit metadata action.
 const metadataDrafts=new Map();
 const archivedVisible=new Map();
+// The concept's sorts first, then the Library's appended Oldest first (D14); D153 (#447) drops "Highest rated".
+const LIBRARY_SORTS=Object.freeze([['newest','Recently added'],['name','Name A–Z'],['oldest','Oldest first']]);
+// Refine › Tag match (#444 D149, D150), in LIBRARY_TAG_MODES order.
+const TAG_MATCH_OPTIONS=Object.freeze([['all','All of these tags'],['any','Any of these tags'],['untagged','Prompts without tags']]);
+// A card's focusable controls in order: the D148 selection checkbox, then its buttons (#437).
+const CARD_CONTROLS='button, input[type="checkbox"]';
+const CATEGORIES_FAILED='Categories could not be loaded. Open the Prompt library again to retry.';
 const ARCHIVED_MESSAGE='Archived. Find it under Show archived in Negative variants.';
 function el(tag,text,className) {
     const node=document.createElement(tag);if(text!==undefined) node.textContent=text;if(className) node.className=className;return node;
 }
-function link(text,href,className) {const node=el('a',text,className);node.href=href;return node;}
 // Cut at 80 UTF-16 units, never inside a surrogate pair (database/library.py titled() matches).
 export function libraryTitle(text) {
     const first=text.split('\n')[0].trim();
@@ -46,8 +64,9 @@ function headingActions(main,fallback) {
 }
 /** The shell heading's description (concept `p.muted`); a view mounted without one shows it at the top of `fallback`. */
 function headingDescription(main,fallback,text) {
-    const description=pageHeading(main)?.description;
-    if(description) description.textContent=text;else fallback.prepend(el('p',text,'muted'));
+    let description=pageHeading(main)?.description;
+    if(description) description.textContent=text;else {description=el('p',text,'muted');fallback.prepend(description);}
+    return description;
 }
 
 /** A confirmed receipt makes cached shelf items, cursor and measured heights stale; filters and anchor survive. */
@@ -57,6 +76,10 @@ export function invalidateLibraryAfterWrite(commit) {
     writeGeneration++;
     if(shelfVisit) shelfVisit={filters:shelfVisit.filters,anchor:shelfVisit.layout?.anchor ?? shelfVisit.anchor ?? null};
     for(const listener of [...writeListeners]) listener(commit);
+}
+/** Forget the shelf's last visit (filters, items and position): the next visit starts fresh (S9: a restored library). */
+export function forgetLibraryVisit() {
+    writeGeneration++;shelfVisit=null;
 }
 /** Observe confirmed Library and vocabulary writes (the sidebar re-reads its counts); returns the unsubscribe. */
 export function onLibraryWrite(listener) {
@@ -69,9 +92,9 @@ export function onLibraryWrite(listener) {
  * with the existing Library filters, and the heading takes focus as after a save.
  */
 export function browseLibrary(filters) {
-    const {text='',category='',tags=[],sort='newest'}=filters || {};
-    if(typeof text!=='string' || typeof category!=='string' || !Array.isArray(tags) || tags.some(tag=>typeof tag!=='string') || typeof sort!=='string') throw new TypeError('Invalid Library filters');
-    shelfVisit={filters:{text,category,tags:[...tags],sort},anchor:null};
+    const {text='',category='',tags=[],sort='newest',tagMode='all',folder=''}=filters || {};
+    if(typeof text!=='string' || typeof category!=='string' || !Array.isArray(tags) || tags.some(tag=>typeof tag!=='string') || typeof sort!=='string' || !LIBRARY_TAG_MODES.includes(tagMode) || typeof folder!=='string') throw new TypeError('Invalid Library filters');
+    shelfVisit={filters:{text,category,tags:[...tags],sort,tagMode,folder},anchor:null};
     focusHeadingOnMount=true;window.location.hash='#/library';
 }
 /** Remember the selection a reconciled save names, so the destination history opens on it once. */
@@ -93,11 +116,13 @@ export function rememberLibraryResult(result) {
 function outcomeMessage(result,outcome) {
     const {kind,receipt}=result.commit;
     if(kind==='metadata') return 'Saved.';
+    // #443: a save that reused an archived prompt leaves it archived; say how to bring it back.
+    if((kind==='create' || kind==='add-negative') && result.detail?.positive?.archived===true) return DELETE_COPY.archivedText;
     if(kind==='archive-pair') return ARCHIVED_MESSAGE;
     if(kind!=='create' && kind!=='add-negative') return null;
     if(receipt.positive_created) return 'Saved.';
     if(receipt.pair_created) return kind==='add-negative'?'Negative saved without adding another positive or gallery.'
-        :outcome?.metadataNotApplied?'Saved as a new negative variant of an existing prompt. The title, category, tags, rating and notes you entered were not applied.'
+        :outcome?.metadataNotApplied?'Saved as a new negative variant of an existing prompt. The title, category, tags and notes you entered were not applied.'
             :'Saved as a new negative variant of an existing prompt.';
     if(receipt.pair.archived) return 'This combination is an archived negative variant. It stays archived; restore it from Show archived in Negative variants.';
     return 'This prompt pair already exists. Showing the saved version.';
@@ -108,7 +133,7 @@ function takeSavedSelection(positiveId) {
 }
 function rememberUnappliedMetadata(result,{outcome,draft}={}) {
     if(result.commit.kind!=='create' || !outcome?.metadataNotApplied || !draft) return;
-    const {title:name,category,tags,rating,notes}=draft;metadataDrafts.set(result.detail.positive.id,{title:name,category,tags,rating,notes});
+    const {title:name,category,tags,notes}=draft;metadataDrafts.set(result.detail.positive.id,{title:name,category,tags,notes});
 }
 /** New prompt, from Library or Images: a saved prompt always opens its own history, as in the concept. */
 function createNewPromptEditor(api,scope,main) {
@@ -128,7 +153,8 @@ export function mountNewPromptAction(main,api,parentScope) {
     return button;
 }
 
-export function mountLibrary(main,api,parentScope,{positiveId}={}) {
+/** `savedState` opens a saved view (#249 D16) instead of the last visit; `onSaveView(trigger, state)` is Save view. */
+export function mountLibrary(main,api,parentScope,{positiveId,savedState=null,onSaveView=()=>{}}={}) {
     const scope=createScope();parentScope.cleanup(()=>scope.dispose());
     main.classList.add('library-main');
     const sender=createPromptSender({scope});
@@ -139,28 +165,53 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
     scope.cleanup(()=>main.classList.remove('library-main'));
 
     function mountShelf() {
-        const visit=shelfVisit, mountedGeneration=writeGeneration;
+        const saved=savedState?libraryFilters(savedState):null;
+        const visit=saved?null:shelfVisit, mountedGeneration=writeGeneration;
         // An invalidated visit keeps only filters and anchor: the stream restarts and heights are measured again.
         const restorable=visit?.state?visit:null;
-        const filters={text:'',category:'',tags:[],sort:'newest',...visit?.filters};
+        // #443 D152: `shelf` ('active' or 'archived', Show archived prompts) lives in the visit's filters, never in a saved view.
+        const filters={text:'',category:'',tags:[],sort:'newest',tagMode:'all',folder:'',shelf:'active',...visit?.filters,...saved};
+        // D153: a sort the shelf no longer offers (an older "Highest rated" visit) reads as Recently added.
+        if(!LIBRARY_SORTS.some(([value])=>value===filters.sort)) filters.sort='newest';
         const section=el('section',undefined,'library-shelf');section.setAttribute('aria-label','Prompt library');
-        const toolbar=el('search',undefined,'library-toolbar');
-        const search=el('input');search.type='search';search.placeholder='Search prompts and saved negatives…';search.value=filters.text;search.maxLength=500;
-        const category=createSelect([['','All categories']], '');category.value=filters.category;
-        const tags=el('input');tags.type='text';tags.placeholder='Comma-separated tags';tags.value=filters.tags.join(', ');tags.maxLength=2000;
-        const sort=createSelect([['newest','Recently added'],['oldest','Oldest first'],['name','Prompt A–Z'],['rating','Highest rated']], '');sort.value=filters.sort;
-        const refresh=createButton('Refresh library');
-        toolbar.append(createField('Search prompts',search,'library-search'),createField('Category',category,'library-category'),createField('Tags',tags,'library-tags'),createField('Sort',sort,'library-sort'),refresh);
+        // The shared concept toolbar (app.js toolbar(), a347–360): Tags live in "Refine this view" (D14), no Refresh (D15).
+        // Its own scope, disposed after the visit is saved: removing it first would shorten the page and clamp scrollY.
+        const toolbarScope=createScope();
+        // D44: Filters reads "Filters · N" while Refine filters (from Refine or a Browse) narrow the shelf: Tags, a Folder
+        // and a Tag match other than All (#444 D149, D150) each count once.
+        const refinements=()=>(filters.tags.length?1:0)+(filters.folder?1:0)+(filters.tagMode!=='all'?1:0);
+        const toolbar=mountToolbar(section,{scope:toolbarScope,categories:filters.category?[filters.category]:[],sorts:LIBRARY_SORTS,
+            value:{q:filters.text,category:filters.category,sort:filters.sort},activeFilters:refinements(),onChange:applyToolbar,onFilters:openFilters,
+            onSaveView:trigger=>{const value=toolbar.value();onSaveView(trigger,libraryViewState({...filters,text:value.q.trim(),category:value.category,sort:value.sort}));}});
         const optionsStatus=el('p','','library-options-status');optionsStatus.hidden=true;optionsStatus.setAttribute('role','alert');
-        const caption=el('p','','library-caption');caption.setAttribute('role','status');
+        // The concept caption (app.js renderLibrary a586): the filtered set's parents and their negative variants.
+        const caption=el('div',undefined,'section-caption');const captionCount=el('span');caption.append(captionCount,el('span','Images are grouped by positive prompt'));caption.hidden=true;
+        // The count is announced when it changes; a reload keeps the last count shown, so nothing else re-announces it.
+        captionCount.setAttribute('role','status');
         const grid=el('div',undefined,'library-grid');grid.setAttribute('role','list');grid.setAttribute('aria-label','Positive prompts');
+        // #437 D148: select prompts and set their category (the legacy admin's Set Category); a write reloads the shelf.
+        let categoryNames=[];
+        // #531: the bar's compensating scroll is not the reader moving, so a pending anchor keeps its offset.
+        const selection=mountLibrarySelection({scope,api,grid,onPlaceKept:shift=>{observedScrollY+=shift;},getItems:()=>state?.items ?? [],getEpoch:()=>state?.epoch ?? null,
+            getCategories:()=>categoryNames,focusFallback:{focus:()=>focusHeading(main)},getShelf:()=>filters.shelf,
+            nameOf:id=>{const item=state?.items.find(entry=>entry.id===id);return item?displayTitle(item):null;},
+            onCommitted:(kind,receipt)=>invalidateLibraryAfterWrite({kind:`bulk-${kind}`,receipt}),onReload:()=>{loadCategories();reset();scrollToPageTop();}});
         const message=el('p','','library-status');message.setAttribute('role','status');
         const continuation=el('div',undefined,'library-continuation');
         const more=createButton('Load more prompts');const retry=createButton('Retry prompt library');retry.hidden=true;
-        const legacy=link('Current prompt library',window.ApiClient.resolveUrl('/prompt_manager/admin'),'workspace-link');
         const actions=headingActions(main,section);
         const exportButton=createButton('Export');exportButton.setAttribute('aria-label','Export full Library JSON');
-        const newPrompt=createButton('+ New prompt','ca-primary');actions.append(exportButton,newPrompt);
+        // #443 D152: the shelf's counterpart of Negative variants' Show archived (#235); N follows the filters. #482: on
+        // the archived shelf it reads the concept's own way back ("← Prompt library", app.js 594); a plain button whose
+        // label names where it goes, so it carries no pressed state its changing label would contradict.
+        const BACK_TO_LIBRARY='← Prompt library';
+        const showArchived=createButton(filters.shelf==='archived'?BACK_TO_LIBRARY:'Show archived prompts');
+        const newPrompt=createButton('+ New prompt','ca-primary');actions.append(showArchived,exportButton,newPrompt);
+        scope.listen(showArchived,'click',()=>{
+            if(selection.writing()) return;
+            filters.shelf=filters.shelf==='archived'?'active':'archived';
+            reset();selection.shelfChanged();
+        });
         const exportStatus=el('p','','library-options-status');exportStatus.hidden=true;exportStatus.setAttribute('role','alert');
         const editor=createNewPromptEditor(api,scope,main);
         scope.listen(newPrompt,'click',()=>editor.open({mode:'new',trigger:newPrompt}));
@@ -184,9 +235,10 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
         }
         scope.listen(exportButton,'click',exportLibrary);
         headingDescription(main,section,'One positive. Reusable negatives. Every experiment stays connected.');
-        continuation.append(message,retry,more);section.append(toolbar,optionsStatus,exportStatus,caption,grid,continuation,legacy);main.append(section);
+        // Nothing follows the grid in the concept; the legacy Library stays one click away on Overview (spec §5).
+        continuation.append(message,retry,more);section.append(optionsStatus,exportStatus,selection.element,caption,grid,continuation);main.append(section);
         const cards=new Map(), rowNodes=new Map(), spacers=new Map(), heights=new Map(), pendingMeasurements=new Map();
-        let state,frame=0,loadFrame=0,observer,optionsRequest,focusOverride=-1;
+        let state,frame=0,loadFrame=0,observer,optionsRequest,folderRequest,focusOverride=-1;
         const columns=()=>window.innerWidth>=1700?3:window.innerWidth<=700?1:2;
         const readInlineSize=()=>Math.round(grid.getBoundingClientRect().width*64)/64;
         let inlineSize=readInlineSize(), columnCount=columns(), layout={rows:[],height:0}, dirty=true, items, indexesById=new Map();
@@ -195,30 +247,40 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
         if(restorable?.layout?.inlineSize===inlineSize && restorable.layout.columns===columnCount) for(const [id,height] of restorable.layout.heights) heights.set(id,height);
         const hiddenSave=restorable?null:savedParentId;savedParentId=null;
         function removeCard(card) {measurementObserver?.unobserve(card.node);pendingMeasurements.delete(Number(card.node.dataset.promptId));card.blocks.dispose();card.node.remove();}
+        /** The concept's prompt card (app.js renderLibrary a586) with real counts and last use (#249 D23; no rating, D153). */
         function cardFor(item,index) {
-            const article=el('article',undefined,'library-card');article.dataset.promptId=item.id;article.setAttribute('role','listitem');
-            const art=el('div',undefined,'library-card-art');art.setAttribute('aria-hidden','true');
+            const article=el('article',undefined,'prompt-card');article.dataset.promptId=item.id;article.setAttribute('role','listitem');
+            const art=el('div',undefined,'card-art');art.setAttribute('aria-hidden','true');
             const previews=item.previews || [];
             for(const image of previews.slice(0,2)) {
-                if(image.is_video && !image.thumbnail_url) art.append(el('span','Video preview','library-art-empty'));
+                // #317: a video with no preview, or one this browser cannot show (JPEG XL), keeps its label.
+                if(!showsThumbnail(image)) art.append(el('span','Video preview','small'));
                 else {
-                    const img=el('img');img.src=window.ApiClient.resolveUrl(image.thumbnail_url || image.url);img.alt='';img.loading='lazy';img.decoding='async';img.width=image.width || 800;img.height=image.height || 600;art.append(img);
+                    // #317: an image's JPEG XL preview this browser cannot show, or one that fails, loads the original;
+                    // a video's preview that fails becomes its label, never a broken image.
+                    const img=el('img');img.src=window.ApiClient.resolveUrl(thumbnailSource(image));if(image.is_video) replaceOnError(img,()=>el('span','Video preview','small'));else fallBackToOriginal(img,window.ApiClient.resolveUrl(image.url));img.alt='';img.loading='lazy';img.decoding='async';img.width=image.width || 800;img.height=image.height || 600;art.append(img);
                 }
             }
-            if(!previews.length) art.append(el('span','No available image previews','library-art-empty'));
-            const content=el('div',undefined,'library-card-content');
-            const heading=el('header',undefined,'library-card-title');
-            const name=link(displayTitle(item),`#/library/${item.id}`,'library-title-link');const h2=el('h2');h2.append(name);
-            heading.append(h2,el('span',item.category || 'Uncategorized','library-chip'));
-            const prompts=el('div',undefined,'library-card-prompts');
-            const blocks=mountPromptBlocks(prompts,{prompts:{positive:{status:'resolved',text:item.text,source:'library'}},sender,parentScope:scope,roles:['positive']});
-            const stats=el('div',undefined,'library-card-meta');stats.append(el('span',item.variant_count?countOf(item.variant_count,'saved negative variant'):'No saved negatives','library-chip library-chip-negative'),el('span',countOf(item.image_count,'linked image')));
-            const vocabulary=el('div',undefined,'library-tags');for(const tag of item.tags || []) vocabulary.append(el('span',tag,'library-chip'));
-            content.append(heading,prompts,stats,vocabulary);
-            const footer=el('footer',undefined,'library-card-footer');
-            const rating=el('span',item.rating?'★'.repeat(item.rating)+'☆'.repeat(5-item.rating):'Unrated','library-rating');rating.setAttribute('role','img');rating.setAttribute('aria-label',item.rating?`Rated ${item.rating} out of 5`:'Unrated');footer.append(rating);
-            const history=link('',`#/library/${item.id}`,'library-history-link');history.append(createWorkspaceIcon('branch'),el('span','Explore history'));footer.append(history);
-            article.append(art,content,footer);article.dataset.index=index;return {node:article,blocks};
+            if(!previews.length) art.append(el('span','No available image previews','small'));
+            const name=displayTitle(item);
+            const content=el('div',undefined,'card-content');
+            const heading=el('div',undefined,'card-title');const open=createButton(name);open.dataset.history='';
+            heading.append(open,el('span',item.category || 'Uncategorized','chip'));
+            if(item.archived===true) heading.append(el('span','Archived','chip'));
+            const prompts=el('div');
+            const blocks=mountPromptBlocks(prompts,{prompts:{positive:{status:'resolved',text:item.text,source:'library'}},sender,parentScope:scope,roles:['positive'],title:name});
+            const meta=el('div',undefined,'card-meta');
+            meta.append(el('span',`\u2212 ${countOf(item.variant_count,'negative variant')}`,'chip red'),el('span',countOf(item.run_count ?? 0,'run')),el('span',countOf(item.image_count,'image')));
+            const vocabulary=el('div',undefined,'tags');for(const tag of item.tags || []) vocabulary.append(el('span',tag,'chip'));
+            content.append(heading,prompts,meta,vocabulary);
+            const footer=el('div',undefined,'card-footer');
+            // D153 (#447): the footer reads only the last use; the concept's rating stars are not drawn.
+            const facts=el('span',usedLabel(item.last_used_at));
+            const actions=el('div',undefined,'row-actions');
+            const send=createButton('','send icon-btn');send.setAttribute('aria-label',`Send positive prompt to ComfyUI: ${name}`);send.append(createWorkspaceIcon('send'));send.dataset.sendPositive='';
+            const explore=createButton('');explore.append(createWorkspaceIcon('branch'),' Explore history');explore.dataset.history='';
+            actions.append(send,explore);footer.append(facts,actions);
+            article.append(selection.overlayFor(item,name),art,content,footer);article.dataset.index=index;return {node:article,blocks};
         }
         function captureAnchor() {
             // Mounted rows can already differ from estimates before their observer batch.
@@ -285,7 +347,7 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
             }
             pendingMeasurements.clear();
             const restore=dirty?(pendingAnchor || anchor):null;
-            if(dirty) {layout=layoutLibraryRows(state.items.map(item=>heights.get(item.id)??null),columnCount,{estimate:columnCount===1?448:468});dirty=false;}
+            if(dirty) {layout=layoutLibraryRows(state.items.map(item=>heights.get(item.id)??null),columnCount,{estimate:columnCount===1?422:448});dirty=false;}
             const index=restore?indexesById.get(restore.id):undefined;
             const target=index===undefined?undefined:Math.max(0,layout.rows[Math.floor(index/columnCount)].top-restore.offset);
             renderWindow(target);
@@ -312,23 +374,35 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
             if(changed) {pendingAnchor ||= anchor;schedule();}
         }):null;
         measurementObserver?.observe(grid);
-        function focusCard(index,last=false) {
+        /** Focus a card's first or `last` control (Tab across the window edge), or its title (`title`: Home/End/arrows). */
+        function focusCard(index,last=false,title=false) {
             if(index<0 || index>=state.items.length) return;
             if(dirty) {cancelAnimationFrame(frame);flush();}focusOverride=index;renderWindow();const card=cards.get(state.items[index].id).node;
-            const controls=card.querySelectorAll('a,button');(last?controls[controls.length-1]:controls[0]).focus();card.scrollIntoView({block:'nearest'});focusOverride=-1;renderWindow();
+            const controls=card.querySelectorAll(CARD_CONTROLS);(title?card.querySelector('.card-title > button'):last?controls[controls.length-1]:controls[0]).focus();card.scrollIntoView({block:'nearest'});focusOverride=-1;renderWindow();
         }
+        // The title and Explore history open the prompt's history; the footer send sends the full positive (D23).
+        scope.listen(grid,'click',event=>{
+            const card=event.target.closest('article[data-prompt-id]');if(!card) return;
+            const item=state?.items[indexesById.get(Number(card.dataset.promptId))];if(!item) return;
+            if(event.target.closest('[data-history]')) window.location.hash=`#/library/${item.id}`;
+            const send=event.target.closest('[data-send-positive]');if(send) sender.open({positive:item.text},send);
+        });
         scope.listen(grid,'keydown',event=>{
             const card=event.target.closest('article[data-prompt-id]');if(!card) return;
             const index=Number(card.dataset.index);
-            if(event.target.matches('a') && ['Home','End','ArrowLeft','ArrowRight'].includes(event.key)) {event.preventDefault();focusCard(event.key==='Home'?0:event.key==='End'?state.items.length-1:index+(event.key==='ArrowLeft'?-1:1));}
+            // D151 (#444 ruling): Ctrl/Cmd+A selects every loaded prompt and Escape clears, as on Images (focus stays).
+            if((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase()==='a') {event.preventDefault();selection.selectAll();return;}
+            if(event.key==='Escape' && selection.hasSelection()) {event.preventDefault();selection.clear();return;}
+            if(event.target.matches('[data-history]') && ['Home','End','ArrowLeft','ArrowRight'].includes(event.key)) {event.preventDefault();focusCard(event.key==='Home'?0:event.key==='End'?state.items.length-1:index+(event.key==='ArrowLeft'?-1:1),false,true);}
             else if(event.key==='Tab') {
-                const controls=card.querySelectorAll('a,button');const next=index+(event.shiftKey?-1:1);
+                const controls=card.querySelectorAll(CARD_CONTROLS);const next=index+(event.shiftKey?-1:1);
                 const edge=event.shiftKey?controls[0]:controls[controls.length-1];
                 if(event.target===edge && state.items[next] && !cards.has(state.items[next].id)) {event.preventDefault();focusCard(next,event.shiftKey);}
             }
         });
         function render(next) {
-            if(items!==next.items) {
+            const batch=items!==next.items;
+            if(batch) {
                 pendingAnchor ||= captureAnchor();items=next.items;indexesById=new Map(items.map((item,index)=>[item.id,index]));dirty=true;
                 if(!items.length) {
                     anchor=null;pendingAnchor=null;heights.clear();layout={rows:[],height:0};
@@ -337,11 +411,25 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
                 } else if(retainedAnchor) {pendingAnchor=retainedAnchor;retainedAnchor=null;}
             }
             state=next;
-            caption.textContent=`${next.items.length} of ${next.total} positive prompts · Images are grouped by positive prompt`;
+            // A loaded batch: the selection bar's count and Select all N loaded follow it (D151).
+            if(batch) selection.listingChanged();
+            if(next.variantTotal!==null) {
+                const count=filters.shelf==='archived'?`${countOf(next.total,'archived prompt')} · ${countOf(next.variantTotal,'negative variant')} hidden with them`
+                    :`${countOf(next.total,'positive prompt')} · ${countOf(next.variantTotal,'negative variant')}`;
+                if(captionCount.textContent!==count) captionCount.textContent=count;caption.hidden=false;
+            }
+            const archivedLabel=filters.shelf==='archived'?BACK_TO_LIBRARY
+                :next.archivedTotal===null?'Show archived prompts':`Show archived prompts (${next.archivedTotal.toLocaleString('en-US')})`;
+            if(showArchived.textContent!==archivedLabel) showArchived.textContent=archivedLabel;
+            const filtered=Boolean(filters.text || filters.category || filters.tags.length || filters.folder || filters.tagMode!=='all');
+            const empty=filters.shelf==='archived'?(filtered?'No archived prompts match.':'No archived prompts.'):'No matching prompts. Try changing the filters.';
             const hidden=hiddenSave!==null && !next.loading && !next.error && !next.hasMore && !next.items.some(item=>item.id===hiddenSave)?' The saved prompt is hidden by the current filters.':'';
-            message.textContent=(next.error?'Prompt library could not be loaded. Retry or refresh.':next.loading?'Loading prompt library…':!next.items.length?'No matching prompts. Try changing the filters.':!next.hasMore?'You’re all caught up.':'')+hidden;
+            message.textContent=(next.error?'Prompt library could not be loaded. Retry.':next.loading?'Loading prompt library…':!next.items.length?empty:!next.hasMore?'You’re all caught up.':'')+hidden;
             message.setAttribute('role',next.error?'alert':'status');retry.hidden=!next.error;more.hidden=!next.hasMore || !!next.error;more.setAttribute('aria-disabled',String(next.loading));
-            schedule();scheduleLoad();
+            // #464: a loaded page is laid out now, not on the next frame: a starved renderer (a background tab, headless
+            // WebKit under load) can hold frames for seconds, which left a loaded shelf empty. Measurements still flush per frame.
+            if(batch && grid.isConnected) {cancelAnimationFrame(frame);flush();} else schedule();
+            scheduleLoad();
         }
         const stream=createLibraryStream({api,onChange:render,restore:restorable?{filters,state:restorable.state}:undefined});
         function maybeLoad() {
@@ -354,33 +442,66 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
             optionsRequest?.abort();const request=optionsRequest=new AbortController();
             try {
                 const data=await api.get('/prompt_manager/library/options',{signal:request.signal});if(scope.signal.aborted || optionsRequest!==request) return;
-                const values=[...new Set([...data.categories,filters.category].filter(Boolean))];category.replaceChildren(new Option('All categories',''),...values.map(value=>new Option(value,value)));category.value=filters.category;optionsStatus.hidden=true;
-            } catch {if(!scope.signal.aborted && optionsRequest===request) {optionsStatus.textContent='Categories could not be loaded. Refresh library to retry.';optionsStatus.hidden=false;}}
+                categoryNames=[...data.categories];toolbar.setCategories([...data.categories,filters.category]);toolbar.setValue({category:filters.category});optionsStatus.hidden=true;
+            } catch {if(!scope.signal.aborted && optionsRequest===request) {optionsStatus.textContent=CATEGORIES_FAILED;optionsStatus.hidden=false;}}
         }
-        const reset=()=>{restoreScrollY=null;return stream.reset(filters);};
-        scope.listen(search,'input',scope.debounce(()=>{filters.text=search.value.trim();reset();},200));
-        scope.listen(tags,'input',scope.debounce(()=>{filters.tags=[...new Set(tags.value.split(',').map(tag=>tag.trim()).filter(Boolean))];reset();},200));
-        scope.listen(category,'change',()=>{filters.category=category.value;reset();});scope.listen(sort,'change',()=>{filters.sort=sort.value;reset();});
-        scope.listen(refresh,'click',()=>{loadCategories();reset();});scope.listen(more,'click',()=>stream.loadMore());scope.listen(retry,'click',()=>stream.loadMore());
+        const reset=()=>{restoreScrollY=null;selection.clear();toolbar.setActiveFilters(refinements());return stream.reset(filters);};
+        /** A toolbar report; a debounced search that lands after a select already applied the same values reloads nothing. */
+        function applyToolbar(value) {
+            const next={text:value.q.trim(),category:value.category,sort:value.sort};
+            if(Object.entries(next).every(([key,item])=>filters[key]===item)) return;
+            Object.assign(filters,next);reset();
+        }
+        /**
+         * "Refine this view" with the Library's filters: the concept's Folder (#444 D150, its options read when the dialog
+         * opens), Tags (D14) and Tag match (D149, D150); Clear also clears the toolbar category.
+         */
+        function openFilters(trigger) {
+            const refine=openRefineDialog({scope,trigger,fields:[{key:'folder',options:libraryFolderOptions([],filters.folder)},{key:'tags'},
+                {key:'tagMode',options:TAG_MATCH_OPTIONS}],values:{folder:filters.folder,tags:filters.tags.join(', '),tagMode:filters.tagMode},
+                onApply:applyRefinement,onClear:cleared=>{toolbar.setValue({category:cleared.category});applyRefinement(cleared);}});
+            folderRequest?.abort();const request=folderRequest=new AbortController();
+            // A failed read leaves "All output folders" and the current folder; nothing else depends on it.
+            api.get('/prompt_manager/library/options?include=folders',{signal:request.signal}).then(data=>{
+                if(scope.signal.aborted || folderRequest!==request || !Array.isArray(data?.folders) || data.folders.some(folder=>typeof folder!=='string')) return;
+                refine.setOptions('folder',libraryFolderOptions(data.folders,filters.folder));
+            },()=>{});
+        }
+        function applyRefinement({tags,tagMode='all',folder='',category=filters.category}) {
+            // "Prompts without tags" takes no Tags (the dialog disables them).
+            const next=tagMode==='untagged'?[]:[...new Set(tags.split(',').map(tag=>tag.trim()).filter(Boolean))];
+            if(category===filters.category && tagMode===filters.tagMode && folder===filters.folder && next.length===filters.tags.length && next.every((tag,index)=>tag===filters.tags[index])) return;
+            filters.category=category;filters.tags=next;filters.tagMode=tagMode;filters.folder=folder;reset();
+        }
+        scope.listen(more,'click',()=>stream.loadMore());
+        // Retry also re-reads a category list that failed (D15: Refresh is gone).
+        scope.listen(retry,'click',()=>{if(!optionsStatus.hidden)loadCategories();stream.loadMore();});
         scope.listen(window,'scroll',()=>{reconcileScroll();schedule();});
         // Mobile viewport resizing can adjust scroll before delivering its resize event.
         scope.listen(window,'resize',()=>{pendingAnchor ||= anchor;observedScrollY=window.scrollY;schedule();});
         scope.cleanup(()=>{
             const savedFilters={...filters,tags:[...filters.tags]},savedAnchor=pendingAnchor || anchor || captureAnchor();
             // A write while mounted makes this stream stale: keep only what still means something.
-            shelfVisit=mountedGeneration!==writeGeneration?{filters:savedFilters,anchor:savedAnchor}:state?{filters:savedFilters,state,scrollY:window.scrollY,layout:{inlineSize,columns:columnCount,heights:[...heights],anchor:savedAnchor}}:null;
-            stream.dispose();optionsRequest?.abort();observer?.disconnect();measurementObserver?.disconnect();cancelAnimationFrame(frame);cancelAnimationFrame(loadFrame);for(const card of cards.values())removeCard(card);cards.clear();});
+            // A saved view is not the plain shelf, so it never replaces the Library return state (#249 M2, as Favorites).
+            if(!saved) shelfVisit=mountedGeneration!==writeGeneration?{filters:savedFilters,anchor:savedAnchor}:state?{filters:savedFilters,state,scrollY:window.scrollY,layout:{inlineSize,columns:columnCount,heights:[...heights],anchor:savedAnchor}}:null;
+            toolbarScope.dispose();stream.dispose();optionsRequest?.abort();folderRequest?.abort();observer?.disconnect();measurementObserver?.disconnect();cancelAnimationFrame(frame);cancelAnimationFrame(loadFrame);for(const card of cards.values())removeCard(card);cards.clear();});
         loadCategories();if(restorable) {render(stream.state);if(restorable.state.loading || restorable.state.error)stream.loadMore();} else reset();
     }
 
     function mountHistory() {
         const history=el('section',undefined,'library-history');history.setAttribute('aria-label','Prompt history');main.append(history);
         const body=el('div');history.append(body);
-        // Concept heading: ← Prompt library, Edit metadata, then the selected pair's Send to ComfyUI.
-        headingDescription(main,history,'One positive prompt. Reusable negative variants. One shared gallery.');
+        // Concept heading (app.js a591–597): ← Prompt library, Edit metadata, then the selected pair's Send to ComfyUI.
+        const description=headingDescription(main,history,HISTORY_DESCRIPTION);
+        // #524 D164: at desktop widths a long title clamps beside the actions.
+        pageHeading(main)?.heading.classList.add('prompt-page-heading');
         const actions=headingActions(main,history);
         const back=createButton('← Prompt library'),edit=createButton('Edit metadata'),send=createButton('','send');
-        send.append(createWorkspaceIcon('send'),el('span','Send to ComfyUI'));send.disabled=true;actions.append(back,edit,send);
+        send.append(createWorkspaceIcon('send'),el('span','Send to ComfyUI'));send.disabled=true;
+        // D163 (#512, maintainer 2026-10-29): a "⋯" More menu after Send to ComfyUI holds Delete prompt…, so delete is
+        // findable on the page; Edit metadata keeps its own Delete prompt… (D161).
+        const moreMenu=createMoreMenu({scope,label:'More actions for this prompt',items:[{label:'Delete prompt…',danger:true,onSelect:()=>deletePrompt(moreMenu.button)}]});
+        actions.append(back,edit,send,moreMenu.element);
         let blocks,galleryScope,detail,contentScope,updateBranches,updateParent,current=null;
         scope.cleanup(()=>{blocks?.dispose();galleryScope?.dispose();contentScope?.dispose();});
         // Every visit opens on the first negative, as the concept's navigate() does (app.js 1149: state.variant = 0);
@@ -388,9 +509,39 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
         let pendingSelection=takeSavedSelection(positiveId);
         if(selectedPairs.get(positiveId)?.id!==pendingSelection) selectedPairs.delete(positiveId);
         const loader=createLibraryDetail({api,onChange:render});scope.cleanup(()=>loader.dispose());
-        const editor=createLibraryEditor({api,parentScope:scope,onCommitted:invalidateLibraryAfterWrite,onReconciled:reconciled,onRefreshRequired:reloadView});
+        const editor=createLibraryEditor({api,parentScope:scope,onCommitted:invalidateLibraryAfterWrite,onReconciled:reconciled,onRefreshRequired:reloadView,
+            onDeletePrompt:()=>deletePrompt()});
+        /** #481: this prompt through the Library's Delete… review; a delete returns to the shelf, an archive shows its notice. */
+        let deleting=false;
+        // While the review or its write runs, Edit metadata is held (as the selection bar holds its actions), so no save
+        // can race the delete; aria-disabled keeps it focusable for the return.
+        function holdEdit(held) {
+            deleting=held;
+            for(const button of [edit,moreMenu.button]) {
+                if(held) button.setAttribute('aria-disabled','true');else button.removeAttribute('aria-disabled');
+            }
+        }
+        function deletePrompt(trigger=edit) {
+            const shown=detail;if(deleting || !shown?.positive) return;
+            // One review at a time, as the selection bar holds itself (a second press during the preview starts nothing).
+            holdEdit(true);
+            reviewPromptDelete({api,scope,trigger,ids:[shown.positive.id],epoch:shown.library_epoch,
+                titleOf:()=>displayTitle(shown.positive),onDismiss:()=>{holdEdit(false);if(trigger.isConnected) trigger.focus({preventScroll:true});},
+                onSettled:(outcome,result,failure)=>{
+                    holdEdit(false);
+                    if(outcome.committed) invalidateLibraryAfterWrite({kind:'bulk-delete',receipt:result ?? {phase:'unconfirmed'}});
+                    // A left page still invalidates what it cached, but says nothing (as the bar's write).
+                    if(scope.signal.aborted) return;
+                    showWorkspaceToast(outcome.toast);
+                    // Restored storage: the whole Library view reads again, as the editor's own restore path.
+                    if(failure?.code==='storage-changed') {reloadView();return;}
+                    if(result && Number.isSafeInteger(result.deleted) && result.deleted>0) {focusHeadingOnMount=true;window.location.hash='#/library';return;}
+                    if(outcome.reload) {detail=null;loader.load(positiveId);focusHeading(main);}
+                }});
+        }
         scope.listen(back,'click',()=>{window.location.hash='#/library';});
         scope.listen(edit,'click',()=>{
+            if(deleting) return;
             const draft=metadataDrafts.get(positiveId);metadataDrafts.delete(positiveId);
             editor.open({mode:'metadata',positiveId,pairId:current?.activePairId() ?? null,trigger:edit,draft:draft || null});
         });
@@ -404,6 +555,26 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
             if(current) current.apply(result);else loader.load(positiveId);
             focusHeading(main);
         }
+        /** The Archived notice: Restore takes the prompt off the archive, then the page reads it again. */
+        function archivedNotice(content,shown) {
+            const notice=el('div',undefined,'notice library-archived-notice'),copy=el('div'),row=el('div',undefined,'row-actions');
+            const status=el('p','','small');status.setAttribute('role','status');status.hidden=true;
+            const restore=createButton('Restore');restore.setAttribute('aria-label','Restore this prompt to the Prompt library');
+            copy.append(el('h2','Archived'),el('p',archivedNoticeText(shown.positive.variant_count)),status);row.append(restore);notice.append(copy,row);
+            content.listen(restore,'click',async()=>{
+                if(restore.getAttribute('aria-disabled')==='true') return;
+                restore.setAttribute('aria-disabled','true');status.hidden=true;
+                let result=null,failure=null;
+                try {result=await api.post(RESTORE_URL,{prompt_ids:[shown.positive.id],expected_epoch:shown.library_epoch});} catch(error) {failure=error;}
+                const outcome=restoreOutcome(result,failure);
+                if(outcome.committed) invalidateLibraryAfterWrite({kind:'bulk-restore',receipt:result?.success?result:{phase:'unconfirmed'}});
+                if(content.signal.aborted) return;
+                restore.removeAttribute('aria-disabled');
+                if(outcome.reload) {showWorkspaceToast(outcome.toast);detail=null;loader.load(positiveId);focusHeading(main);return;}
+                status.textContent=outcome.toast;status.hidden=false;
+            });
+            return notice;
+        }
         /** Explicit exit after restored storage: dispose the recorded view, then remount with a fresh visit. */
         function reloadView() {
             writeGeneration++;shelfVisit=shelfVisit && {filters:shelfVisit.filters,anchor:null};
@@ -415,26 +586,80 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
             if(detail && state.detail && !state.loading && !state.error) {detail=state.detail;updateParent();updateBranches(state);return;}
             contentScope?.dispose();contentScope=createScope();detail=null;updateBranches=null;updateParent=null;current=null;send.disabled=true;
             blocks?.dispose();blocks=null;galleryScope?.dispose();galleryScope=null;body.replaceChildren();
+            // #512: a prompt that no longer exists (deleted, or a stale link) says so, with the way back; no Retry.
+            // Edit metadata and ⋯ act on a loaded prompt only (review M2).
+            const hadFocus=[edit,moreMenu.button].includes(document.activeElement);
+            const loaded=!state.loading && !state.error;edit.disabled=!loaded;moreMenu.setDisabled(!loaded);
+            // #524: a prompt that no longer exists has no history to describe.
+            const gone=state.error?.status===404;description.textContent=gone?'':HISTORY_DESCRIPTION;description.hidden=gone;
+            if(gone) {
+                const message=el('p',PROMPT_GONE,'library-status');message.setAttribute('role','status');body.append(message);
+                const open=createButton('Open the Prompt library');contentScope.listen(open,'click',()=>{window.location.hash='#/library';});body.append(open);
+                // A focused control that was just disabled hands focus to the way back (review M3).
+                if(hadFocus) open.focus({preventScroll:true});
+                return;
+            }
             if(state.loading || state.error) {
                 const message=el('p',state.loading?'Loading prompt history…':'Prompt history could not be loaded.','library-status');message.setAttribute('role',state.error?'alert':'status');body.append(message);
                 if(state.error) {const retry=createButton('Retry prompt history');contentScope.listen(retry,'click',()=>loader.load(positiveId));body.append(retry);}return;
             }
             detail=state.detail;const content=contentScope;
-            const summary=el('article',undefined,'library-surface');const categoryChip=el('span','','library-chip');summary.append(categoryChip);
+            // The concept summary (app.js a598): category chip, positive and selected negative blocks, then the counts (D24).
+            const summary=el('article',undefined,'surface');const categoryChip=el('span','','chip');summary.append(categoryChip);
             const promptContainer=el('div');promptContainer.setAttribute('role','region');promptContainer.setAttribute('aria-label','Saved prompt texts');summary.append(promptContainer);
+            const meta=el('div',undefined,'card-meta'),runsMeta=el('span'),imagesMeta=el('span'),variantsMeta=el('span');runsMeta.hidden=true;
+            meta.append(runsMeta,imagesMeta,variantsMeta);summary.append(meta);
             const parentStatus=el('p','','library-parent-status muted');parentStatus.hidden=true;parentStatus.setAttribute('role','status');
             const retryParent=createButton('Retry saved Library details'),reloadSaved=createButton('Reload saved Library view');retryParent.hidden=reloadSaved.hidden=true;summary.append(parentStatus,retryParent,reloadSaved);
             const ownerText=detail.positive.text;let savedReadState='current',parentRequest,parentGeneration=0;
             content.cleanup(()=>{parentGeneration++;parentRequest?.abort();});
             const all=createButton('All images for this positive');
-            const variants=el('section',undefined,'library-surface library-variants');variants.setAttribute('aria-label','Saved negative variants');
-            const panelHeading=el('div',undefined,'library-panel-heading'),panelCopy=el('div'),rowActions=el('div',undefined,'row-actions');
-            panelCopy.append(el('h2','Negative variants'),el('p','Choose a saved negative to inspect its full text and filter the shared gallery.','muted'));
-            const addNegative=createButton('+ Add negative'),showArchived=createButton('');showArchived.setAttribute('aria-pressed','false');
-            rowActions.append(addNegative,showArchived);panelHeading.append(panelCopy,rowActions);variants.append(panelHeading);
-            const branches=el('div',undefined,'library-branches');const positiveLane=el('p',undefined,'library-positive-lane');positiveLane.append(el('span','Positive prompt · unchanged'));branches.append(positiveLane);
+            // The concept's negative variants panel (app.js a598, style.css 1059-1154): heading, the lanes, then the legend.
+            const variants=el('section',undefined,'surface timeline-panel');variants.setAttribute('aria-label','Saved negative variants');
+            const panelHeading=el('div',undefined,'panel-heading'),panelCopy=el('div'),rowActions=el('div',undefined,'row-actions');
+            panelCopy.append(el('h2','Negative variants'),el('p','Choose a red dot to change the negative and filter this gallery.','small'));
+            // Compare negatives (aria-pressed) opens the comparison section below; Show archived is the approved #235 addition.
+            const compare=createButton('Compare negatives'),addNegative=createButton('+ Add negative'),showArchived=createButton('');
+            compare.setAttribute('aria-pressed','false');showArchived.setAttribute('aria-pressed','false');
+            rowActions.append(compare,addNegative,showArchived);panelHeading.append(panelCopy,rowActions);variants.append(panelHeading);
+            content.listen(compare,'click',()=>{compare.setAttribute('aria-pressed',String(compare.getAttribute('aria-pressed')!=='true'));updateCompare();});
+            // The concept's comparison (app.js a599-616, style.css 1155-1179): after the timeline panel, the baseline (the oldest
+            // active variant, D25) beside the selected negative, then its added terms. Another dot updates it in place.
+            const compareSection=el('section',undefined,'surface');let compareBlocks=[],compareKey=null;
+            const disposeCompareBlocks=()=>{for(const item of compareBlocks)item.dispose();compareBlocks=[];};
+            content.cleanup(disposeCompareBlocks);
+            function compareBlock(text,label) {
+                // The concept's `.compare-item` holds the block itself; the blocks mount in a transparent child (D25).
+                const item=el('div',undefined,'compare-item'),mount=el('div');item.append(mount);
+                // D46: the two blocks are named Baseline and Selected, so no region or action name repeats on the page.
+                compareBlocks.push(mountPromptBlocks(mount,{prompts:{negative:{status:'resolved',text,source:'library'}},roles:['negative'],sender,parentScope:content,includePairAction:false,contextLabel:label,title:displayTitle(detail.positive)}));
+                compareBlocks.at(-1).setState({prompts:{negative:{status:'resolved',text,source:'library'}},actionsEnabled:savedReadState==='current'});
+                return item;
+            }
+            function updateCompare() {
+                if(detail.variant_total===0) compare.setAttribute('aria-pressed','false');
+                compare.disabled=detail.variant_total===0;
+                if(compare.getAttribute('aria-pressed')!=='true') {compareSection.remove();disposeCompareBlocks();compareKey=null;return;}
+                if(variants.nextSibling!==compareSection) variants.after(compareSection);
+                // D46: the oldest active variant may sit on an unloaded page; the baseline is never guessed from the newest lanes.
+                const baseline=detail.variants_has_more?null:detail.variants.reduce((oldest,variant)=>!oldest || variant.id<oldest.id?variant:oldest,null);
+                const lane=[...lanes.values()].find(item=>item.entry.variant.id===activePairId) || [...lanes.values()].find(item=>item.entry.variant.id===baseline?.id);
+                const selected=(activePairId!==null && activePairId!==undefined && recordFor(activePairId)) || baseline;
+                const name=lane?laneName(lane.entry):'';
+                const key=JSON.stringify([baseline?.id,baseline?.negative_text,selected?.id,selected?.negative_text,name,displayTitle(detail.positive),savedReadState]);
+                if(key===compareKey) return;
+                compareKey=key;disposeCompareBlocks();compareSection.replaceChildren(el('h2','Compare negative variants'));
+                if(!baseline || !selected) {compareSection.append(el('p','Load more negative variants to reach the baseline.','small'));return;}
+                const grid=el('div',undefined,'compare-grid');grid.append(compareBlock(baseline.negative_text,'Baseline'),compareBlock(selected.negative_text,'Selected'));
+                compareSection.append(el('p',`Baseline compared with ${name}. Choose another red dot to change the comparison.`),grid,el('p','Added terms','small'));
+                const terms=addedTerms(baseline.negative_text,selected.negative_text);
+                if(terms.length) for(const term of terms) compareSection.append(el('span',`+ ${term}`,'diff-added'));
+                else compareSection.append(el('p','No added terms.','small'));
+            }
+            const branches=el('div',undefined,'timeline');const positiveLane=el('div',undefined,'positive-lane');positiveLane.append(el('span','Positive prompt · unchanged'));branches.append(positiveLane);
             const lanes=new Map();const emptyNote=el('p','No saved negative variants. Existing image associations remain available.','muted');
-            const variantCount=el('p','','muted');variantCount.setAttribute('role','status');
+            // D45: the bounded page count stays a status for assistive technology; the concept shows no count line.
+            const variantCount=el('p','','ca-visually-hidden');variantCount.setAttribute('role','status');
             const variantError=el('p','','muted');variantError.setAttribute('role','alert');variantError.hidden=true;
             const restoreStatus=el('p','','muted library-restore-status');restoreStatus.setAttribute('role','alert');restoreStatus.hidden=true;
             const restoreAction=createButton('');restoreAction.hidden=true;let restoreHandler=null;
@@ -471,13 +696,24 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
                 for(const [index,variant] of loadedArchived.entries()) entries.push({key:`archived:${variant.id}`,kind:'archived',variant,number:detail.variant_total+index+1});
                 return entries;
             }
+            /** D45: a dot names its pair by a title no other loaded lane shares, else by its number, so every name is unique. */
+            // Titles compare trimmed (accessible names are whitespace-normalized), and a title that reads like a fallback
+            // "variant N" is never used, so it cannot collide with an untitled lane's name.
+            const trimmedTitle=variant=>typeof variant.title==='string'?variant.title.trim():'';
+            function dotName(entry,entries) {
+                const title=trimmedTitle(entry.variant);
+                return title && !/^variant\s+\d+$/i.test(title) && entries.filter(other=>trimmedTitle(other.variant)===title).length===1?title:`variant ${entry.number}`;
+            }
+            const runCount=variant=>Number.isSafeInteger(variant.run_count) && variant.run_count>0?variant.run_count:0;
             function laneFor(entry) {
                 let lane=lanes.get(entry.key);
                 if(!lane) {
-                    const node=el('div',undefined,`library-variant-lane${entry.kind==='archived'?' library-variant-archived':''}`);const button=createButton('−','library-variant-dot');const label=el('span');
-                    node.append(button,label);lane={node,button,label,text:document.createTextNode(''),entry};label.append(lane.text);
+                    // Concept lane (app.js a598): the "−" dot, "<name> · N runs", then the repeat-run dot (D26).
+                    const node=el('div',undefined,`variant-lane${entry.kind==='archived'?' library-variant-archived':''}`);const button=createButton('−','variant-dot');const label=el('span');
+                    const runDot=createButton('','run-dot');runDot.hidden=true;
+                    node.append(button,label,runDot);lane={node,button,label,runDot,text:document.createTextNode(''),entry};label.append(lane.text);
                     if(entry.kind==='archived') {lane.restore=createButton('Restore','library-variant-restore');label.append(lane.restore);content.listen(lane.restore,'click',()=>restorePair(lane.entry.variant.id,lane.restore));}
-                    content.listen(button,'click',()=>select(lane.entry.variant.id));lanes.set(entry.key,lane);
+                    content.listen(button,'click',()=>select(lane.entry.variant.id));content.listen(runDot,'click',()=>openRunDot(lane));lanes.set(entry.key,lane);
                 }
                 lane.entry=entry;return lane;
             }
@@ -488,9 +724,12 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
                 for(const [index,entry] of entries.entries()) {
                     const lane=laneFor(entry),name=laneName(entry);
                     lane.node.style.setProperty('--lane-offset',`${38+index*47}px`);
-                    lane.button.setAttribute('aria-label',entry.kind==='separate'?'Select the saved negative variant outside the loaded list':`Select negative variant ${entry.number}`);
+                    const named=entry.kind==='separate'?'the saved negative variant outside the loaded list':dotName(entry,entries);
+                    lane.button.setAttribute('aria-label',entry.kind==='separate'?'Select the saved negative variant outside the loaded list':`Select negative ${named}`);
                     lane.button.setAttribute('aria-pressed',String(activePairId===entry.variant.id));lane.button.disabled=savedReadState!=='current';
-                    lane.text.textContent=`${name} · ${countOf(entry.variant.image_count,'linked image')}${entry.kind==='archived'?' · Archived':''}`;
+                    lane.text.textContent=`${name} · ${countOf(runCount(entry.variant),'run')}${entry.kind==='archived'?' · Archived':''}`;
+                    // D26: the small dot appears only for a pair counted more than once.
+                    lane.runDot.hidden=runCount(entry.variant)<=1;lane.runDot.setAttribute('aria-label',`Show repeat run for ${named}`);lane.runDot.disabled=savedReadState!=='current';
                     if(lane.restore) {lane.restore.setAttribute('aria-label',`Restore ${name}`);lane.restore.disabled=savedReadState!=='current' || restoringPairs.has(entry.variant.id);}
                     if(previous.nextSibling!==lane.node) previous.after(lane.node);
                     previous=lane.node;
@@ -505,22 +744,30 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
                 variantError.hidden=!loadError;variantError.textContent=!loadError?'':state.variantsError?'Negative variants could not be loaded. Retry to continue.':'Archived negative variants could not be loaded. Retry to continue.';
                 const archivedCount=Number.isSafeInteger(detail.positive.archived_variant_count)?detail.positive.archived_variant_count:0;
                 showArchived.textContent=`Show archived (${archivedCount})`;showArchived.setAttribute('aria-pressed',String(archivedShown));
+                updateCompare();updateGalleryContext();
             };
+            const updateMeta=()=>{imagesMeta.textContent=countOf(detail.positive.image_count ?? 0,'image');variantsMeta.textContent=countOf(detail.positive.variant_count ?? 0,'negative variant');};
             updateParent=()=>{
-                main.querySelector('h1').textContent=displayTitle(detail.positive);categoryChip.textContent=detail.positive.category || 'Uncategorized';
-                send.setAttribute('aria-label',`Send prompt pair to ComfyUI: ${displayTitle(detail.positive)}`);
+                const name=displayTitle(detail.positive);
+                const h1=main.querySelector('h1');h1.textContent=name;h1.title=name;categoryChip.textContent=detail.positive.category || 'Uncategorized';updateMeta();
+                send.setAttribute('aria-label',`Send prompt pair to ComfyUI: ${name}`);blocks?.setTitle(name);
             };
             let activePairId;
             updateParent();updateBranches(state);
             branches.append(emptyNote);
-            const note=el('p','Saved combinations, not an execution timeline.','muted');
-            const variantFooter=el('div',undefined,'library-variant-footer'),variantSummary=el('div',undefined,'library-variant-summary');variantSummary.append(variantCount,note);variantFooter.append(variantSummary,all);
-            variants.append(branches,variantError,restoreStatus,restoreAction,more,retry,variantFooter);
-            const context=el('p','','library-variant-context');context.setAttribute('role','status');
-            const gallery=el('section',undefined,'library-shared-gallery');gallery.setAttribute('aria-label','Shared gallery');gallery.append(el('h2','Shared gallery'),context);
+            const lower=el('div',undefined,'timeline-lower');lower.append(el('span','Green + positive · red − negative · small dot repeat run','small'),all);
+            variants.append(branches,variantCount,variantError,restoreStatus,restoreAction,more,retry,lower);
+            // The concept's shared gallery (app.js a616-621): its heading names the selected variant; the embedded
+            // collection renders the PR C media cards. Recorded executions (#209) stay below it.
+            const context=el('span','','small');context.setAttribute('role','status');
+            const galleryTitle=el('h2','Shared gallery');galleryTitle.tabIndex=-1;
+            const galleryHeading=el('div',undefined,'panel-heading');galleryHeading.append(galleryTitle,context);
+            const gallery=el('section',undefined,'history-gallery');gallery.setAttribute('aria-label','Shared gallery');gallery.append(galleryHeading);
             const images=el('div',undefined,'library-linked-images');gallery.append(images);
             const recorded=el('div',undefined,'library-recorded-container');
-            body.append(summary,variants,recorded,gallery);
+            // #443 D152: an archived prompt's page says so first, with Restore (the concept's `.notice`).
+            if(detail.positive.archived===true) body.append(archivedNotice(content,detail));
+            body.append(summary,variants,gallery,recorded);
             const recordFor=pairId=>detail.variants.find(variant=>variant.id===pairId) || archivedList().find(variant=>variant.id===pairId) || (separate()?.id===pairId?separate():null);
             const archivedSelection=pairId=>archivedList().some(variant=>variant.id===pairId) || (separate()?.id===pairId && separate().archived===true);
             function rolesFor(pairId) {
@@ -549,7 +796,7 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
                             if(current.negative_text!==variant.negative_text || current.explicit_empty!==variant.explicit_empty) {changed=true;return variant;}
                             return {...variant,...current};
                         });
-                        detail={...detail,positive:fresh.positive,variants};categoryChip.textContent=fresh.positive.category || 'Uncategorized';
+                        detail={...detail,positive:fresh.positive,variants};categoryChip.textContent=fresh.positive.category || 'Uncategorized';updateMeta();
                         savedReadState=changed || unobserved || additional?'stale':'current';
                         parentStatus.textContent=changed?'A saved negative changed identity. This view retains its previous selection and gallery. Reload the saved Library view to inspect current data.':unobserved?(fresh.variants_has_more?'Some loaded saved negatives were not observed in this bounded revalidation page. Reload the saved Library view to validate them.':'Some loaded saved negatives were not present in the revalidation result. This view retains its previous selection and gallery.'):additional?'Saved Library choices changed. This view retains its previous selection and gallery. Reload the saved Library view to inspect current choices.':'Saved Library details revalidated.';
                         reloadSaved.hidden=savedReadState==='current';
@@ -568,23 +815,31 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
             }
             content.listen(retryParent,'click',retrySavedParent);content.listen(reloadSaved,'click',()=>{pendingSelection=null;loader.load(positiveId);});
             if(!historyVisits.has(positiveId)) historyVisits.set(positiveId,{});
-            mountRecordedHistory(recorded,{api,positiveId,parentScope:content,sender,visit:historyVisits.get(positiveId),onParentRevalidate:parent=>{
+            const recordedView=mountRecordedHistory(recorded,{api,positiveId,parentScope:content,sender,visit:historyVisits.get(positiveId),onParentRevalidate:parent=>{
                 if(content.signal.aborted) return;parentGeneration++;parentRequest?.abort();setParentState(parent);
-            }});
+            },onRecordedCount:count=>{runsMeta.hidden=count===null;runsMeta.textContent=count===null?'':countOf(count,'tracked run');}});
             // The heading carries the pair send, as in the concept; the saved texts keep their per-role actions.
-            blocks=mountPromptBlocks(promptContainer,{prompts:libraryPromptRoles(detail),sender,parentScope:content,includePairAction:false});
+            blocks=mountPromptBlocks(promptContainer,{prompts:libraryPromptRoles(detail),sender,parentScope:content,includePairAction:false,title:displayTitle(detail.positive)});
+            /** The gallery heading's "<name> · same positive prompt" with the lane's own name, renamed with it (D47). */
+            // With no saved variant the page shows every image of the positive, a state the concept never reaches.
+            function updateGalleryContext() {
+                if(activePairId===undefined) return;
+                const lane=[...lanes.values()].find(item=>item.entry.variant.id===activePairId);
+                const archived=activePairId!==null && archivedSelection(activePairId);
+                context.textContent=activePairId===null?'All images for this positive, including unassigned images. Choose a saved negative variant to inspect or send it.':`${lane?laneName(lane.entry):'Selected saved negative variant'}${archived?' · Archived':''} · same positive prompt`;
+            }
             function select(pairId,{force=false}={}) {
                 if(savedReadState!=='current' || (!force && galleryScope && activePairId===pairId)) return;
                 if(pairId!==null && !recordFor(pairId)) pairId=null;
                 activePairId=pairId;blocks.setState({prompts:rolesFor(pairId),actionsEnabled:true});
-                for(const lane of lanes.values()) lane.button.setAttribute('aria-pressed',String(lane.entry.variant.id===pairId));all.setAttribute('aria-pressed',String(pairId===null));
-                const index=detail.variants.findIndex(variant=>variant.id===pairId),archived=pairId!==null && archivedSelection(pairId);
-                const lane=[...lanes.values()].find(item=>item.entry.variant.id===pairId);
-                context.textContent=pairId===null?'All images for this positive, including unassigned images. Choose a saved negative variant to inspect or send it.':index>=0?`Negative variant ${index+1} · same positive prompt`:`${lane?laneName(lane.entry):'Selected saved negative variant'}${archived?' · Archived':''} · same positive prompt`;
+                for(const lane of lanes.values()) lane.button.setAttribute('aria-pressed',String(lane.entry.variant.id===pairId));
+                const archived=pairId!==null && archivedSelection(pairId);
+                updateGalleryContext();
                 galleryScope?.dispose();galleryScope=createScope();images.replaceChildren();
-                // An archived pair's images are read in the archived scope; the gallery stays authoritative.
-                mountImages(images,api,galleryScope,{embedded:true,fetchPage:({parameters,signal})=>{const query=new URLSearchParams(parameters);if(pairId!==null) query.set('pair_id',String(pairId));if(archived) query.set('archive','archived');return api.get(`/prompt_manager/library/${positiveId}/images?${query}`,{signal});}});
-                updateSend();
+                // An archived pair's images are read in the archived scope; the gallery stays authoritative. The
+                // embedded collection has no caption: the gallery heading names it (D47).
+                mountImages(images,api,galleryScope,{embedded:true,focusTarget:galleryTitle,emptyText:pairId===null?undefined:'Saved variant · no runs yet.',fetchPage:({parameters,signal})=>{const query=new URLSearchParams(parameters);if(pairId!==null) query.set('pair_id',String(pairId));if(archived) query.set('archive','archived');return api.get(`/prompt_manager/library/${positiveId}/images?${query}`,{signal});}});
+                updateSend();updateCompare();
             }
             /** A metadata receipt names no pair, so the page re-reads its own selection through the exact-ID route. */
             async function rereadSelectedPair() {
@@ -648,7 +903,51 @@ export function mountLibrary(main,api,parentScope,{positiveId}={}) {
                 if(pair) select(pair.id,{force:true});
             }
             current={activePairId:()=>activePairId ?? null,sendRoles:()=>{const roles=activePairId===null || activePairId===undefined?{}:promptRoles(rolesFor(activePairId));return Object.hasOwn(roles,'positive') && Object.hasOwn(roles,'negative')?roles:null;},apply};
-            content.listen(all,'click',()=>select(null));
+            /** A bounded media dialog (D26): its gallery lives until the dialog closes or the view goes. */
+            // One slot: each open replaces the previous dialog's scope, so repeated opens never pile up cleanups.
+            let imagesDialogScope=null;content.cleanup(()=>{imagesDialogScope?.dispose();imagesDialogScope=null;});
+            function openImagesDialog({title,intro,className,fetchPage,trigger}) {
+                imagesDialogScope?.dispose();
+                const dialogScope=createScope();imagesDialogScope=dialogScope;
+                const grid=el('div',undefined,className);
+                openContentDialog({scope:content,title,nodes:intro?[el('p',intro,'small'),grid]:[grid],trigger,onClose:()=>{dialogScope.dispose();if(imagesDialogScope===dialogScope) imagesDialogScope=null;}});
+                // D47: the dialog's own title names its images, as in the concept (a1282-1304), so the collection has no
+                // "Linked images" heading or count; a stranded focus returns to the dialog's close button.
+                mountImages(grid,api,dialogScope,{embedded:true,focusTarget:grid.closest('dialog')?.querySelector('.dialog-header > button') ?? null,fetchPage});
+            }
+            const imagesPage=(id,query,signal)=>api.get(`/prompt_manager/library/${id}/images?${query}`,{signal});
+            /** Concept "All images for this positive" (a1282-1290): every image of the positive, Load more bounded. */
+            function openAllImagesDialog(id,trigger) {
+                openImagesDialog({title:'All images for this positive',trigger,fetchPage:({parameters,signal})=>imagesPage(id,new URLSearchParams(parameters),signal)});
+            }
+            /** Concept "Repeat run" (a1291-1304): the pair's newest linked image only. */
+            function openRepeatRun(pair,trigger) {
+                openImagesDialog({title:'Repeat run',intro:'Same positive and negative, another execution.',className:'spaced-15',trigger,fetchPage:async({parameters,signal})=>{
+                    const query=new URLSearchParams(parameters);query.set('pair_id',String(pair.id));query.set('limit','1');query.delete('cursor');
+                    if(pair.archived===true) query.set('archive','archived');
+                    const page=await imagesPage(positiveId,query,signal),images=Array.isArray(page?.images)?page.images.slice(0,1):page?.images;
+                    return {...page,images,total:Array.isArray(images)?images.length:page?.total,has_more:false,next_cursor:null};
+                }});
+            }
+            /** D26: the run dot opens Recorded run for the pair's newest recorded execution, else Repeat run. */
+            const runLookups=new Set();
+            async function openRunDot(lane) {
+                const pair=lane.entry.variant,trigger=lane.runDot;
+                if(savedReadState!=='current' || runLookups.has(pair.id)) return;
+                runLookups.add(pair.id);let run=null,failed=false;
+                try {
+                    const value=await api.get(`/prompt_manager/library/${positiveId}/history/pairs/${pair.id}/newest`,{signal:content.signal,cache:'no-store'});
+                    run=value?.run && typeof value.run.run_id==='string'?value.run:null;
+                } catch {
+                    failed=true;
+                } finally {runLookups.delete(pair.id);}
+                // The view may have gone stale while the lookup was in flight; a stale view opens nothing.
+                if(content.signal.aborted || savedReadState!=='current') return;
+                if(run && recordedView.openRun({runId:run.run_id,anchorId:run.anchor_id ?? null,contextId:run.context_id ?? null,trigger})) return;
+                if(failed) showWorkspaceToast('Recorded runs could not be read. Showing the newest linked image.');
+                openRepeatRun(pair,trigger);
+            }
+            content.listen(all,'click',()=>openAllImagesDialog(positiveId,all));
             const remembered=pendingSelection,outside=selectedPairs.get(positiveId);pendingSelection=null;
             if(outside?.archived && outside.id===remembered && !archivedShown) {archivedShown=true;archivedVisible.set(positiveId,true);}
             if(archivedShown) archivedLoader.load(positiveId);

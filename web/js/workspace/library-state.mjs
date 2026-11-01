@@ -11,20 +11,40 @@ function parameters(filters,limit) {
     if(filters.tags!==undefined && (!Array.isArray(filters.tags) || filters.tags.some(tag=>typeof tag!=='string'))) throw new TypeError('Invalid library tags');
     for(const tag of filters.tags || []) if(tag.trim()) query.append('tag',tag.trim());
     const sort=filters.sort || 'newest';
-    if(!['newest','oldest','name','rating'].includes(sort)) throw new TypeError('Invalid library sort');
-    query.set('sort',sort);return query;
+    if(!['newest','oldest','name'].includes(sort)) throw new TypeError('Invalid library sort');
+    // #444: how Tags match (every tag, any of them, or parents no tag's Browse returns, which never goes with tags) and
+    // the output folder below a root.
+    const tagMode=filters.tagMode ?? 'all',folder=filters.folder ?? '';
+    if(!LIBRARY_TAG_MODES.includes(tagMode) || (tagMode==='untagged' && query.has('tag'))) throw new TypeError('Invalid library tag mode');
+    if(typeof folder!=='string' || folder.length>1024) throw new TypeError('Invalid library folder');
+    if(tagMode!=='all') query.set('tag_mode',tagMode);
+    if(folder) query.set('folder',folder);
+    query.set('sort',sort);
+    // #443 D152: the archived shelf; the default shelf sends nothing, as before.
+    const shelf=filters.shelf || 'active';
+    if(!['active','archived'].includes(shelf)) throw new TypeError('Invalid library shelf');
+    if(shelf==='archived') query.set('shelf','archived');
+    return query;
 }
-function validatePage(page,cursor) {
-    if(!page || !Array.isArray(page.items) || page.items.some(item=>!parent(item)) || !Number.isSafeInteger(page.total) || page.total<0 || typeof page.has_more!=='boolean' || !(page.next_cursor===null || (typeof page.next_cursor==='string' && page.next_cursor.length)) || page.has_more!==(page.next_cursor!==null) || (page.has_more && cursor===page.next_cursor)) throw new TypeError('Invalid library page');
+/** The Library's tag match values (#444); the first is the default, sent as no parameter. */
+export const LIBRARY_TAG_MODES=Object.freeze(['all','any','untagged']);
+// `variant_total` is the filtered parents' active negative variants (the concept caption's "M negative variants").
+function validatePage(page,cursor,query) {
+    // A tag match or folder the server did not echo was not applied (an older server): never show the whole shelf as filtered.
+    if(query?.has('tag_mode') && page?.tag_mode!==query.get('tag_mode')) throw new TypeError('Unconfirmed library tag mode');
+    if(query?.has('folder') && page?.folder!==query.get('folder')) throw new TypeError('Unconfirmed library folder');
+    if(!page || !Array.isArray(page.items) || page.items.some(item=>!parent(item)) || !Number.isSafeInteger(page.total) || page.total<0 || !Number.isSafeInteger(page.variant_total) || page.variant_total<0 || typeof page.has_more!=='boolean' || !(page.next_cursor===null || (typeof page.next_cursor==='string' && page.next_cursor.length)) || page.has_more!==(page.next_cursor!==null) || (page.has_more && cursor===page.next_cursor)) throw new TypeError('Invalid library page');
 }
 export function createLibraryStream({api,onChange=()=>{},restore}) {
-    let state=Object.freeze({items:Object.freeze([]),total:0,cursor:null,hasMore:true,loading:false,error:null});
+    let state=Object.freeze({items:Object.freeze([]),total:0,variantTotal:null,archivedTotal:null,cursor:null,hasMore:true,loading:false,error:null,epoch:null});
     let query=parameters({},40),request,disposed=false,seen=new Set();
     if(restore) {
         query=parameters(restore.filters,40);const saved=restore.state;
-        validatePage({items:saved.items,total:saved.total,next_cursor:saved.cursor,has_more:saved.cursor!==null},null);
+        // A shelf left before its first page answered (or after it failed) has no page yet: it restores as a fresh stream.
+        const firstPagePending=saved?.variantTotal===null && Array.isArray(saved.items) && !saved.items.length && saved.total===0 && saved.cursor===null && saved.hasMore===true;
+        if(!firstPagePending) validatePage({items:saved.items,total:saved.total,variant_total:saved.variantTotal,next_cursor:saved.cursor,has_more:saved.cursor!==null},null);
         if(new Set(saved.items.map(item=>item.id)).size!==saved.items.length) throw new TypeError('Duplicate restored parent');
-        state=Object.freeze({...saved,items:Object.freeze(saved.items.map(item=>Object.freeze({...item}))),loading:false,error:null});seen=new Set(state.items.map(item=>item.id));
+        state=Object.freeze({...saved,epoch:saved.epoch ?? null,items:Object.freeze(saved.items.map(item=>Object.freeze({...item}))),loading:false,error:null});seen=new Set(state.items.map(item=>item.id));
     }
     const emit=patch=>{state=Object.freeze({...state,...patch});onChange(state);};
     async function loadMore() {
@@ -34,14 +54,21 @@ export function createLibraryStream({api,onChange=()=>{},restore}) {
         try {
             const page=await api.get(`/prompt_manager/library?${params}`,{signal:current.signal});
             if(disposed || current!==request) return 0;
-            validatePage(page,cursor);const incoming=[];const added=new Set();
+            validatePage(page,cursor,query);
+            // #437: the storage epoch the shelf's items were read under, which a bulk write sends as its fence; a later
+            // page from a restored storage is refused (its items would belong to another database).
+            const epoch=typeof page.library_epoch==='string'?page.library_epoch:null;
+            if(state.epoch!==null && epoch!==state.epoch) throw new TypeError('Prompt storage changed while the library was loading');
+            const incoming=[];const added=new Set();
             for(const item of page.items) if(!seen.has(item.id) && !added.has(item.id)) {added.add(item.id);incoming.push(Object.freeze({...item}));}
             for(const value of added) seen.add(value);
-            request=null;emit({items:incoming.length?Object.freeze([...state.items,...incoming]):state.items,total:page.total,cursor:page.next_cursor,hasMore:page.has_more,loading:false,error:null});return incoming.length;
+            // #443: the archived parents matching the filters (Show archived prompts); null from an older server.
+            const archivedTotal=Number.isSafeInteger(page.archived_total) && page.archived_total>=0?page.archived_total:null;
+            request=null;emit({items:incoming.length?Object.freeze([...state.items,...incoming]):state.items,epoch:state.epoch ?? epoch,total:page.total,variantTotal:page.variant_total,archivedTotal,cursor:page.next_cursor,hasMore:page.has_more,loading:false,error:null});return incoming.length;
         } catch(error) {if(!disposed && current===request) {request=null;emit({loading:false,error});}return 0;}
     }
     return {get state(){return state;},loadMore,async reset(filters={}) {
-        if(disposed) return 0;const next=parameters(filters,40);request?.abort();request=null;query=next;seen=new Set();emit({items:Object.freeze([]),total:0,cursor:null,hasMore:true,loading:false,error:null});return loadMore();
+        if(disposed) return 0;const next=parameters(filters,40);request?.abort();request=null;query=next;seen=new Set();emit({items:Object.freeze([]),total:0,variantTotal:null,archivedTotal:state.archivedTotal ?? null,cursor:null,hasMore:true,loading:false,error:null,epoch:null});return loadMore();
     },dispose(){disposed=true;request?.abort();request=null;}};
 }
 /**
@@ -104,4 +131,29 @@ export function libraryWindow(count,columns,top,height,focused=-1) {
     for(let row=first;row<=last;row++) keep.add(row);
     if(focused>=0 && focused<count) keep.add(Math.floor(focused/columns));
     return [...keep].sort((a,b)=>a-b).flatMap(row=>Array.from({length:columns},(_,column)=>row*columns+column).filter(index=>index<count));
+}
+
+const byFolderName=(a,b)=>{const x=a.toLowerCase(),y=b.toLowerCase();return x<y?-1:x>y?1:a<b?-1:a>b?1:0;};
+/**
+ * Refine › Folder options (#444 D150): the concept's "All output folders" first, then the folders as a tree built by
+ * path segment, so each folder sits directly under its own parent (never under a longer sibling such as `kiko-v6`) and
+ * folders differing only in case stay distinct siblings. Siblings sort case-insensitively, then by exact spelling. A
+ * label is the last segment indented by depth (the legacy admin select). The chosen folder is kept even when the list
+ * lacks it, with its parents.
+ */
+export function libraryFolderOptions(folders,current='') {
+    const root=new Map();
+    for(const folder of current?[...folders,current]:folders) {
+        let level=root;
+        for(const segment of folder.split('/')) {if(!level.has(segment)) level.set(segment,new Map());level=level.get(segment);}
+    }
+    const options=[['','All output folders']];
+    (function walk(level,prefix,depth) {
+        for(const segment of [...level.keys()].sort(byFolderName)) {
+            const path=prefix?`${prefix}/${segment}`:segment;
+            options.push([path,`${'\u00a0\u00a0'.repeat(depth)}${segment}`]);
+            walk(level.get(segment),path,depth+1);
+        }
+    })(root,'',0);
+    return options;
 }

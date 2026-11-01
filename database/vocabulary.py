@@ -3,6 +3,9 @@
 A count is the number of eligible Library parents that carry the value
 directly or through one active saved pair, which is exactly what
 ``list_library(tags=[name])`` / ``list_library(category=value)`` return.
+A tag row's ``image_count`` is the number of files (private locators) with any
+byte record carrying the tag (#249), so a file counts once however many of its
+byte versions carry it, and equal bytes at two paths count twice.
 
 Tag commands run in one ``_pair_transaction``: the storage epoch is checked
 first, then the exact ``{id, name}`` identity, and the receipt is read on the
@@ -10,12 +13,15 @@ same connection before commit. Owner rows and their timestamps never change.
 
 Category consolidation is previewed in one ``library_snapshot`` and applied in
 one ``_pair_transaction`` that recomputes the owner projection and requires the
-preview's ``impact_token``; only rows carrying the exact source change.
+preview's ``impact_token``; only rows carrying the exact source change. Image
+rows holding the source (``image_categories``, #332) are owners too: they are
+counted, hashed into the token and renamed with the prompts and pairs.
 """
 
 import sqlite3
 
-from .library import _ELIGIBLE, _limit
+from .library import _ELIGIBLE, SHELVED_PAIR, UNTAGGED, _escape, _limit
+from .prompt_archive import SHELVED
 from .library_commands import _TOKEN, LibraryCommandError, _validate_epoch
 from .library_tokens import canonical_token
 from .models import utc_now_iso
@@ -26,28 +32,82 @@ except ImportError:
     from utils.validators import validate_category, validate_tags
 
 _CATEGORY_DOMAIN = "prompt-manager-vocabulary-category:v1\n"
+# Files carrying a tag through any of their byte records (#249 image tags).
+_IMAGE_FILES = (
+    "SELECT mit.tag_id,COUNT(DISTINCT b.file_id) FROM media_image_tags mit "
+    "JOIN media_annotation_bytes b ON b.id=mit.byte_id"
+)
 
 
-def _tag_rows(page: str) -> str:
+def _tag_rows(page: str, order: str = "page.id") -> str:
     """Count rows for the registry rows selected by ``page`` (id, name)."""
-    # Eligible parent components carrying a tag in the page, plus the
-    # positive parent of every active pair carrying it (always eligible).
+    # Eligible parent components on the shelf carrying a tag in the page,
+    # plus the positive parent of every active pair carrying it (always
+    # eligible) when that parent is on the shelf: archived parents (#443)
+    # are hidden with their pairs, so Browse lists what was counted.
     return (
         "WITH page AS (" + page + "),"
         "owners(tag_id,pid) AS ("
         "SELECT pt.tag_id,p.id FROM prompts p "
         "JOIN prompt_tags pt ON pt.prompt_id=p.id "
         "WHERE pt.tag_id IN (SELECT id FROM page) AND " + _ELIGIBLE + " "
+        "AND " + SHELVED + " "
         "UNION SELECT ppt.tag_id,pp.positive_prompt_id FROM prompt_pairs pp "
         "JOIN prompt_pair_tags ppt ON ppt.pair_id=pp.id "
-        "WHERE pp.archived=0 AND ppt.tag_id IN (SELECT id FROM page)) "
-        "SELECT page.id,page.name,COUNT(DISTINCT owners.pid) AS prompt_count "
+        "WHERE pp.archived=0 AND " + SHELVED_PAIR + " "
+        "AND ppt.tag_id IN (SELECT id FROM page)),"
+        "images(tag_id,n) AS (" + _IMAGE_FILES + " "
+        "WHERE mit.tag_id IN (SELECT id FROM page) GROUP BY mit.tag_id) "
+        "SELECT page.id,page.name,COUNT(DISTINCT owners.pid) AS prompt_count,"
+        "COALESCE(MAX(images.n),0) AS image_count "
         "FROM page LEFT JOIN owners ON owners.tag_id=page.id "
-        "GROUP BY page.id ORDER BY page.id"
+        "LEFT JOIN images ON images.tag_id=page.id "
+        "GROUP BY page.id ORDER BY " + order
     )
 
 
-_TAG_PAGE = _tag_rows("SELECT id,name FROM tags WHERE id>? ORDER BY id LIMIT ?")
+# #444 tag sorts: sort -> (key expression on tags/counted, direction). Ties and
+# "created" follow the id, so every order is total and keyset pages are exact.
+TAG_SORTS = {
+    "created": (None, "ASC"),
+    "name": ("name COLLATE NOCASE", "ASC"),
+    "name-desc": ("name COLLATE NOCASE", "DESC"),
+    "prompts": ("prompt_count", "DESC"),
+    "prompts-asc": ("prompt_count", "ASC"),
+}
+_MAX_SEARCH = 200
+_TAG_SEARCH = "name LIKE ? ESCAPE '\\'"
+# Every matching tag ranked by the prompt count its row shows (the owners rule
+# of ``_tag_rows``), then one keyset page of it with its image counts.
+_RANKED_TAG_PAGE = (
+    "WITH owners(tag_id,pid) AS ("
+    "SELECT pt.tag_id,p.id FROM prompts p "
+    "JOIN prompt_tags pt ON pt.prompt_id=p.id WHERE " + _ELIGIBLE + " "
+    "AND " + SHELVED + " "
+    "UNION SELECT ppt.tag_id,pp.positive_prompt_id FROM prompt_pairs pp "
+    "JOIN prompt_pair_tags ppt ON ppt.pair_id=pp.id WHERE pp.archived=0 "
+    "AND " + SHELVED_PAIR + "),"
+    "counted AS (SELECT t.id,t.name,COUNT(DISTINCT o.pid) AS prompt_count "
+    "FROM tags t LEFT JOIN owners o ON o.tag_id=t.id WHERE {search} "
+    "GROUP BY t.id),"
+    "page AS (SELECT id,name,prompt_count FROM counted WHERE {after} "
+    "ORDER BY prompt_count {direction},id LIMIT ?),"
+    "images(tag_id,n) AS (" + _IMAGE_FILES + " "
+    "WHERE mit.tag_id IN (SELECT id FROM page) GROUP BY mit.tag_id) "
+    "SELECT page.id,page.name,page.prompt_count,"
+    "COALESCE(images.n,0) AS image_count FROM page "
+    "LEFT JOIN images ON images.tag_id=page.id "
+    "ORDER BY page.prompt_count {direction},page.id"
+)
+_UNTAGGED_COUNT = (
+    "SELECT COUNT(*) FROM prompts p WHERE ("
+    + _ELIGIBLE
+    + ") AND "
+    + UNTAGGED
+    # Untagged prompts opens the shelf, which hides archived parents (#443).
+    + " AND "
+    + SHELVED
+)
 _TAG_ONE = _tag_rows("SELECT id,name FROM tags WHERE id=?")
 # Every owner kind a tag can sit on, for the delete confirmation.
 _TAG_IMPACT = (
@@ -61,7 +121,10 @@ _TAG_IMPACT = (
     "AS negative_variants,"
     "(SELECT COUNT(*) FROM prompt_pairs pp JOIN prompt_pair_tags ppt "
     "ON ppt.pair_id=pp.id WHERE ppt.tag_id=:tag AND pp.archived!=0) "
-    "AS archived_negative_variants"
+    "AS archived_negative_variants,"
+    "(SELECT COUNT(DISTINCT b.file_id) FROM media_image_tags mit "
+    "JOIN media_annotation_bytes b ON b.id=mit.byte_id WHERE mit.tag_id=:tag) "
+    "AS images"
 )
 _MAX_ID = 2**63 - 1
 
@@ -82,16 +145,34 @@ def _validate_tag_id(tag_id: object) -> None:
         raise ValueError("Invalid tag ID")
 
 
-# The /library/options universe: nonblank values on eligible parents or on
-# active pairs, grouped exactly (whitespace and case variants stay distinct).
-_CATEGORY_GROUPS = (
-    "WITH owners(value,pid) AS ("
-    "SELECT p.category,p.id FROM prompts p WHERE p.category IS NOT NULL "
-    "AND TRIM(p.category)!='' AND " + _ELIGIBLE + " "
-    "UNION SELECT pp.category,pp.positive_prompt_id FROM prompt_pairs pp "
+# Category values in Tags & categories (#332 §7): the prompt-backed values
+# (nonblank values on eligible parents or on active pairs; ``prompt_count``
+# counts only parents on the shelf, so a value only archived parents (#443)
+# hold stays listed with 0, as a tag does; grouped exactly, so
+# whitespace and case variants stay distinct; /library/options lists the same
+# prompt-backed set with its own query) plus the values only image rows hold.
+# A prompt-backed value is ordered by its oldest owning positive; an image-only
+# value sorts after all of them (first_pid is SQLite's INTEGER maximum, above
+# any prompt id), then by value. ``image_count`` counts stored rows, including
+# files missing on disk. No FULL OUTER JOIN, so it runs on SQLite 3.31+.
+_IMAGE_ONLY_FIRST_PID = 2**63 - 1
+_CATEGORY_ROWS = (
+    "WITH owners(value,pid,shelved) AS ("
+    "SELECT p.category,p.id," + SHELVED + " FROM prompts p "
+    "WHERE p.category IS NOT NULL AND TRIM(p.category)!='' AND " + _ELIGIBLE + " "
+    "UNION SELECT pp.category,pp.positive_prompt_id," + SHELVED_PAIR + " "
+    "FROM prompt_pairs pp "
     "WHERE pp.archived=0 AND pp.category IS NOT NULL AND TRIM(pp.category)!=''),"
-    "grouped AS (SELECT value,MIN(pid) AS first_pid,"
-    "COUNT(DISTINCT pid) AS prompt_count FROM owners GROUP BY value) "
+    "image_values(value,image_count) AS ("
+    "SELECT category,COUNT(*) FROM image_categories GROUP BY category),"
+    "grouped(value,first_pid,prompt_count) AS ("
+    "SELECT value,MIN(pid),COUNT(DISTINCT CASE WHEN shelved THEN pid END) "
+    "FROM owners GROUP BY value "
+    "UNION ALL SELECT value," + str(_IMAGE_ONLY_FIRST_PID) + ",0 FROM image_values "
+    "WHERE value NOT IN (SELECT value FROM owners)),"
+    "counted AS (SELECT g.value,g.first_pid,g.prompt_count,"
+    "COALESCE(i.image_count,0) AS image_count FROM grouped g "
+    "LEFT JOIN image_values i ON i.value=g.value) "
 )
 
 
@@ -102,15 +183,23 @@ _CATEGORY_COMPONENTS = (
     "WHERE p.category=? ORDER BY p.id"
 )
 _CATEGORY_PAIRS = "SELECT id,archived FROM prompt_pairs WHERE category=? ORDER BY id"
+# Image rows holding one exact value (#332 DC7), an index search.
+_IMAGE_CATEGORY_ROWIDS = (
+    "SELECT rowid FROM image_categories WHERE category=? ORDER BY rowid"
+)
 _CATEGORY_EXISTS = (
     "SELECT EXISTS(SELECT 1 FROM prompts WHERE category=:v)"
     " OR EXISTS(SELECT 1 FROM prompt_pairs WHERE category=:v)"
+    " OR EXISTS(SELECT 1 FROM image_categories WHERE category=:v)"
 )
 
-# Pairs after components, so a failing pair update rolls both back.
+# Pairs after components and image rows last, so a failing update rolls every
+# earlier one back. An image row is keyed by its file, never by its value, so
+# merging into a value other files already hold cannot conflict.
 _CATEGORY_UPDATES = (
     "UPDATE prompts SET category=?,updated_at=? WHERE category=?",
     "UPDATE prompt_pairs SET category=?,updated_at=? WHERE category=?",
+    "UPDATE image_categories SET category=?,updated_at=? WHERE category=?",
 )
 
 
@@ -121,8 +210,15 @@ def category_impact_token(
     target_exists: bool,
     components: list,
     pairs: list,
+    *,
+    images: list = (),
 ) -> str:
-    """Hash a category projection like ``library_edit_token`` (no secret)."""
+    """Hash a category projection like ``library_edit_token`` (no secret).
+
+    ``images`` are the rowids of the image rows holding ``source`` (#332 DC7).
+    With none the preimage has no ``images`` key, so a prompt-only token keeps
+    the value it had before image categories existed.
+    """
     preimage = {
         "epoch": epoch,
         "source": source,
@@ -131,6 +227,8 @@ def category_impact_token(
         "components": sorted([int(i), bool(flag)] for i, flag in components),
         "pairs": sorted([int(i), bool(flag)] for i, flag in pairs),
     }
+    if images:
+        preimage["images"] = sorted(int(i) for i in images)
     return canonical_token(_CATEGORY_DOMAIN, preimage)
 
 
@@ -160,6 +258,28 @@ def _tag_after(after: object) -> int:
     if type(after) is not int or after <= 0:
         raise ValueError("Invalid vocabulary cursor")
     return after
+
+
+def _tag_search(search: object) -> str:
+    if not isinstance(search, str) or len(search) > _MAX_SEARCH:
+        raise ValueError(f"Tag search must be text of at most {_MAX_SEARCH} characters")
+    return search.strip()
+
+
+def _sorted_tag_after(after: object, sort: str) -> tuple | None:
+    """The ``[key, id]`` cursor of a name or prompt-count sort."""
+    if after is None:
+        return None
+    key_type = str if sort.startswith("name") else int
+    if (
+        not isinstance(after, list)
+        or len(after) != 2
+        or type(after[0]) is not key_type
+        or type(after[1]) is not int
+        or after[1] <= 0
+    ):
+        raise ValueError("Invalid vocabulary cursor")
+    return after[0], after[1]
 
 
 def _category_after(after: object) -> tuple[int, str] | None:
@@ -205,7 +325,16 @@ class VocabularyOperations:
             "SELECT COUNT(DISTINCT pair_id) FROM prompt_pair_tags WHERE tag_id=?",
             (tag_id,),
         ).fetchone()[0]
-        return {"components_changed": components, "pairs_changed": pairs}
+        images = conn.execute(
+            "SELECT COUNT(DISTINCT b.file_id) FROM media_image_tags mit "
+            "JOIN media_annotation_bytes b ON b.id=mit.byte_id WHERE mit.tag_id=?",
+            (tag_id,),
+        ).fetchone()[0]
+        return {
+            "components_changed": components,
+            "pairs_changed": pairs,
+            "images_changed": images,
+        }
 
     def create_vocabulary_tag(self, name: str, *, expected_epoch: str) -> dict:
         """Insert an unused registry row, or reuse the exact existing name."""
@@ -250,6 +379,7 @@ class VocabularyOperations:
                 "SELECT id FROM tags WHERE name=?", (new_name,)
             ).fetchone()
             if target is None:
+                self._bump_image_tag_bytes(conn, tag_id)
                 conn.execute("UPDATE tags SET name=? WHERE id=?", (new_name, tag_id))
                 result_id = tag_id
             else:
@@ -275,6 +405,7 @@ class VocabularyOperations:
             epoch = self._library_epoch(conn, expected_epoch)
             self._vocabulary_identity(conn, epoch, tag_id, name)
             counts = self._tag_owner_counts(conn, tag_id)
+            self._bump_image_tag_bytes(conn, tag_id)
             conn.execute("DELETE FROM tags WHERE id=?", (tag_id,))
             return {"library_epoch": epoch, "deleted": True, **counts}
 
@@ -299,7 +430,8 @@ class VocabularyOperations:
         pairs = [
             [row[0], bool(row[1])] for row in conn.execute(_CATEGORY_PAIRS, (source,))
         ]
-        if not components and not pairs:
+        images = [row[0] for row in conn.execute(_IMAGE_CATEGORY_ROWIDS, (source,))]
+        if not components and not pairs and not images:
             raise LibraryCommandError("vocabulary-conflict", epoch)
         target_exists = bool(
             conn.execute(_CATEGORY_EXISTS, {"v": target}).fetchone()[0]
@@ -313,9 +445,10 @@ class VocabularyOperations:
                 "other_prompts": len(components) - eligible,
                 "negative_variants": len(pairs) - archived,
                 "archived_negative_variants": archived,
+                "images": len(images),
             },
             "impact_token": category_impact_token(
-                epoch, source, target, target_exists, components, pairs
+                epoch, source, target, target_exists, components, pairs, images=images
             ),
         }
 
@@ -339,7 +472,8 @@ class VocabularyOperations:
     def apply_vocabulary_category(
         self, *, expected_epoch: str, source: str, target: str, impact_token: str
     ) -> dict:
-        """Set the exact ``source`` to ``target`` on every component and pair.
+        """Set the exact ``source`` to ``target`` on every component, pair
+        and image row.
 
         The recomputed projection must still match the preview's token; a
         mismatch is ``vocabulary-conflict`` with nothing written.
@@ -369,21 +503,79 @@ class VocabularyOperations:
         epoch: str,
         *,
         limit: int = 100,
-        after: int | None = None,
+        after: object = None,
+        search: str = "",
+        sort: str = "created",
     ) -> dict:
+        """One page of tags matching ``search`` (a literal, case-insensitive
+        substring) in ``sort`` order, with the untagged parents' count."""
         _limit(limit)
-        start = _tag_after(after)
-        total = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
-        rows = [dict(row) for row in conn.execute(_TAG_PAGE, (start, limit + 1))]
+        search = _tag_search(search)
+        if not isinstance(sort, str) or sort not in TAG_SORTS:
+            raise ValueError("sort must be one of " + ", ".join(TAG_SORTS))
+        where, params = "1=1", []
+        if search:
+            where, params = _TAG_SEARCH, [f"%{_escape(search)}%"]
+        total, untagged = conn.execute(
+            f"SELECT (SELECT COUNT(*) FROM tags WHERE {where}),({_UNTAGGED_COUNT})",
+            params,
+        ).fetchone()
+        rows = [
+            dict(row) for row in self._tag_page(conn, where, params, sort, after, limit)
+        ]
         has_more = len(rows) > limit
         rows = rows[:limit]
+        key, _direction = TAG_SORTS[sort]
+        next_key = None
+        if has_more:
+            last = rows[-1]
+            next_key = (
+                last["id"]
+                if key is None
+                else [
+                    last["prompt_count" if key == "prompt_count" else "name"],
+                    last["id"],
+                ]
+            )
         return {
             "library_epoch": epoch,
             "tags": rows,
             "total": total,
+            "untagged_count": untagged,
+            # Echoed so a client can tell this read applied its search and sort.
+            "search": search,
+            "sort": sort,
             "has_more": has_more,
-            "next_key": rows[-1]["id"] if has_more else None,
+            "next_key": next_key,
         }
+
+    @staticmethod
+    def _tag_page(conn, where, params, sort, after, limit):
+        key, direction = TAG_SORTS[sort]
+        if key is None:
+            page = (
+                f"SELECT id,name FROM tags WHERE {where} AND id>? ORDER BY id LIMIT ?"
+            )
+            return conn.execute(
+                _tag_rows(page), [*params, _tag_after(after), limit + 1]
+            )
+        cursor = _sorted_tag_after(after, sort)
+        operator = ">" if direction == "ASC" else "<"
+        keyset, keys = "1=1", []
+        if cursor is not None:
+            keyset = f"({key}{operator}? OR ({key}=? AND id>?))"
+            keys = [cursor[0], cursor[0], cursor[1]]
+        if key == "prompt_count":
+            sql = _RANKED_TAG_PAGE.format(
+                search=where, after=keyset, direction=direction
+            )
+            return conn.execute(sql, [*params, *keys, limit + 1])
+        page = (
+            f"SELECT id,name FROM tags WHERE {where} AND {keyset} "
+            f"ORDER BY {key} {direction},id LIMIT ?"
+        )
+        order = f"page.{key} {direction},page.id"
+        return conn.execute(_tag_rows(page, order), [*params, *keys, limit + 1])
 
     def _vocabulary_categories(
         self,
@@ -396,15 +588,15 @@ class VocabularyOperations:
         _limit(limit)
         key = _category_after(after)
         total = conn.execute(
-            _CATEGORY_GROUPS + "SELECT COUNT(*) FROM grouped"
+            _CATEGORY_ROWS + "SELECT COUNT(*) FROM counted"
         ).fetchone()[0]
         where, params = "", []
         if key is not None:
             where = " WHERE first_pid>? OR (first_pid=? AND value>?)"
             params = [key[0], key[0], key[1]]
         rows = conn.execute(
-            _CATEGORY_GROUPS
-            + "SELECT value,first_pid,prompt_count FROM grouped"
+            _CATEGORY_ROWS
+            + "SELECT value,first_pid,prompt_count,image_count FROM counted"
             + where
             + " ORDER BY first_pid,value LIMIT ?",
             [*params, limit + 1],
@@ -414,7 +606,11 @@ class VocabularyOperations:
         return {
             "library_epoch": epoch,
             "categories": [
-                {"value": row["value"], "prompt_count": row["prompt_count"]}
+                {
+                    "value": row["value"],
+                    "prompt_count": row["prompt_count"],
+                    "image_count": row["image_count"],
+                }
                 for row in rows
             ],
             "total": total,
@@ -424,9 +620,18 @@ class VocabularyOperations:
             ),
         }
 
-    def list_vocabulary_tags(self, *, limit: int = 100, after: int | None = None):
+    def list_vocabulary_tags(
+        self,
+        *,
+        limit: int = 100,
+        after: object = None,
+        search: str = "",
+        sort: str = "created",
+    ):
         with self.library_snapshot() as (conn, epoch, _ceiling):
-            return self._vocabulary_tags(conn, epoch, limit=limit, after=after)
+            return self._vocabulary_tags(
+                conn, epoch, limit=limit, after=after, search=search, sort=sort
+            )
 
     def list_vocabulary_categories(
         self, *, limit: int = 100, after: list | None = None

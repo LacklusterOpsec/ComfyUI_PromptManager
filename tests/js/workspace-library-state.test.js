@@ -2,11 +2,20 @@ const test=require('node:test');
 const assert=require('node:assert/strict');
 const source=import('../../web/js/workspace/library-state.mjs');
 const item=id=>({id,text:`Positive ${id}`,category:'Art',tags:['blue'],rating:3,variant_count:2,image_count:4,previews:[]});
-const page=(items,cursor=null)=>({items,total:3,has_more:cursor!==null,next_cursor:cursor});
+const page=(items,cursor=null)=>({items,total:3,variant_total:6,has_more:cursor!==null,next_cursor:cursor});
 test('parent stream builds literal filters and deduplicates stable identities across infinite pages',async()=>{
  const {createLibraryStream}=await source;const calls=[];const pending=[page([item(1),item(2)],'next'),page([item(2),item(3)])];const s=createLibraryStream({api:{get:async(url)=>{calls.push(url);return pending.shift();}}});
- assert.equal(await s.reset({text:'a%_',category:'Art',tags:['blue','red'],sort:'rating'}),2);assert.equal(await s.loadMore(),1);assert.deepEqual(s.state.items.map(row=>row.id),[1,2,3]);assert.equal(s.state.hasMore,false);
- const query=new URL(calls[0],'https://x').searchParams;assert.equal(query.get('text'),'a%_');assert.deepEqual(query.getAll('tag'),['blue','red']);assert.equal(query.get('sort'),'rating');assert.equal(new URL(calls[1],'https://x').searchParams.get('cursor'),'next');assert.equal(await s.loadMore(),0);s.dispose();
+ assert.equal(await s.reset({text:'a%_',category:'Art',tags:['blue','red'],sort:'name'}),2);assert.equal(await s.loadMore(),1);assert.deepEqual(s.state.items.map(row=>row.id),[1,2,3]);assert.equal(s.state.hasMore,false);
+ const query=new URL(calls[0],'https://x').searchParams;assert.equal(query.get('text'),'a%_');assert.deepEqual(query.getAll('tag'),['blue','red']);assert.equal(query.get('sort'),'name');assert.equal(new URL(calls[1],'https://x').searchParams.get('cursor'),'next');assert.equal(await s.loadMore(),0);s.dispose();
+});
+test('the shelf caption total of negative variants comes from variant_total and resets with the filters',async()=>{
+ const {createLibraryStream}=await source;const pending=[page([item(1)],'next'),{...page([item(2)]),variant_total:7},{...page([item(3)]),variant_total:1}];
+ const s=createLibraryStream({api:{get:async()=>pending.shift()}});assert.equal(s.state.variantTotal,null);
+ await s.reset();assert.equal(s.state.variantTotal,6);await s.loadMore();assert.equal(s.state.variantTotal,7);
+ const reset=s.reset({text:'x'});assert.equal(s.state.variantTotal,null);await reset;assert.equal(s.state.variantTotal,1);
+ const restored=createLibraryStream({api:{},restore:{filters:{},state:s.state}});assert.equal(restored.state.variantTotal,1);restored.dispose();
+ for(const bad of [undefined,-1,1.5,'2']){const broken=createLibraryStream({api:{get:async()=>({...page([item(1)]),variant_total:bad})}});await broken.reset();assert.ok(broken.state.error);assert.equal(broken.state.variantTotal,null);broken.dispose();}
+ s.dispose();
 });
 test('reset aborts older requests and late success/failure cannot replace current parents',async()=>{
  const {createLibraryStream}=await source;const requests=[];const s=createLibraryStream({api:{get:(url,{signal})=>new Promise((resolve,reject)=>requests.push({signal,resolve,reject}))}});
@@ -36,7 +45,23 @@ test('detail reads validate identities, abort stale selection and expose retryab
 test('restored shelves keep filters, loaded parents and continuation without a fresh first page',async()=>{
  const {createLibraryStream}=await source;const old=createLibraryStream({api:{get:async()=>page([item(1)],'next')}});await old.reset({text:'retained',sort:'name'});old.dispose();const urls=[];
  const next=createLibraryStream({api:{get:async url=>{urls.push(url);return page([item(2)]);}},restore:{filters:{text:'retained',sort:'name'},state:old.state}});assert.equal(next.state.items.length,1);await next.loadMore();assert.match(urls[0],/text=retained/);assert.match(urls[0],/cursor=next/);assert.equal(next.state.items.length,2);next.dispose();
- assert.throws(()=>createLibraryStream({api:{},restore:{filters:{},state:{items:[item(1),item(1)],total:2,cursor:null,hasMore:false}}}));
+ assert.throws(()=>createLibraryStream({api:{},restore:{filters:{},state:{items:[item(1),item(1)],total:2,variantTotal:0,cursor:null,hasMore:false}}}));
+});
+test('a shelf left before its first page answered or after it failed restores and reads page one',async()=>{
+ const {createLibraryStream}=await source;
+ // The shelf saves whatever state it holds when the route changes; a first page still pending or failed has no variant total yet.
+ let pending;const left=createLibraryStream({api:{get:()=>new Promise(resolve=>{pending=resolve;})}});const first=left.reset({text:'kept'});
+ assert.equal(left.state.loading,true);assert.equal(left.state.variantTotal,null);const saved=left.state;left.dispose();pending(page([item(9)]));await first;
+ const failed=createLibraryStream({api:{get:async()=>{throw Error('offline');}}});await failed.reset();assert.ok(failed.state.error);failed.dispose();
+ for(const state of [saved,failed.state]) {
+  const urls=[];const next=createLibraryStream({api:{get:async url=>{urls.push(url);return page([item(1)]);}},restore:{filters:{text:'kept'},state}});
+  assert.deepEqual([next.state.items.length,next.state.loading,next.state.error,next.state.variantTotal,next.state.hasMore],[0,false,null,null,true]);
+  assert.equal(await next.loadMore(),1);assert.equal(new URL(urls[0],'https://x').searchParams.get('text'),'kept');assert.equal(new URL(urls[0],'https://x').searchParams.has('cursor'),false);
+  assert.equal(next.state.variantTotal,6);next.dispose();
+ }
+ // A pending first page is only the empty, cursorless state: anything else without a variant total stays invalid.
+ for(const state of [{items:[item(1)],total:1,variantTotal:null,cursor:null,hasMore:false},{items:[],total:0,variantTotal:null,cursor:'next',hasMore:true},{items:[],total:3,variantTotal:null,cursor:null,hasMore:true},{items:[],total:0,variantTotal:null,cursor:null,hasMore:false}])
+  assert.throws(()=>createLibraryStream({api:{},restore:{filters:{},state}}),/Invalid library page/);
 });
 test('parent shelf window bounds DOM and pins focused rows without changing logical order',async()=>{
  const {libraryWindow}=await source;const first=libraryWindow(500,2,0,900);assert.equal(first[0],0);assert.ok(first.length<24);
@@ -78,4 +103,70 @@ test('archived variant reads use their own scope and cursor without changing the
  for(const url of urls)assert.equal(new URL(url,'https://x').searchParams.get('archive'),'archived');assert.equal(new URL(urls[1],'https://x').searchParams.get('variant_cursor'),'arch');
  const active=[];const plain=createLibraryDetail({api:{get:async url=>{active.push(url);return {positive:item(1),variants:[]};}},onChange:()=>{}});await plain.load(1);assert.equal(new URL(active[0],'https://x').searchParams.has('archive'),false);
  assert.throws(()=>createLibraryDetail({api:{},onChange:()=>{},archive:'parents'}));
+});
+test('tag mode any and a folder are sent, echoed and validated (#444)',async()=>{
+ const {createLibraryStream,LIBRARY_TAG_MODES}=await source;assert.deepEqual(LIBRARY_TAG_MODES,['all','any','untagged']);
+ const calls=[];const pending=[{...page([item(1)]),tag_mode:'any',folder:'2026/Aug'},{...page([item(2)]),tag_mode:'all',folder:''},page([item(3)]),{...page([item(4)]),tag_mode:'all'}];
+ const s=createLibraryStream({api:{get:async(url)=>{calls.push(new URL(url,'https://x').searchParams);return pending.shift();}}});
+ assert.equal(await s.reset({tags:['a','b'],tagMode:'any',folder:'2026/Aug'}),1);
+ assert.equal(calls[0].get('tag_mode'),'any');assert.equal(calls[0].get('folder'),'2026/Aug');assert.deepEqual(calls[0].getAll('tag'),['a','b']);
+ // An older server that ignored them answers without the echo: an error, never the unfiltered shelf.
+ assert.equal(await s.reset({tags:['a','b'],tagMode:'any',folder:'2026/Aug'}),0);assert.ok(s.state.error instanceof TypeError);
+ // The defaults send neither, so they need no echo.
+ assert.equal(await s.reset({tagMode:'all',folder:''}),1);assert.equal(calls[2].has('tag_mode'),false);assert.equal(calls[2].has('folder'),false);
+ assert.equal(await s.reset({folder:'x'}),0);assert.ok(s.state.error instanceof TypeError,'a folder without its echo is refused');
+ await assert.rejects(s.reset({tagMode:'or'}),TypeError);await assert.rejects(s.reset({folder:3}),TypeError);
+ assert.equal(calls.length,4);s.dispose();
+});
+test('tag mode untagged is sent, echoed and never combined with tags (#444)',async()=>{
+ const {createLibraryStream}=await source;const calls=[];const pending=[{...page([item(1)]),tag_mode:'untagged'},page([item(2)]),page([item(3)])];
+ const s=createLibraryStream({api:{get:async(url)=>{calls.push(url);return pending.shift();}}});
+ assert.equal(await s.reset({tagMode:'untagged'}),1);assert.equal(new URL(calls[0],'https://x').searchParams.get('tag_mode'),'untagged');
+ // An older server that ignored tag_mode answers without the echo: an error, never the whole Library.
+ assert.equal(await s.reset({tagMode:'untagged'}),0);assert.ok(s.state.error instanceof TypeError);assert.deepEqual(s.state.items,[]);
+ // The default sends no tag_mode, so it needs no echo.
+ assert.equal(await s.reset({tagMode:'all'}),1);assert.equal(new URL(calls[2],'https://x').searchParams.has('tag_mode'),false);
+ await assert.rejects(s.reset({tagMode:'untagged',tags:['a']}),TypeError);await assert.rejects(s.reset({tagMode:'or'}),TypeError);
+ assert.equal(calls.length,3);s.dispose();
+});
+test('the stream keeps the first page\'s storage epoch and refuses a later page from another one (#437)',async()=>{
+ const {createLibraryStream}=await source;const A='11111111-1111-4111-8111-111111111111',B='22222222-2222-4222-8222-222222222222';
+ const pending=[{...page([item(1)],'next'),library_epoch:A},{...page([item(2)],'more'),library_epoch:A},{...page([item(3)]),library_epoch:B}];
+ const s=createLibraryStream({api:{get:async()=>pending.shift()}});assert.equal(s.state.epoch,null);
+ await s.reset();assert.equal(s.state.epoch,A);await s.loadMore();assert.equal(s.state.epoch,A);assert.equal(s.state.items.length,2);
+ await s.loadMore();assert.ok(s.state.error);assert.equal(s.state.items.length,2);assert.equal(s.state.epoch,A);
+ const restored=createLibraryStream({api:{},restore:{filters:{},state:s.state}});assert.equal(restored.state.epoch,A);restored.dispose();
+ const fresh=[{...page([item(4)]),library_epoch:B}];const reset=s.reset({text:'x'});assert.equal(s.state.epoch,null);
+ s.dispose();const next=createLibraryStream({api:{get:async()=>fresh.shift()}});await next.reset();assert.equal(next.state.epoch,B);next.dispose();await reset;
+});
+test('the shelf no longer sorts by rating (D153)',async()=>{
+ const {createLibraryStream}=await source;const s=createLibraryStream({api:{get:async()=>page([])}});
+ await assert.rejects(s.reset({sort:'rating'}),/Invalid library sort/);
+ assert.throws(()=>createLibraryStream({api:{get:async()=>page([])},restore:{filters:{sort:'rating'},state:{}}}),/Invalid library sort/);
+ for(const sort of ['newest','oldest','name']) assert.equal(await s.reset({sort}),0);s.dispose();
+});
+test('Refine › Folder nests each folder under its exact parent, by path segment (#444 live B1)',async()=>{
+ const {libraryFolderOptions}=await source;assert.equal(typeof libraryFolderOptions,'function');
+ const I='  ';
+ // The server's flat list sorts full paths as text, so "-" and "_" land before "/" (live report shapes).
+ const folders=['CCC','CCC/mabes9sans-dataset','CCC/mabes9sans-dataset-v1','CCC/mabes9sans-dataset/mabes9sans-dataset_IMG_GEN',
+  'FLUX','FLUX/2025-12-11','flux','flux/images','flux-klein','illustrious','illustrious-base','illustrious/2026-10-26','illustrious/training',
+  'illustrious/training/a','kiko','kiko-v6','kiko/char','kiko/XXX','QWEN','QWEN/x','Qwen','Qwen/y','Qwen-Training','Video','Video/v','video'].sort();
+ const options=libraryFolderOptions(folders);
+ assert.deepEqual(options[0],['','All output folders']);
+ assert.deepEqual(options.slice(1),[
+  ['CCC','CCC'],['CCC/mabes9sans-dataset',`${I}mabes9sans-dataset`],['CCC/mabes9sans-dataset/mabes9sans-dataset_IMG_GEN',`${I}${I}mabes9sans-dataset_IMG_GEN`],
+  ['CCC/mabes9sans-dataset-v1',`${I}mabes9sans-dataset-v1`],
+  ['FLUX','FLUX'],['FLUX/2025-12-11',`${I}2025-12-11`],['flux','flux'],['flux/images',`${I}images`],['flux-klein','flux-klein'],
+  ['illustrious','illustrious'],['illustrious/2026-10-26',`${I}2026-10-26`],['illustrious/training',`${I}training`],['illustrious/training/a',`${I}${I}a`],
+  ['illustrious-base','illustrious-base'],
+  ['kiko','kiko'],['kiko/char',`${I}char`],['kiko/XXX',`${I}XXX`],['kiko-v6','kiko-v6'],
+  ['QWEN','QWEN'],['QWEN/x',`${I}x`],['Qwen','Qwen'],['Qwen/y',`${I}y`],['Qwen-Training','Qwen-Training'],
+  ['Video','Video'],['Video/v',`${I}v`],['video','video'],
+ ]);
+ // Every parent precedes its children directly; a chosen folder missing from the list is kept, with its parents.
+ assert.deepEqual(libraryFolderOptions(['a'],'a/b/c').slice(1),[['a','a'],['a/b',`${I}b`],['a/b/c',`${I}${I}c`]]);
+ assert.deepEqual(libraryFolderOptions([],''),[['','All output folders']]);
+ // A POSIX folder whose name holds a backslash is one segment.
+ assert.deepEqual(libraryFolderOptions(['Metadata\\Klein_4b Wildcard Run']).slice(1),[['Metadata\\Klein_4b Wildcard Run','Metadata\\Klein_4b Wildcard Run']]);
 });

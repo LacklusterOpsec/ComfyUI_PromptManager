@@ -4,6 +4,7 @@ permissions:
   contents: read
 
 on:
+  merge_group:
   pull_request:
     branches: [main]
   push:
@@ -19,15 +20,36 @@ concurrency:
 env:
   PYTHONFAULTHANDLER: "1"
 
+# Every job has a time limit: ceil(1.5 x the slowest of three recent green runs on main) + 3
+# minutes, never under 5. The 3 minutes leave room for the Python runner's watchdog (120 s, see
+# tests/run_suite.py) to print its stack dump before GitHub cancels the job. A limit changes only
+# with new measurements written here (TESTING.md "Time limits and hangs").
+# Measured 2026-10-26 on runs 40257217681 (3be0ada), 40240706568 (fb9134f), 40228167328 (f9835aa):
+#   py matrix, slowest py3.10 on windows-latest: 12m43s / 15m54s / 14m53s -> 27 min
+#     (ubuntu 5m27s-6m27s, macos 6m14s-8m30s, windows 11m42s-15m54s)
+#     3.10 and 3.11 left the matrix and 3.14 joined it in #356; re-measure after three green main runs.
+#     Windows moved to portability.yml (#420; macOS left CI in #571), which has its own measured limit (#493);
+#     this Linux-only matrix keeps 27 minutes until it is re-measured.
+#   real ComfyUI compatibility: 13m32s / 8m55s / 11m46s -> 24 min
+#   coverage gate (85%): 7m26s / 7m22s / 7m54s -> 15 min
+#   perf budget 30s / 29s / 27s, black and flake8 39s / 37s / 39s,
+#   frontend modules 23s / 19s / 29s -> 5 min (the floor)
+#   all tests: a result check without setup, 5 min (the floor)
+#
+# Pull requests run a fast subset (#420): Python 3.12 on ubuntu-latest, coverage, lint and frontend
+# modules. The merge queue (merge_group), pushes to main and manual runs add Python 3.13 and 3.14 on
+# Linux and the real ComfyUI job. "all tests" is the required gate that holds the queue to that set.
+# Windows runs in portability.yml (push to main, nightly, on demand) and never gate a merge.
 jobs:
   test:
     name: py${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 27
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest]
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.12"]') || fromJSON('["3.12", "3.13", "3.14"]') }}
 
     steps:
       - uses: actions/checkout@v7
@@ -45,21 +67,26 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Run tests
-        run: python -m unittest discover -s tests -v
+        run: python -m tests.run_suite -v
 
   comfyui:
     name: real ComfyUI compatibility
+    # Merge queue, main and manual runs only. A job skipped by its condition reports Success, so this
+    # required context never blocks a pull request; "all tests" fails if it is skipped anywhere else.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Chromium and its system libraries come from the pinned Playwright image (tag = @playwright/test in
+    # tools/vendor/package-lock.json; tests/vendor/browser-image.test.mjs checks it). The runner install
+    # pulled them from Ubuntu's apt mirror on every run, and three runs (#349, #378, #382) crawled at
+    # ~26 kB/s for 11-12 minutes until the job hit its limit after every test had passed.
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-noble
+      options: --user 1001
+    timeout-minutes: 24
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: tools/vendor/package-lock.json
       - name: Read the reviewed runtime pins
         id: runtime
         run: |
@@ -84,21 +111,42 @@ jobs:
           ref: ${{ steps.runtime.outputs.kikoRevision }}
           path: .ci-kikotools
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      # The image's own Python and Node 24: setup-python/setup-node install the runner's toolcache builds,
+      # whose entry points name host paths that do not exist in the container. The image has no ensurepip
+      # and the job has no root, so a checksum-pinned pip wheel bootstraps a user-space venv. The image
+      # Python must be the reviewed host Python, so a pin or image bump that disagrees fails here.
+      - name: Python environment on the reviewed host Python
+        env:
+          PIP_WHEEL: https://files.pythonhosted.org/packages/f3/6e/1736e5b4ae2b778ef2f81c47d797de9f891d4d8acb047a24ca37a60294dd/pip-26.2.1-py3-none-any.whl
+          PIP_SHA256: 71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e
+          PINNED_PYTHON: ${{ steps.runtime.outputs.pythonVersion }}
+        run: |
+          image="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+          [ "$image" = "$PINNED_PYTHON" ] || { echo "::error::image Python $image is not the pinned $PINNED_PYTHON"; exit 1; }
+          venv="$RUNNER_TEMP/venv" wheel="$RUNNER_TEMP/pip-26.2.1-py3-none-any.whl"
+          python3 -m venv --without-pip "$venv"
+          curl -fsSL --retry 3 -o "$wheel" "$PIP_WHEEL"
+          echo "$PIP_SHA256  $wheel" | sha256sum -c -
+          "$venv/bin/python" "$wheel/pip" install --no-index --no-cache-dir "$wheel"
+          echo "$venv/bin" >> "$GITHUB_PATH"
+      - run: python --version && node --version && node --version | grep -q '^v24\.'
+      # pip's download cache (torch alone is ~200 MB); inside the container ~ is the job's HOME (/github/home).
+      - name: Cache pip downloads
+        uses: actions/cache@v6
         with:
-          python-version: ${{ steps.runtime.outputs.pythonVersion }}
-          cache: pip
-          cache-dependency-path: |
-            requirements-dev.txt
-            .ci-comfyui/requirements.txt
-            tools/vendor/comfyui-runtime.json
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-playwright-v1.64.1-${{ hashFiles('requirements-dev.txt', '.ci-comfyui/requirements.txt', 'tools/vendor/comfyui-runtime.json') }}
       - name: Install CPU runtime and test dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install "torch==${{ steps.runtime.outputs.torchVersion }}" "torchvision==${{ steps.runtime.outputs.torchvisionVersion }}" --index-url https://download.pytorch.org/whl/cpu
           pip install -r .ci-comfyui/requirements.txt -r requirements-dev.txt "torch==${{ steps.runtime.outputs.torchVersion }}" "torchvision==${{ steps.runtime.outputs.torchvisionVersion }}"
+      # npm's download cache, keyed on the lockfile. node_modules itself is still built fresh by npm ci.
+      - name: Cache npm downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-playwright-v1.64.1-${{ hashFiles('tools/vendor/package-lock.json') }}
       - run: npm ci --prefix tools/vendor --ignore-scripts
-      - run: npx --prefix tools/vendor playwright install --with-deps chromium
       - name: Classic and Nodes 2.0 startup and compatibility
         env:
           PM_COMFY_ROOT: ${{ github.workspace }}/.ci-comfyui
@@ -127,6 +175,7 @@ jobs:
   coverage:
     name: coverage gate (85%)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -143,7 +192,7 @@ jobs:
 
       - name: Measure coverage
         run: |
-          python -m coverage run -m unittest discover -s tests
+          python -m coverage run -m tests.run_suite
           python -m coverage combine
           python -m coverage report --fail-under=85
 
@@ -154,6 +203,7 @@ jobs:
     name: perf budget
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
 
@@ -176,24 +226,31 @@ jobs:
   lint:
     name: black and flake8
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install black flake8
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      # The exact black and flake8 pins from requirements-dev.txt, so a new release cannot turn CI red.
+      - run: pip install $(grep -E '^(black|flake8)==' requirements-dev.txt)
       - run: black --check .
       - run: flake8 .
 
   js-test:
     name: frontend modules
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: tools/vendor/package-lock.json
 
       - name: Check shipped extension and page modules parse
         run: |
@@ -207,3 +264,32 @@ jobs:
 
       - name: Run JS tests
         run: node --test tests/js/*.test.js
+
+  # The required context "all tests". A dropped matrix leg never reports a check at all, so the eight
+  # legs that pull requests skip cannot be required by name; this gate requires them instead. Every
+  # job must succeed; real ComfyUI must be skipped on a pull request and succeed on every other event.
+  all-tests:
+    name: all tests
+    needs: [test, comfyui, coverage, lint, js-test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every test job for this event
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TEST_RESULT: ${{ needs.test.result }}
+          COMFYUI_RESULT: ${{ needs.comfyui.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          JS_RESULT: ${{ needs.js-test.result }}
+        run: |
+          queue_only=success
+          if [ "$EVENT_NAME" = pull_request ]; then queue_only=skipped; fi
+          echo "event: $EVENT_NAME (real ComfyUI must be $queue_only)"
+          echo "test matrix: $TEST_RESULT"
+          echo "comfyui: $COMFYUI_RESULT"
+          echo "coverage: $COVERAGE_RESULT"
+          echo "lint: $LINT_RESULT"
+          echo "js-test: $JS_RESULT"
+          test "$TEST_RESULT" = success && test "$COVERAGE_RESULT" = success && test "$LINT_RESULT" = success && test "$JS_RESULT" = success && test "$COMFYUI_RESULT" = "$queue_only"

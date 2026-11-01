@@ -14,15 +14,19 @@ from unittest import skipUnless
 from unittest.mock import patch
 
 from aiohttp import web
+from PIL import Image
 from aiohttp.test_utils import make_mocked_request
 
 from tests.test_api_images import ImageAPITestCase, make_png
 from tests.test_api_prompt_inspector import graph, png
 from tests.test_execution_context_database import bundle as context_bundle
 from tests.test_execution_history_database import JOB, SESSION
+from tests.saver_anchor_graphs import BRANCH_TEXTS, shared_prefix
+from tests.test_recorded_saver_anchor import LLM_TEXT, text_generate_run
 from utils.execution_contexts import ContextBundle
 from utils.execution_history_events import make_finish, make_start
 from utils.execution_outputs import OutputBundle, OutputReference, snapshot_output_roots
+from py.api.images import media_thumbnail_rel
 from py.config import GalleryConfig
 
 
@@ -208,6 +212,57 @@ class HistoryOutputAPITests(ImageAPITestCase):
                 )
                 self.assertNotIn("root=", candidate["media"][field])
                 self.assertNotIn(str(self.comfy_dir), candidate["media"][field])
+
+    async def test_an_output_in_a_trash_folder_is_read_by_no_kind(self):
+        # #543: inspection, media, thumbnail and the listing share one check.
+        path = make_png(self.output_dir / "image.png")
+        start = self.capture([self.ref()])
+        media = await self.media(start)
+        trashed = self.output_dir / ".Trash-1000" / "files"
+        trashed.mkdir(parents=True)
+        os.rename(path, trashed / "image.png")
+        try:
+            os.symlink(trashed / "image.png", path)
+        except OSError:
+            if os.environ.get("GITHUB_ACTIONS"):
+                raise
+            self.skipTest("this machine cannot make symlinks")
+        for field in ("inspection_url", "url", "thumbnail_url"):
+            with self.subTest(field=field):
+                response = await self.current(media[field])
+                self.assertIn(response.status, (404, 409, 410))
+                await response.read()
+        response, page = await self.outputs(start)
+        self.assertEqual(response.status, 200, page)
+        candidate = page["items"][0]["current_candidate"]
+        self.assertEqual(candidate["status"], "unavailable")
+        self.assertEqual(candidate["reason"], "missing")
+
+    async def test_a_preview_linked_into_a_trash_folder_does_not_open(self):
+        # #543: the cover picks its preview after the candidate check.
+        make_png(self.output_dir / "image.png")
+        trashed = self.output_dir / ".Trash-1000" / "files"
+        trashed.mkdir(parents=True)
+        make_png(trashed / "secret.png", color=(0, 0, 255))
+        preview = self.output_dir / media_thumbnail_rel(Path("image.png"))
+        preview.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(trashed / "secret.png", preview)
+        except OSError:
+            if os.environ.get("GITHUB_ACTIONS"):
+                raise
+            self.skipTest("this machine cannot make symlinks")
+        media = await self.media(self.capture([self.ref()]))
+        response = await self.current(media["thumbnail_url"])
+        body = await response.read()
+        # Never the trashed bytes: the link is ignored or refused at the open.
+        self.assertNotEqual(body, (trashed / "secret.png").read_bytes())
+        mod = importlib.import_module("py.api.history_current")
+        scope = mod.snapshot_current_output_scope(self.api)
+        with self.assertRaises(mod.CurrentLocationUnavailable):
+            mod._open_current_target(
+                mod._canonical(preview), self.output_dir, scope, True
+            )
 
     async def test_complete_zero_incomplete_unavailable_and_not_captured_are_distinct(
         self,
@@ -401,7 +456,7 @@ class HistoryOutputAPITests(ImageAPITestCase):
         self.assertEqual(response.status, 400)
         await response.read()
 
-    async def test_media_ranges_head_and_existing_thumbnail_without_generation(self):
+    async def test_media_ranges_head_and_a_preview_made_on_first_view(self):
         path = self.output_dir / "clip.mp4"
         payload = bytes(range(256)) * 600
         path.write_bytes(payload)
@@ -430,9 +485,15 @@ class HistoryOutputAPITests(ImageAPITestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(int(response.headers["Content-Length"]), len(payload))
         self.assertEqual(await response.read(), b"")
+        # A missing preview is made on first view (#249): an undecodable video
+        # gets the placeholder frame, never the whole file, written in the
+        # thumbnail format (#317, WebP by default).
+        preview = self.output_dir / "thumbnails" / "clip_thumb.webp"
         response = await self.current(descriptor["thumbnail_url"])
-        self.assertEqual(await response.read(), payload)
-        preview = make_png(self.output_dir / "thumbnails" / "clip_thumb.jpg")
+        self.assertEqual(response.headers["Content-Type"], "image/webp")
+        self.assertEqual(await response.read(), preview.read_bytes())
+        self.assertLess(preview.stat().st_size, len(payload))
+        make_png(preview)
         response = await self.current(descriptor["thumbnail_url"])
         self.assertEqual(await response.read(), preview.read_bytes())
 
@@ -1006,6 +1067,122 @@ class HistoryOutputAPITests(ImageAPITestCase):
             response = await self.current(descriptor["inspection_url"])
             self.assert_error(response, await response.json(), 422, "response-limit")
 
+    async def tag_image(self, relative, tags):
+        """Save *tags* on Images root 0's *relative* file through the Tag routes.
+
+        The real observe and save routes store the locator the Tag dialog
+        stores (``media_capture._resolve``), so History must find it (#457).
+        """
+        self.addCleanup(self.api.close_annotation_captures)
+        roots = self.api._get_all_output_dirs()
+        target = {
+            "root_index": 0,
+            "root_scope": self.api._gallery_root_scope(roots[0], 0),
+            "path": relative,
+        }
+        response = await self.client.post(
+            "/prompt_manager/image-annotations/observe", json={"target": target}
+        )
+        observed = await response.json()
+        self.assertEqual(response.status, 200, observed)
+        token = observed["capture"]["token"]
+        try:
+            response = await self.client.put(
+                "/prompt_manager/image-annotations/tags",
+                json={
+                    "target": target,
+                    "capture_token": token,
+                    "sha256": observed["capture"]["sha256"],
+                    "expected_epoch": observed["library_epoch"],
+                    "expected_tag_revision": observed["tag_revision"],
+                    "tags": list(tags),
+                },
+            )
+            saved = await response.json()
+            self.assertEqual(response.status, 200, saved)
+        finally:
+            await self.client.delete(
+                f"/prompt_manager/image-annotations/capture/{token}"
+            )
+        return saved["tags"]
+
+    async def test_current_inspection_carries_the_files_image_tags(self):
+        """#457: History reads the file's own image tags, as Images does (S1)."""
+        sub = self.output_dir / "batch"
+        sub.mkdir()
+        tagged = png(sub / "tagged.png", prompt=graph("Tagged file"))
+        png(self.output_dir / "plain.png", prompt=graph("Plain file"))
+        self.assertEqual(
+            await self.tag_image("batch/tagged.png", ["dunes", "warm_light"]),
+            ["dunes", "warm_light"],
+        )
+        start = self.capture(
+            [
+                self.ref("1", subfolder="batch", filename="tagged.png"),
+                self.ref("2", filename="plain.png"),
+            ]
+        )
+        _, page = await self.outputs(start)
+        urls = [
+            item["current_candidate"]["media"]["inspection_url"]
+            for item in page["items"]
+        ]
+        bodies = []
+        for url in urls:
+            response = await self.current(url)
+            body = await response.json()
+            self.assertEqual(response.status, 200, body)
+            bodies.append(body)
+        self.assertEqual(
+            bodies[0].get("image_tags"),
+            {"state": "current", "tags": ["dunes", "warm_light"]},
+        )
+        # Image tags are the file's own search metadata, never prompt tags.
+        self.assertEqual(bodies[0]["prompts"]["positive"]["text"], "Tagged file")
+        self.assertEqual(bodies[1].get("image_tags"), {"state": "none", "tags": []})
+        # New bytes at the same path: the tags belong to the old byte record.
+        stat = tagged.stat()
+        os.utime(tagged, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        response = await self.current(urls[0])
+        body = await response.json()
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(body["image_tags"], {"state": "none", "tags": []})
+
+    async def test_current_inspection_finds_image_tags_under_a_symlinked_output(self):
+        """An output folder reached through a link (another drive) still matches."""
+        link = self.comfy_dir / "linked_output"
+        self._make_symlink(self.output_dir, link, target_is_directory=True)
+        self.api._get_all_output_dirs = lambda: [link]
+        self.host_output = str(link)
+        png(self.output_dir / "image.png", prompt=graph("Linked folder"))
+        self.assertEqual(await self.tag_image("image.png", ["dunes"]), ["dunes"])
+        start = self.capture([self.ref()])
+        descriptor = await self.media(start)
+        response = await self.current(descriptor["inspection_url"])
+        body = await response.json()
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(body["image_tags"], {"state": "current", "tags": ["dunes"]})
+
+    async def test_current_inspection_image_tag_failure_is_unavailable(self):
+        png(self.output_dir / "image.png", prompt=graph("File evidence"))
+        await self.tag_image("image.png", ["dunes"])
+        start = self.capture([self.ref()])
+        descriptor = await self.media(start)
+        with (
+            self.assertLogs(self.api.logger, "WARNING") as logs,
+            patch.object(
+                type(self.api.db),
+                "current_image_tags",
+                side_effect=sqlite3.OperationalError("locked"),
+            ),
+        ):
+            response = await self.current(descriptor["inspection_url"])
+            body = await response.json()
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(body["image_tags"], {"state": "unavailable", "tags": []})
+        self.assertEqual(body["prompts"]["positive"]["text"], "File evidence")
+        self.assertNotIn(str(self.output_dir), "\n".join(logs.output))
+
     async def test_optional_candidate_failure_preserves_every_occurrence_without_urls(
         self,
     ):
@@ -1110,6 +1287,172 @@ class HistoryOutputAPITests(ImageAPITestCase):
         alias.symlink_to(self.temp_dir, target_is_directory=True)
         response = await self.current(descriptor["thumbnail_url"])
         self.assert_error(response, await response.json(), 403, "not-authorized")
+
+    async def test_missing_preview_is_never_made_through_a_linked_out_folder(self):
+        original = make_png(self.output_dir / "image.png", size=(64, 64))
+        elsewhere = self.temp_dir / "elsewhere"
+        elsewhere.mkdir()
+        (self.output_dir / "thumbnails").symlink_to(elsewhere, target_is_directory=True)
+        start = self.capture([self.ref()])
+        descriptor = await self.media(start)
+        response = await self.current(descriptor["thumbnail_url"])
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), original.read_bytes())
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    async def test_missing_preview_is_never_made_through_a_linked_sub_folder(self):
+        # M6: every link segment of the preview's folder is checked.
+        original = make_png(self.output_dir / "sub" / "image.png", size=(64, 64))
+        elsewhere = self.temp_dir / "elsewhere"
+        elsewhere.mkdir()
+        (self.output_dir / "thumbnails").mkdir()
+        (self.output_dir / "thumbnails" / "sub").symlink_to(
+            elsewhere, target_is_directory=True
+        )
+        start = self.capture([self.ref(subfolder="sub")])
+        descriptor = await self.media(start)
+        response = await self.current(descriptor["thumbnail_url"])
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), original.read_bytes())
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    async def test_a_video_preview_that_cannot_be_made_is_the_placeholder(self):
+        # I1: never the video bytes inside an <img>.
+        from py.api.jobs import RESTORE_JOB_KIND
+
+        (self.output_dir / "clip.webm").write_bytes(b"AV1 stream no decoder here")
+        start = self.capture([self.ref(filename="clip.webm")])
+        descriptor = await self.media(start)
+        gate = asyncio.Event()
+
+        async def runner(job):
+            await gate.wait()
+
+        job = self.api._jobs.start(
+            RESTORE_JOB_KIND,
+            "restore",
+            admission="records",
+            cancellable=False,
+            runner=runner,
+        )
+        try:
+            response = await self.current(descriptor["thumbnail_url"])
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+            self.assertTrue((await response.read()).startswith(b"\xff\xd8"))
+        finally:
+            gate.set()
+            await asyncio.wait_for(job.task, 5)
+        self.assertFalse((self.output_dir / "thumbnails").exists())
+
+    async def test_the_cover_is_the_preview_the_images_listing_shows(self):
+        # Review M5: JPEG XL configured with no encoder left writes WebP; the
+        # history cover prefers that WebP, like the Images listing.
+        from py.api import thumbnail_encode
+        from py.config import PromptManagerConfig
+
+        make_png(self.output_dir / "image.png")
+        folder = self.output_dir / "thumbnails"
+        folder.mkdir()
+        (folder / "image_thumb.jxl").write_bytes(b"\xff\x0a stale jxl")
+        webp = folder / "image_thumb.webp"
+        Image.new("RGB", (16, 16)).save(webp, "WEBP")
+        start = self.capture([self.ref()])
+        descriptor = await self.media(start)
+        with (
+            patch.object(PromptManagerConfig, "THUMBNAIL_FORMAT", "jxl"),
+            patch.object(thumbnail_encode, "detect_jxl_encoder", return_value=None),
+        ):
+            response = await self.current(descriptor["thumbnail_url"])
+            body = await response.read()
+        self.assertEqual(response.headers["Content-Type"], "image/webp")
+        self.assertEqual(body, webp.read_bytes())
+
+    async def _jxl_cover(self, filename, accept):
+        from py.api import thumbnail_encode
+        from py.config import PromptManagerConfig
+
+        folder = self.output_dir / "thumbnails"
+        folder.mkdir(exist_ok=True)
+        stem = filename.rsplit(".", 1)[0]
+        jxl = folder / f"{stem}_thumb.jxl"
+        jxl.write_bytes(b"\xff\x0a jxl preview")
+        start = self.capture([self.ref(filename=filename)])
+        descriptor = await self.media(start)
+        headers = {"Accept": accept} if accept else {}
+        with (
+            patch.object(PromptManagerConfig, "THUMBNAIL_FORMAT", "jxl"),
+            patch.object(thumbnail_encode, "detect_jxl_encoder", return_value="cjxl"),
+        ):
+            response = await self.current(descriptor["thumbnail_url"], headers=headers)
+            body = await response.read()
+        return response, body, jxl
+
+    async def test_a_jxl_cover_is_served_only_to_a_browser_that_accepts_it(self):
+        # Review M3: History's cover URL names no format, so the server picks:
+        # a browser that does not list image/jxl gets the original image.
+        original = make_png(self.output_dir / "image.png")
+        response, body, jxl = await self._jxl_cover(
+            "image.png", "image/avif,image/webp,image/*,*/*;q=0.8"
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body, original.read_bytes())
+        self.assertEqual(response.headers["Content-Type"], "image/png")
+        self.assertTrue(jxl.exists())
+
+    async def test_a_browser_that_lists_image_jxl_gets_the_jxl_cover(self):
+        make_png(self.output_dir / "image.png")
+        response, body, jxl = await self._jxl_cover(
+            "image.png", "image/webp,image/avif,image/jxl,image/*;q=0.8"
+        )
+        self.assertEqual(response.headers["Content-Type"], "image/jxl")
+        self.assertEqual(body, jxl.read_bytes())
+
+    async def test_the_jxl_flag_selects_the_jxl_cover_without_accept(self):
+        # M3 follow-up: a browser that decodes JPEG XL but does not list it in
+        # Accept (Firefox) says so with jxl=1 on the cover URL.
+        make_png(self.output_dir / "image.png")
+        folder = self.output_dir / "thumbnails"
+        folder.mkdir(exist_ok=True)
+        jxl = folder / "image_thumb.jxl"
+        jxl.write_bytes(b"\xff\x0a jxl preview")
+        start = self.capture([self.ref()])
+        descriptor = await self.media(start)
+        from py.api import thumbnail_encode
+        from py.config import PromptManagerConfig
+
+        with (
+            patch.object(PromptManagerConfig, "THUMBNAIL_FORMAT", "jxl"),
+            patch.object(thumbnail_encode, "detect_jxl_encoder", return_value="cjxl"),
+        ):
+            url = descriptor["thumbnail_url"]
+            response = await self.current(url + "&jxl=1", headers={"Accept": "*/*"})
+            self.assertEqual(response.headers["Content-Type"], "image/jxl")
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(await response.read(), jxl.read_bytes())
+            response = await self.current(url + "&jxl=0", headers={"Accept": "*/*"})
+            self.assertEqual(response.headers["Content-Type"], "image/png")
+            await response.read()
+            for bad in ("&jxl=true", "&jxl=", "&jxl=1&jxl=1", "&jxl=2"):
+                response = await self.current(url + bad)
+                self.assertEqual(response.status, 400, bad)
+                await response.read()
+
+    async def test_a_video_jxl_cover_is_the_placeholder_without_jxl_support(self):
+        (self.output_dir / "clip.webm").write_bytes(b"AV1 stream no decoder here")
+        response, body, _jxl = await self._jxl_cover("clip.webm", "image/*,*/*")
+        self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+        self.assertTrue(body.startswith(b"\xff\xd8"))
+
+    async def test_a_preview_that_cannot_be_made_serves_the_original(self):
+        broken = self.output_dir / "image.png"
+        broken.write_bytes(b"\x89PNG\r\n\x1a\n not an image")
+        start = self.capture([self.ref()])
+        descriptor = await self.media(start)
+        response = await self.current(descriptor["thumbnail_url"])
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), broken.read_bytes())
+        self.assertFalse((self.output_dir / "thumbnails" / "image_thumb.png").exists())
 
     async def test_disappearance_before_open_is_missing_and_closes_handle(
         self,
@@ -1332,3 +1675,88 @@ class HistoryOutputAPITests(ImageAPITestCase):
         body = await response.json()
         self.assertEqual(response.status, 200, body)
         self.assertEqual(body["prompts"]["positive"]["text"], "Readable portrait")
+
+    async def recorded_shared_prefix_run(self):
+        """#386: the dataset shape, branch 3's saver wrote the file in a run."""
+        path = png(self.output_dir / "IMG_GEN_00371_.png", prompt=shared_prefix())
+        # make_start/make_finish observe the run at 0 ms: the file was written then.
+        os.utime(path, ns=(1_000_000, 1_000_000))
+        start = self.capture(
+            [self.ref(node="33", filename=path.name), self.ref("43", 1, "other.png")]
+        )
+        return start
+
+    async def test_both_inspect_routes_name_the_branch_recorded_history_saved(self):
+        start = await self.recorded_shared_prefix_run()
+        _, body = await self.outputs(start)
+        descriptor = next(
+            item["current_candidate"]["media"]
+            for item in body["items"]
+            if item["occurrence"]["output_node_id"] == "33"
+        )
+        response = await self.current(descriptor["inspection_url"])
+        recorded = await response.json()
+        self.assertEqual(response.status, 200, recorded)
+        response = await self.client.get(
+            "/prompt_manager/images/inspect/IMG_GEN_00371_.png", params={"root": "0"}
+        )
+        images = await response.json()
+        self.assertEqual(response.status, 200, images)
+        for result in (recorded, images):
+            self.assertEqual(result["resolution"]["state"], "resolved")
+            self.assertEqual(
+                result["prompts"]["positive"],
+                {
+                    "status": "resolved",
+                    "text": BRANCH_TEXTS[2],
+                    "source": "recorded-run",
+                },
+            )
+
+    async def test_a_file_rewritten_after_its_run_keeps_several_prompts(self):
+        await self.recorded_shared_prefix_run()
+        os.utime(self.output_dir / "IMG_GEN_00371_.png")  # written now: not that run
+        response = await self.client.get(
+            "/prompt_manager/images/inspect/IMG_GEN_00371_.png", params={"root": "0"}
+        )
+        body = await response.json()
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(body["resolution"]["state"], "ambiguous")
+        self.assertEqual(body["prompts"]["positive"]["status"], "ambiguous")
+
+    async def test_a_failing_history_lookup_judges_the_file_alone(self):
+        await self.recorded_shared_prefix_run()
+        with (
+            patch(
+                "database.run_attribution.recorded_output",
+                side_effect=sqlite3.OperationalError("locked"),
+            ),
+            self.assertLogs("prompt_manager.run_attribution", "WARNING"),
+        ):
+            response = await self.client.get(
+                "/prompt_manager/images/inspect/IMG_GEN_00371_.png",
+                params={"root": "0"},
+            )
+            body = await response.json()
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(body["resolution"]["state"], "ambiguous")
+
+    async def test_a_language_model_text_shows_what_promptmanager_recorded(self):
+        path = png(self.output_dir / "moss_00026_.png", prompt=text_generate_run())
+        os.utime(path, ns=(1_000_000, 1_000_000))
+        start = self.capture([self.ref(node="9", filename=path.name)])
+        self.api.db.write_execution_contexts(
+            start.run_id,
+            start.storage_epoch,
+            context_bundle("", LLM_TEXT, anchor="7"),
+        )
+        response = await self.client.get(
+            "/prompt_manager/images/inspect/moss_00026_.png", params={"root": "0"}
+        )
+        body = await response.json()
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(
+            body["prompts"]["positive"],
+            {"status": "resolved", "text": LLM_TEXT, "source": "execution"},
+        )
+        self.assertEqual(body["prompts"]["negative"]["text"], "")

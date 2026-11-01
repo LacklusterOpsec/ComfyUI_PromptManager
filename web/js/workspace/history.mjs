@@ -22,6 +22,12 @@ function observedLabel(value) {
     return `Observed dequeue ${value} ms (${Number.isSafeInteger(time) && time <= 8640000000000000 ? new Date(time).toISOString() : 'outside display range'})`;
 }
 
+// Writing textContent replaces the text node even when the text is unchanged. A marker re-rendered between the press and
+// the release of a tap would lose the node under the pointer, and Chromium touch then drops the click.
+function setText(node, text) {
+    if (node.textContent !== text) node.textContent = text;
+}
+
 // New nodes use ordinary insertion; connected moves preserve browser state where supported.
 function place(parent, node, before) {
     if (node === before || (node.parentNode === parent && node.nextSibling === before)) return;
@@ -29,9 +35,10 @@ function place(parent, node, before) {
     else parent.insertBefore(node, before);
 }
 
-export function mountRecordedHistory(container, {api, positiveId, parentScope, sender, visit = {}, onParentRevalidate}) {
+export function mountRecordedHistory(container, {api, positiveId, parentScope, sender, visit = {}, onParentRevalidate, onRecordedCount}) {
     const scope = createScope(), dispose = () => scope.dispose();
-    if (parentScope.signal.aborted) {dispose();return {dispose};}
+    // openRun is a hoisted declaration: on an aborted parent it answers false before reading any later state.
+    if (parentScope.signal.aborted) {dispose();return {dispose, openRun};}
     parentScope.signal.addEventListener('abort', dispose, {once:true});
     scope.cleanup(() => parentScope.signal.removeEventListener('abort', dispose));
     const section = el('section', undefined, 'library-surface recorded-history');
@@ -61,6 +68,9 @@ export function mountRecordedHistory(container, {api, positiveId, parentScope, s
     const controller = createHistoryController({api, positiveId, restore:visit, onChange:next => {
         render(next);runView?.setState(next);
         if (next.parent !== activeParent) {activeParent = next.parent;onParentRevalidate?.(next.parent);}
+        // The history summary's "N tracked runs" (#249 D24): a completed window read's count; a read in flight keeps the last.
+        const window = next.window;
+        if (!window.loading) onRecordedCount?.(window.history_epoch && !window.error ? window.recorded_run_count : null);
     }});
     state = controller.state;
     runView = mountRecordedRun(container, {api, controller, sender, parentScope:scope, onRestoreFocus:restoreMarker});
@@ -111,7 +121,7 @@ export function mountRecordedHistory(container, {api, positiveId, parentScope, s
             const {node, buttons} = column;
             node.style.insetInlineStart = `${38 + index * 64}px`;node.value = index + 1;
             node.setAttribute('aria-posinset', String(index + 1));node.setAttribute('aria-setsize', String(items.length));
-            column.position.textContent = String(index + 1);
+            setText(column.position, String(index + 1));
             const anchors = new Map();for (const anchor of run.matching_anchors) if (!anchors.has(anchor.context_id)) anchors.set(anchor.context_id, anchor);
             for (const anchor of anchors.values()) {
                 let button = buttons.get(anchor.context_id);
@@ -122,7 +132,7 @@ export function mountRecordedHistory(container, {api, positiveId, parentScope, s
                 const context = contexts.get(anchor.context_id), first = context.first === index;
                 button.classList.toggle('history-context-anchor', first);
                 button.style.insetBlockStart = `${80 + context.row * 57}px`;
-                button.textContent = first ? '−' : '';
+                setText(button, first ? '−' : '');
                 const label = `Recorded run ${index + 1} of ${items.length} loaded · ${observedLabel(run.observed_dequeue_at)} · Outcome ${run.outcome} · ${preview(context.summary)} · context ${anchor.context_id.slice(0, 8)} · anchor ${anchor.anchor_id}`;
                 button.setAttribute('aria-label', label);button.title = label;
                 button.setAttribute('aria-pressed', String(state.selection.run_id === run.run_id && state.selection.context_id === anchor.context_id));
@@ -153,7 +163,7 @@ export function mountRecordedHistory(container, {api, positiveId, parentScope, s
                 let branch = branchNodes.get(id);
                 if (!branch) {branch = el('div', undefined, 'history-context-branch');branch.dataset.contextBranch = id;branch.append(el('span', '', 'history-context-label'));branchNodes.set(id, branch);}
                 branch.style.insetBlockStart = `${80 + context.row * 57}px`;branch.style.insetInlineStart = `${38 + context.first * 64}px`;
-                branch.firstChild.textContent = `${preview(context.summary)} · ${id.slice(0, 8)} · ${distinction(context.summary)}`;
+                setText(branch.firstChild, `${preview(context.summary)} · ${id.slice(0, 8)} · ${distinction(context.summary)}`);
                 place(branches, branch, before);before = branch.nextSibling;
             }
             if (anchor) {
@@ -163,7 +173,7 @@ export function mountRecordedHistory(container, {api, positiveId, parentScope, s
         }
         count.textContent = window.group ? `${countOf(window.recorded_run_count, 'distinct recorded run')} as of this read · ${window.items.length} loaded positions` : '';
         const group = window.group;
-        scopeText.textContent = group?.scope_status === 'uncapturable_text' ? 'This saved positive cannot be matched within frozen-text capture limits.' : 'Runs are grouped by exact frozen positive raw text, independently of saved pairs. Effective text, prepend/append composition and evidence can differ. Reported output locations do not establish context membership or historical file identity.';
+        scopeText.textContent = group?.scope_status === 'uncapturable_text' ? 'This saved positive cannot be matched within frozen-text capture limits.' : 'Runs are grouped by frozen positive raw text that is this saved text apart from outer whitespace, independently of saved pairs. Effective text, prepend/append composition and evidence can differ. Reported output locations do not establish context membership or historical file identity.';
         status.setAttribute('role', window.error || next.run.error ? 'alert' : 'status');
         status.textContent = next.validating ? 'Revalidating recorded history…' : window.loading ? 'Loading recorded history…' : window.error ? 'Recorded history could not be loaded.' : next.refreshRequired ? 'Recorded evidence changed. Reload before using these actions.' : !items.length ? 'No matching recorded executions.' : window.has_more ? 'Newest bounded window · displayed in chronological order.' : 'All matching recorded runs in this window are loaded.';
         if (next.run.error && !next.selection.run_id && !next.refreshRequired) status.textContent += ' The previous recorded selection could not be restored.';
@@ -172,7 +182,7 @@ export function mountRecordedHistory(container, {api, positiveId, parentScope, s
         selected.hidden = !outside;selected.disabled = next.validating || window.loading || !!next.refreshRequired;
         earlier.hidden = !window.has_more;earlier.disabled = window.loading || !!next.refreshRequired;earlier.setAttribute('aria-disabled', String(earlier.disabled));
         refresh.disabled = window.loading || next.validating;retry.hidden = !window.error || !!next.refreshRequired;
-        reload.hidden = !next.refreshRequired;reload.textContent = next.refreshLabel || 'Reload recorded history';
+        reload.hidden = !next.refreshRequired;setText(reload, next.refreshLabel || 'Reload recorded history');
         timeline.hidden = !items.length;
         let initialAnchor = null;
         if (!initialized && items.length && !window.loading && !next.validating && !next.refreshRequired) {
@@ -218,5 +228,11 @@ export function mountRecordedHistory(container, {api, positiveId, parentScope, s
     });
     render(state);
     void controller.load();
-    return {dispose};
+    /** Open Recorded run for one run (the history run dot, #249 D26); false while recorded actions are unavailable. */
+    function openRun({runId, anchorId = null, contextId = null, trigger}) {
+        if (scope.signal.aborted || !state.actionsEnabled) return false;
+        runView.open({runId, anchorId, contextId, trigger});
+        return true;
+    }
+    return {dispose, openRun};
 }

@@ -5,6 +5,7 @@ import base64
 import binascii
 from functools import wraps
 import json
+import os
 import re
 import sqlite3
 from typing import Callable
@@ -20,16 +21,23 @@ from .history_current import (
     _OpenedCurrentMedia,
     _current_media_response,
     _prepare_current_media,
+    accepts_jxl,
     _reauthorize_current_target,
     candidate_locator,
     resolve_current_candidate,
     snapshot_current_output_scope,
 )
-from .inspection_service import CurrentFileChanged, inspect_current_file
+from .inspection_service import (
+    CurrentFileChanged,
+    image_tags_reader,
+    inspect_current_file,
+)
+from .images import image_category_key
 
 try:
     from ...database.execution_history import HistoryEpochChanged
     from ...database.history_gallery import read_history_gallery
+    from ...database.run_attribution import recorded_output_lookup
     from ...database.history_reads import (
         HistoryCaptureChanged,
         OutputPosition,
@@ -37,10 +45,15 @@ try:
         WindowPosition,
     )
     from ...utils.history_read_fence import HistoryReadFence
-    from ...utils.inspection_response import encode_history_inspection_response
+    from ...utils.inspection_response import (
+        OWN_CATEGORY_UNREAD,
+        apply_own_category,
+        encode_history_inspection_response,
+    )
 except ImportError:
     from database.execution_history import HistoryEpochChanged
     from database.history_gallery import read_history_gallery
+    from database.run_attribution import recorded_output_lookup
     from database.history_reads import (
         HistoryCaptureChanged,
         OutputPosition,
@@ -48,7 +61,11 @@ except ImportError:
         WindowPosition,
     )
     from utils.history_read_fence import HistoryReadFence
-    from utils.inspection_response import encode_history_inspection_response
+    from utils.inspection_response import (
+        OWN_CATEGORY_UNREAD,
+        apply_own_category,
+        encode_history_inspection_response,
+    )
 
 
 _RUN_MAX_BYTES = 8 * 1024 * 1024
@@ -140,6 +157,18 @@ def _uuid(value: object) -> str:
 def _query(request: web.Request) -> None:
     if any(len(request.query.getall(key)) != 1 for key in request.query):
         raise ValueError("Duplicate history query parameter")
+
+
+def _jxl_flag(request: web.Request) -> bool:
+    """The cover's ``jxl`` flag (#317): ``1`` when the workspace decoded a
+    JPEG XL image (a browser may not list ``image/jxl`` in Accept), ``0`` or
+    absent otherwise; anything else is a bad request."""
+    value = request.query.get("jxl")
+    if value is None:
+        return False
+    if value not in ("0", "1"):
+        raise ValueError("Invalid jxl flag")
+    return value == "1"
 
 
 def _page_limit(request: web.Request) -> int:
@@ -388,6 +417,9 @@ class HistoryRoutesMixin:
         routes.get("/prompt_manager/library/{positive_id}/history")(
             self.get_library_history
         )
+        routes.get(
+            "/prompt_manager/library/{positive_id}/history/pairs/{pair_id}/newest"
+        )(self.get_newest_pair_run)
         routes.get("/prompt_manager/history/runs/{run_id}")(self.get_history_run)
         routes.get("/prompt_manager/history/runs/{run_id}/outputs")(
             self.get_history_outputs
@@ -460,6 +492,40 @@ class HistoryRoutesMixin:
             )
             for run in result["items"]:
                 _wire_run(run)
+            encoded = _serialize_history(
+                {
+                    "success": True,
+                    "history_version": 1,
+                    "history_epoch": epoch,
+                    **result,
+                }
+            )
+            fence.validate(epoch, generation)
+            return encoded
+
+        return _success_response(await self._run_in_executor(project))
+
+    @_history_errors
+    async def get_newest_pair_run(self, request: web.Request) -> web.Response:
+        """The pair's newest recorded run for the history run dot (#249 D26)."""
+        _query(request)
+        if request.query:
+            raise ValueError("Invalid newest pair run query")
+        positive_id = _decimal(request.match_info["positive_id"], minimum=1)
+        pair_id = _decimal(request.match_info["pair_id"], minimum=1)
+        fence = self._history_fence()
+        db = self.db
+
+        def project() -> bytes:
+            generation = fence.begin()
+            try:
+                with db.recorded_history_snapshot() as epoch:
+                    result = db.get_newest_pair_run(positive_id, pair_id)
+            finally:
+                db.model.close()
+            if result is None:
+                fence.validate(epoch, generation)
+                raise HistoryReadError(404, "not-found")
             encoded = _serialize_history(
                 {
                     "success": True,
@@ -625,6 +691,32 @@ class HistoryRoutesMixin:
     ) -> web.Response:
         return await self._history_current(request, "inspection")
 
+    def _history_own_category(self, reference: dict, scope):
+        """The recorded output's own category (#332), inside the snapshot.
+
+        The path is the symlink-resolved output folder plus the receipt's
+        subfolder and filename, keyed by ``image_category_key`` over the
+        configured output sources as Images keys it. A temp output or a path
+        no source holds has none. A failed read is OWN_CATEGORY_UNREAD.
+        """
+        if (
+            reference.get("folder_type") != "output"
+            or scope.canonical_output is None
+            or candidate_locator(reference, scope) is None
+        ):
+            return None
+        path = os.path.join(
+            str(scope.canonical_output), reference["subfolder"], reference["filename"]
+        )
+        try:
+            key = image_category_key(self._get_all_output_dirs(), path)
+            return None if key is None else self.db.image_category(*key)
+        except Exception:
+            self.logger.warning(
+                "History image category could not be read", exc_info=True
+            )
+            return OWN_CATEGORY_UNREAD
+
     async def _history_current(
         self, request: web.Request, kind: str
     ) -> web.StreamResponse:
@@ -649,6 +741,7 @@ class HistoryRoutesMixin:
                     if scope.current_scope != current_scope:
                         raise _current_stale()
                     result = db.get_history_occurrence(run_id, node, ordinal)
+                    own = None
                     if result is not None:
                         receipt = result["receipt"]
                         path = candidate_locator(receipt["reference"], scope)
@@ -656,6 +749,10 @@ class HistoryRoutesMixin:
                             db.model.get_connection(),
                             (path,) if path is not None else (),
                         )
+                        if kind == "inspection":
+                            own = self._history_own_category(
+                                receipt["reference"], scope
+                            )
             finally:
                 db.model.close()
             if result is None:
@@ -674,9 +771,27 @@ class HistoryRoutesMixin:
                         resolved.canonical_target,
                         source_label=resolved.public["source_label"],
                         saved=saved.get("saved"),
-                        library=saved.get(
-                            "library",
-                            {"status": "unavailable" if saved_unavailable else "none"},
+                        library=apply_own_category(
+                            saved.get(
+                                "library",
+                                {
+                                    "status": (
+                                        "unavailable" if saved_unavailable else "none"
+                                    )
+                                },
+                            ),
+                            own,
+                        ),
+                        # The file's own image tags, keyed as the Tag dialog
+                        # keys them: the normcased realpath (#457).
+                        image_tags=image_tags_reader(
+                            db,
+                            str(resolved.canonical_target),
+                            self.logger,
+                            close=True,
+                        ),
+                        recorded=recorded_output_lookup(
+                            db, close=True, reference=receipt["reference"]
                         ),
                     )
                     _reauthorize_current_target(resolved, scope)
@@ -697,7 +812,10 @@ class HistoryRoutesMixin:
                         raise HistoryReadError(422, "response-limit") from None
                 else:
                     prepared = _prepare_current_media(
-                        resolved, scope, thumbnail=kind == "thumbnail"
+                        resolved,
+                        scope,
+                        thumbnail=kind == "thumbnail",
+                        **media_options,
                     )
                 _check_current(scope, self, fence, epoch, generation)
                 return prepared
@@ -724,25 +842,48 @@ class HistoryRoutesMixin:
                     _check_current(scope, self, fence, epoch, generation)
                 raise
 
-        pending = asyncio.create_task(self._run_in_executor(project))
-        try:
-            prepared = await asyncio.shield(pending)
-        except asyncio.CancelledError:
-            pending.add_done_callback(_close_prepared_result)
-            raise
-        except (
-            HistoryReadError,
-            HistoryEpochChanged,
-            sqlite3.Error,
-            OSError,
-            ValueError,
-        ):
-            raise
-        except Exception as error:
-            self.logger.warning(
-                "Current history media unavailable (%s)", type(error).__name__
-            )
-            raise _current_unavailable("temporary_unavailable") from None
+        async def execute():
+            # An inspection reads the file's header and text: the
+            # interactive image pool (#523); media stays on the default.
+            run = self._run_image if kind == "inspection" else self._run_in_executor
+            pending = asyncio.create_task(run(project))
+            try:
+                return await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                pending.add_done_callback(_close_prepared_result)
+                raise
+            except (
+                HistoryReadError,
+                HistoryEpochChanged,
+                sqlite3.Error,
+                OSError,
+                ValueError,
+            ):
+                raise
+            except Exception as error:
+                self.logger.warning(
+                    "Current history media unavailable (%s)", type(error).__name__
+                )
+                raise _current_unavailable("temporary_unavailable") from None
+
+        # A missing preview (#249) is noted on the first read, made through
+        # the serve route's admission and single flight, then read again. A
+        # video whose preview cannot be made is the placeholder frame.
+        needed = []
+        media_options = {}
+        if kind == "thumbnail":
+            media_options = {
+                "ensure_preview": lambda *preview: needed.append(preview),
+                "placeholder": self._video_placeholder_bytes(),
+                "accepts_jxl": _jxl_flag(request) or accepts_jxl(request),
+            }
+        prepared = await execute()
+        if needed:
+            if not isinstance(prepared, bytes):
+                prepared.close()
+            await self._admit_preview(*needed[0])
+            media_options["ensure_preview"] = None
+            prepared = await execute()
         if isinstance(prepared, bytes):
             return _success_response(prepared)
         return await _current_media_response(request, prepared)

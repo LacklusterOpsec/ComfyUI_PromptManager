@@ -19,6 +19,7 @@ from unittest.mock import patch
 from tests.history_waits import drain_writer
 from database import PromptDatabase
 from utils import usage_tracking
+from utils.hashing import generate_prompt_hash
 from utils.execution_history_writer import HistoryWriter
 
 try:
@@ -28,6 +29,8 @@ except ImportError:
 
 Status = namedtuple("ExecutionStatus", "status_str completed messages")
 JOB = "a0c26da3-eb26-405c-b143-c662a84c3112"
+# A cross-thread wait or a duration check fails only past this (#370).
+CEILING_SECONDS = 30.0
 
 
 class HostQueue:
@@ -52,7 +55,7 @@ def status(kind="execution_success", job=JOB):
     return Status("success", True, [(kind, {"prompt_id": job, "timestamp": 20})])
 
 
-class HistoryHooksTests(unittest.TestCase):
+class HooksCase(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -120,6 +123,8 @@ class HistoryHooksTests(unittest.TestCase):
     def drain(self, registration):
         drain_writer(registration.writer, clock=time.monotonic)
 
+
+class HistoryHooksTests(HooksCase):
     def test_package_history_initializes_when_monitor_and_usage_setup_fail(self):
         try:
             from tests.test_init_package import (
@@ -209,6 +214,9 @@ class HistoryHooksTests(unittest.TestCase):
         self.queue.get = unrelated_after
         self.dequeue(0)
         self.queue.task_done(0, {}, status())
+        # The writer drains first: this test checks wrappers and the session,
+        # not the 2 s bound, which a slow runner can spend on the write (#370).
+        self.drain(first)
         self.assertTrue(first.dispose())
         self.assertTrue(first.dispose())
         self.assertIs(self.queue.get, unrelated_after)
@@ -339,16 +347,20 @@ class HistoryHooksTests(unittest.TestCase):
         with patch.object(self.db, "write_execution_start", blocked):
             registration = self.register()
             self.dequeue(0)
-            self.assertTrue(entered.wait(1))
+            # Ceilings, not tight wall clocks (#370): the return values show
+            # the bound; a ceiling still fails a call that waits unbounded.
+            self.assertTrue(entered.wait(CEILING_SECONDS))
             began = time.monotonic()
             self.queue.task_done(0, {}, status())
             self.dequeue(1)
-            self.assertLess(time.monotonic() - began, 0.2)
+            self.assertLess(time.monotonic() - began, CEILING_SECONDS)
             began = time.monotonic()
             self.assertFalse(registration.dispose())
             self.assertGreaterEqual(time.monotonic() - began, 1.8)
-            self.assertLess(time.monotonic() - began, 2.3)
+            self.assertLess(time.monotonic() - began, CEILING_SECONDS)
             release.set()
+            # Drain first: the 2 s bound is not under test here (#370).
+            self.drain(registration)
             self.assertTrue(registration.dispose(2))
 
     def test_restore_disables_capture_and_clears_handles_before_fresh_epoch(self):
@@ -757,4 +769,190 @@ class HistoryHooksTests(unittest.TestCase):
                 independent()
         self.assertEqual(
             calls, ["execution_start", "execution_cached", "execution_cached"]
+        )
+
+
+class CachedRuntimeHistoryTests(HooksCase):
+    """A cached runtime-linked prompt is a tracked run, like an executed one (#403).
+
+    The real history hook and writer, a real ``CachedRuns`` and the real host
+    adapter over fakes of ComfyUI's executor, cache and executing context.
+    """
+
+    TEXT = "a lighthouse the LLM wrote"
+    GRAPH = {
+        "str": {"class_type": "PrimitiveString", "inputs": {"value": "seed"}},
+        "llm": {"class_type": "PreviewAny", "inputs": {"source": ["str", 0]}},
+        "p": {"class_type": "PromptManager", "inputs": {"text": ["llm", 0]}},
+        "s": {"class_type": "KSampler", "inputs": {"positive": ["p", 0]}},
+    }
+
+    def setUp(self):
+        super().setUp()
+        from utils import cached_runs
+        from utils.cached_runs import CachedRuns
+
+        self.context = None
+        self.runs = CachedRuns(context=lambda: self.context or (None, None))
+        self.cache_entries = {}
+        entries = self.cache_entries
+        execution = types.ModuleType("execution")
+        caching = types.ModuleType("comfy_execution.caching")
+        package = types.ModuleType("comfy_execution")
+        utils_module = types.ModuleType("comfy_execution.utils")
+        entry_type = namedtuple("CacheEntry", "ui outputs")
+
+        class PromptExecutor:
+            def add_message(self, event, data, broadcast):
+                return None
+
+        class HierarchicalCache:
+            def get_local(self, node_id):
+                return entries.get(node_id)
+
+        execution.PromptExecutor, execution.CacheEntry = PromptExecutor, entry_type
+        caching.HierarchicalCache = HierarchicalCache
+        package.caching, package.utils = caching, utils_module
+        utils_module.get_executing_context = lambda: (
+            SimpleNamespace(prompt_id=self.context[0], node_id="p", list_index=0)
+            if self.context
+            else None
+        )
+        self.entry_type = entry_type
+        modules = patch.dict(
+            sys.modules,
+            {
+                "execution": execution,
+                "comfy_execution": package,
+                "comfy_execution.caching": caching,
+                "comfy_execution.utils": utils_module,
+            },
+        )
+        modules.start()
+        self.addCleanup(modules.stop)
+        swap = patch.object(cached_runs, "CACHED_RUNS", self.runs)
+        swap.start()
+        self.addCleanup(swap.stop)
+        self.executor = PromptExecutor()
+        self.executor.server = self.server
+        self.executor.caches = SimpleNamespace(outputs=HierarchicalCache())
+        self.prompt_id = self.db.save_prompt(text=self.TEXT)
+        self.item_id = 0
+
+    def job(self, cached):
+        """One job; the node executes unless ``cached`` (ComfyUI's cache serves it)."""
+        from uuid import uuid4
+
+        from utils.cached_runs import stored_facts
+        from utils.execution_context_capture import record_runtime_context
+
+        self.item_id += 1
+        job = str(uuid4())
+        result = ((0, job, self.GRAPH, {}, ["s"]), self.item_id)
+        self.queue.results.append(result)
+        self.queue.get()
+        self.runs.begin_attempt(result)
+        self.context = (job, 0)
+        self.executor.add_message("execution_start", {"prompt_id": job}, False)
+        if cached:
+            self.executor.add_message(
+                "execution_cached", {"prompt_id": job, "nodes": ["p"]}, False
+            )
+        else:
+            # What PromptManager.encode_prompt records for this text
+            record_runtime_context("PromptManager", self.TEXT, "", "", self.TEXT)
+            self.runs.record_item(
+                "p", (self.TEXT,), stored_facts(self.TEXT), ((self.TEXT, "", ""),)
+            )
+            self.cache_entries["p"] = self.entry_type(None, [object(), [self.TEXT]])
+        self.context = None
+        self.queue.task_done(self.item_id, {}, status(job=job))
+        self.runs.end_attempt(self.item_id)
+
+    def tracked_runs(self):
+        with self.db.recorded_history_snapshot():
+            return self.db.list_history_window(self.prompt_id)["recorded_run_count"]
+
+    def test_three_jobs_of_runtime_text_are_three_tracked_runs(self):
+        registration = self.register()
+        for cached in (False, True, True):
+            self.job(cached)
+        self.drain(registration)
+        self.assertEqual(self.tracked_runs(), 3)
+        rows = self.rows()
+        for row in rows:
+            contexts = self.db.get_execution_contexts(row["run_id"])["contexts"]
+            self.assertEqual(contexts[0]["positive"]["raw"], self.TEXT)
+            self.assertEqual(contexts[0]["positive_prompt_id"], self.prompt_id)
+        cached = self.db.get_execution_contexts(rows[1]["run_id"])["contexts"][0]
+        self.assertEqual(
+            cached["evidence"]["positive"]["raw"],
+            {"provenance": "inferred", "source": "graph_semantics", "reason": None},
+        )
+        self.assertEqual(
+            cached["evidence"]["positive"]["effective"]["source"], "host_cache_output"
+        )
+        # The stored history passes the whole-database check older builds run too
+        from database.execution_history_schema import history_schema_error
+
+        self.assertIsNone(history_schema_error(self.db.model.get_connection()))
+        # An image of a cached job can now be attributed through its run (#342)
+        from database.run_attribution import named_prompt
+
+        self.assertEqual(
+            [named_prompt(self.db, row["run_id"]) for row in rows],
+            [self.prompt_id] * 3,
+        )
+
+    def test_without_a_receipt_a_cached_job_stays_untracked(self):
+        registration = self.register()
+        self.job(False)
+        self.runs._receipts.clear()  # as after a restart with a provider entry
+        self.job(True)
+        self.drain(registration)
+        self.assertEqual(self.tracked_runs(), 1)
+        cached = self.db.get_execution_contexts(self.rows()[1]["run_id"])["contexts"]
+        self.assertIsNone(cached[0]["positive"]["raw"])
+        self.assertIsNone(cached[0]["positive_prompt_id"])
+        from database.run_attribution import named_prompt
+
+        self.assertIsNone(named_prompt(self.db, self.rows()[1]["run_id"]))
+
+
+class CachedRuntimeCaseHistoryTests(CachedRuntimeHistoryTests):
+    """Raw text that differs only in case joins the saved prompt's history (#460).
+
+    The hash folds case, so the run counts toward the lower-case prompt saved
+    first; the run keeps its exact raw spelling.
+    """
+
+    TEXT = "\u00c9 LIGHTHOUSE the LLM wrote"
+
+    def setUp(self):
+        super().setUp()
+        self.db.delete_prompt(self.prompt_id)
+        lower = self.TEXT.lower()
+        self.prompt_id = self.db.save_prompt(
+            text=lower, prompt_hash=generate_prompt_hash(lower)
+        )
+
+    def test_the_library_counts_the_case_variant_as_this_prompt(self):
+        self.assertEqual(
+            self.db.get_prompt_by_hash(generate_prompt_hash(self.TEXT))["id"],
+            self.prompt_id,
+        )
+
+
+class CachedRuntimeWhitespaceHistoryTests(CachedRuntimeHistoryTests):
+    """Raw text with outer whitespace joins the history of the prompt it saves (#438).
+
+    The Library stores ``"a lighthouse the LLM wrote"``; the run keeps the exact
+    frozen raw text, newline included, yet is a tracked run of that prompt.
+    """
+
+    TEXT = "\u3000 a lighthouse the LLM wrote\n"
+
+    def test_the_library_stores_the_stripped_text(self):
+        self.assertEqual(
+            self.db.get_prompt_by_id(self.prompt_id)["text"], self.TEXT.strip()
         )

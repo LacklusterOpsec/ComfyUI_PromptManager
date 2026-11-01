@@ -1,5 +1,7 @@
 """Deterministic nodes and queue controls installed only in an owned test host."""
 
+import asyncio
+import os
 import threading
 import time
 
@@ -199,6 +201,39 @@ NODE_CLASS_MAPPINGS.update(
     {"PMHistoryImages": PMHistoryImages, "PMHistoryImageOutput": PMHistoryImageOutput}
 )
 
+# #347: text whose value (and cache signature) follows a value the test sets, so
+# one queued graph can serve A, then B, then A again (each cached under LRU).
+_CYCLED = {"value": "cycled"}
+
+
+class PMCycledText:
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        return {"required": {}}
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "execute"
+    CATEGORY = "testing/execution-history"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs: object) -> str:
+        return _CYCLED["value"]
+
+    def execute(self) -> tuple:
+        return (_CYCLED["value"],)
+
+
+NODE_CLASS_MAPPINGS["PMCycledText"] = PMCycledText
+
+
+@PromptServer.instance.routes.post("/pm_execution_fixture/cycled")
+async def cycled_text(request: web.Request) -> web.Response:
+    value = (await request.json())["value"]
+    if type(value) is not str:
+        raise web.HTTPBadRequest()
+    _CYCLED["value"] = value
+    return web.json_response({"value": value})
+
 
 @PromptServer.instance.routes.post("/pm_execution_fixture/metadata")
 async def metadata(request: web.Request) -> web.Response:
@@ -255,3 +290,59 @@ async def cache_mode(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest()
     _CACHE_MODE = mode
     return web.json_response({"configured": True})
+
+
+def _plugin_module(suffix: str):
+    """A loaded PromptManager module (ComfyUI names the package by its path)."""
+    import sys
+
+    for name, module in list(sys.modules.items()):
+        if name.endswith("promptmanager." + suffix):
+            return module
+    raise web.HTTPServiceUnavailable(text=f"PromptManager {suffix} not loaded")
+
+
+@PromptServer.instance.routes.post("/pm_execution_fixture/monitor")
+async def image_monitor(request: web.Request) -> web.Response:
+    """Start or stop PromptManager's image monitor on the host output folder.
+
+    The managed host's config disables monitoring; only the attribution cases
+    (#342) turn it on, and they turn it off again.
+    """
+    enabled = (await request.json())["enabled"]
+    if type(enabled) is not bool:
+        raise web.HTTPBadRequest()
+    import folder_paths
+
+    monitor_module = _plugin_module("utils.image_monitor")
+    config = _plugin_module("py.config").GalleryConfig
+    monitor = monitor_module._monitor_instance
+    if monitor is None:
+        database = _plugin_module("database.operations").PromptDatabase()
+        tracker = _plugin_module("utils.prompt_tracker").get_prompt_tracker(database)
+        monitor = monitor_module.get_image_monitor(database, tracker)
+    if enabled:
+        config.MONITORING_ENABLED = True
+        monitor.start_monitoring([folder_paths.get_output_directory()])
+    else:
+        # Joins the image worker and the observer (one shared 5 s deadline),
+        # so it runs on a worker thread, not on the event loop.
+        await asyncio.to_thread(monitor.stop_monitoring)
+        config.MONITORING_ENABLED = False
+    return web.json_response({"monitoring": monitor.is_monitoring})
+
+
+@PromptServer.instance.routes.get("/pm_execution_fixture/monitor")
+async def image_monitor_state(request: web.Request) -> web.Response:
+    """File names of images waiting for their run's recorded outputs: keyless
+    ones (``awaiting``) and foreign ones (``foreign``, #247)."""
+    monitor = _plugin_module("utils.image_monitor")._monitor_instance
+    handler = getattr(monitor, "handler", None)
+    waiting = handler.awaiting_history() if handler is not None else []
+    foreign = handler.awaiting_foreign() if handler is not None else []
+    return web.json_response(
+        {
+            "awaiting": [os.path.basename(p) for p in waiting],
+            "foreign": [os.path.basename(p) for p in foreign],
+        }
+    )

@@ -12,9 +12,21 @@ else:
 
 try:
     from .prompt_manager import IO, InputTypeDict, PromptManagerFocused
+    from .utils.cached_runs import (
+        PAIR,
+        Role,
+        Seen,
+        own_counts,
+        pair_components,
+        stored_facts,
+    )
     from .utils.hashing import generate_prompt_hash
     from .utils.pair_execution import record_pair_execution
-    from .utils.prompt_graph import intrinsic_pair_nodes, run_prompt_components
+    from .utils.prompt_graph import (
+        intrinsic_pair_nodes,
+        run_prompt_components,
+        save_setting,
+    )
     from .utils.prompt_pair_resolver import resolve_text_input
     from .utils.usage_tracking import (
         PENDING_FIRST_USE,
@@ -23,9 +35,21 @@ try:
     )
 except ImportError:
     from prompt_manager import IO, InputTypeDict, PromptManagerFocused
+    from utils.cached_runs import (
+        PAIR,
+        Role,
+        Seen,
+        own_counts,
+        pair_components,
+        stored_facts,
+    )
     from utils.hashing import generate_prompt_hash
     from utils.pair_execution import record_pair_execution
-    from utils.prompt_graph import intrinsic_pair_nodes, run_prompt_components
+    from utils.prompt_graph import (
+        intrinsic_pair_nodes,
+        run_prompt_components,
+        save_setting,
+    )
     from utils.prompt_pair_resolver import resolve_text_input
     from utils.usage_tracking import (
         PENDING_FIRST_USE,
@@ -74,8 +98,13 @@ class PromptManagerPair(PromptManagerFocused):
         prompt: Optional[Dict[str, Any]] = None,
         unique_id: Optional[str] = None,
         extra_pnginfo: Optional[Dict[str, Any]] = None,
+        save_to_library: bool = True,
     ) -> Tuple[Any, Any, str, str]:
-        """Encode both sides once; database and tracking failures never block CLIP."""
+        """Encode both sides once; database and tracking failures never block CLIP.
+
+        With ``save_to_library`` off nothing is saved, counted, tracked or
+        recorded (#90); the four outputs are the same.
+        """
         if clip is None:
             raise RuntimeError("ERROR: clip input is invalid: None")
         if not isinstance(text, str) or not isinstance(negative_text, str):
@@ -93,6 +122,10 @@ class PromptManagerPair(PromptManagerFocused):
         negative_conditioning = clip.encode_from_tokens_scheduled(
             clip.tokenize(negative_text)
         )
+        result = positive_conditioning, negative_conditioning, positive, negative_text
+        if not save_to_library:
+            self._skip_not_saved(prompt, unique_id)
+            return result
         record_pair_execution(
             extra_pnginfo,
             unique_id,
@@ -117,85 +150,29 @@ class PromptManagerPair(PromptManagerFocused):
         )
         is_positive = "text" in used_fields
         pair_used = node_id in intrinsic_pair_nodes(prompt) if known else True
-        try:
-            pair_id = self.db.save_prompt_pair(
-                text,
-                negative_text,
-                category=category.strip() or None,
-                tags=self._parse_tags(tags),
-            )
-            pair = self.db.get_prompt_pair(pair_id)
-            prompt_id = pair["positive_prompt_id"]
-            resolved_positive = (
-                resolve_text_input(prompt, node_id, "text") if known else None
-            )
-            resolved_negative = (
-                resolve_text_input(prompt, node_id, "negative_text") if known else None
-            )
-            positive_seen = resolved_positive is not None and generate_prompt_hash(
-                resolved_positive
-            ) == generate_prompt_hash(text)
-            pair_seen = (
-                positive_seen
-                and resolved_negative is not None
-                and generate_prompt_hash(resolved_negative)
-                == generate_prompt_hash(negative_text)
-            )
-            positive_pending = getattr(self, "pending_first_use", PENDING_FIRST_USE)
-            pair_pending = getattr(
-                self, "pending_pair_first_use", PENDING_PAIR_FIRST_USE
-            )
-            counted = set()
-            for field, component_text, resolved_text, component_id in (
-                ("text", text, resolved_positive, prompt_id),
-                (
-                    "negative_text",
+        if not text.strip():
+            # Nothing to store: prepend/append are never the stored prompt (#342)
+            self._skip_empty_prompt(prompt, unique_id)
+        else:
+            try:
+                pair_id, prompt_id = self._save_and_track_pair(
+                    text,
                     negative_text,
-                    resolved_negative,
-                    pair["negative_prompt_id"],
-                ),
-            ):
-                component_hash = generate_prompt_hash(component_text)
-                if (
-                    field not in used_fields
-                    or not component_id
-                    or component_hash in counted
-                ):
-                    continue
-                counted.add(component_hash)
-                seen_at_queue = (
-                    resolved_text is not None
-                    and generate_prompt_hash(resolved_text) == component_hash
+                    positive,
+                    category=category,
+                    tags=tags,
+                    prepend_text=prepend_text,
+                    append_text=append_text,
+                    prompt=prompt,
+                    unique_id=unique_id,
+                    used_fields=used_fields,
+                    is_positive=is_positive,
+                    pair_used=pair_used,
                 )
-                runs = positive_pending.consume(component_hash) + int(not seen_at_queue)
-                if runs:
-                    self.db.record_prompt_use(component_id, times=runs)
-            if pair_used:
-                runs = pair_pending.consume(pair_run_key(text, negative_text)) + int(
-                    not pair_seen
-                )
-                if runs:
-                    self.db.record_prompt_pair_use(pair_id, times=runs)
-            if is_positive:
-                self.prompt_tracker.set_current_prompt(
-                    prompt_text=positive,
-                    additional_data={
-                        "prompt_id": prompt_id,
-                        "pair_id": pair_id if pair_used else None,
-                        "positive_text": positive,
-                        "negative_text": negative_text,
-                        "positive_storage_text": text.strip(),
-                        "negative_storage_text": negative_text.strip(),
-                        "prepend_text": prepend_text.strip(),
-                        "append_text": append_text.strip(),
-                        "final_text": positive,
-                        "category": category.strip() or None,
-                        "tags": self._parse_tags(tags) or [],
-                    },
-                    push_to_queue=not positive_seen or (pair_used and not pair_seen),
-                )
-        except Exception as error:
-            self.logger.warning(f"Could not save or track paired prompt: {error}")
+            except Exception as error:
+                self.logger.warning(f"Could not save or track paired prompt: {error}")
+                if is_positive:
+                    self._mark_untracked(prompt, unique_id)
         try:
             self.comfyui_integration.register_prompt(
                 f"promptmanager_pair_{time.time_ns()}",
@@ -209,7 +186,6 @@ class PromptManagerPair(PromptManagerFocused):
             )
         except Exception as error:
             self.logger.warning(f"Could not register paired metadata: {error}")
-        result = positive_conditioning, negative_conditioning, positive, negative_text
         record_runtime_context(
             type(self).__name__,
             text,
@@ -221,7 +197,114 @@ class PromptManagerPair(PromptManagerFocused):
         record_runtime_context(
             type(self).__name__, negative_text, "", "", negative_text, role="negative"
         )
+        self._record_cached_item(
+            unique_id,
+            (positive, negative_text),
+            text,
+            negative_text,
+            fields=((text, prepend_text, append_text), (negative_text, "", "")),
+        )
         return result
+
+    def _save_and_track_pair(
+        self,
+        text: str,
+        negative_text: str,
+        positive: str,
+        *,
+        category: str,
+        tags: str,
+        prepend_text: str,
+        append_text: str,
+        prompt: Optional[Dict[str, Any]],
+        unique_id: Optional[str],
+        used_fields: set,
+        is_positive: bool,
+        pair_used: bool,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Save the recipe, count its runs and register the positive for linking."""
+        known = isinstance(prompt, dict) and unique_id is not None
+        node_id = str(unique_id)
+        pair_id = self.db.save_prompt_pair(
+            text,
+            negative_text,
+            category=category.strip() or None,
+            tags=self._parse_tags(tags),
+            # The Library shows the prompt's own category and tags, not the pair's.
+            fill_new_positive=True,
+        )
+        pair = self.db.get_prompt_pair(pair_id)
+        prompt_id = pair["positive_prompt_id"]
+        resolved_positive = (
+            resolve_text_input(prompt, node_id, "text") if known else None
+        )
+        resolved_negative = (
+            resolve_text_input(prompt, node_id, "negative_text") if known else None
+        )
+        if known and save_setting(prompt, node_id) is not True:
+            # The hook skips a switch it cannot read (#90): the node counts
+            resolved_positive = resolved_negative = None
+        positive_seen = resolved_positive is not None and generate_prompt_hash(
+            resolved_positive
+        ) == generate_prompt_hash(text)
+        pair_seen = (
+            positive_seen
+            and resolved_negative is not None
+            and generate_prompt_hash(resolved_negative)
+            == generate_prompt_hash(negative_text)
+        )
+        negative_seen = resolved_negative is not None and generate_prompt_hash(
+            resolved_negative
+        ) == generate_prompt_hash(negative_text)
+        positive_pending = getattr(self, "pending_first_use", PENDING_FIRST_USE)
+        pair_pending = getattr(self, "pending_pair_first_use", PENDING_PAIR_FIRST_USE)
+        facts = stored_facts(text, negative_text)
+        role = Role(frozenset(used_fields), pair_used)
+        # Own counts are skipped when this job already counted the node from
+        # ComfyUI's cache (#347); the pending first-use catch-up never is.
+        counts = (
+            []
+            if self._replayed(unique_id)
+            else own_counts(
+                PAIR, facts, role, Seen(positive_seen, negative_seen, pair_seen)
+            )
+        )
+        component_ids = {"text": prompt_id, "negative_text": pair["negative_prompt_id"]}
+        for field, component_hash in pair_components(facts, role):
+            component_id = component_ids[field]
+            if not component_id:
+                continue
+            runs = positive_pending.consume(component_hash) + int(
+                ("prompt", component_hash) in counts
+            )
+            if runs:
+                self.db.record_prompt_use(component_id, times=runs)
+        if pair_used:
+            runs = pair_pending.consume(pair_run_key(text, negative_text)) + int(
+                ("pair", facts.positive_hash, facts.negative_hash) in counts
+            )
+            if runs:
+                self.db.record_prompt_pair_use(pair_id, times=runs)
+        if is_positive:
+            self.prompt_tracker.set_current_prompt(
+                prompt_text=positive,
+                additional_data={
+                    "prompt_id": prompt_id,
+                    "pair_id": pair_id if pair_used else None,
+                    "positive_text": positive,
+                    "negative_text": negative_text,
+                    "positive_storage_text": text.strip(),
+                    "negative_storage_text": negative_text.strip(),
+                    "prepend_text": prepend_text.strip(),
+                    "append_text": append_text.strip(),
+                    "final_text": positive,
+                    "category": category.strip() or None,
+                    "tags": self._parse_tags(tags) or [],
+                },
+                push_to_queue=not positive_seen or (pair_used and not pair_seen),
+                **self._run_identity(prompt, unique_id),
+            )
+        return pair_id, prompt_id
 
     @classmethod
     def IS_CHANGED(

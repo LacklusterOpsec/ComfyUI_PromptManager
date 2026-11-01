@@ -37,6 +37,7 @@ from typing import Optional, Dict, Any
 from PIL import Image
 
 from .logging_config import get_logger
+from .png_text import png_text
 
 
 class ComfyUIMetadataExtractor:
@@ -88,24 +89,26 @@ class ComfyUIMetadataExtractor:
                 # Add basic file information
                 metadata["file_info"] = self.get_file_info(image_path, image)
 
-                # ComfyUI writes PNG text chunks, but other savers put the same
-                # keys in image.info (WebP, JPEG, GIF). Read both so images from
-                # those nodes still link to their prompts.
-                text_chunks = {}
-                if hasattr(image, "text") and image.text:
-                    text_chunks.update(image.text)
-                if hasattr(image, "info") and image.info:
-                    for key, value in image.info.items():
-                        if isinstance(value, bytes):
-                            text_chunks[key] = value.decode("utf-8", errors="replace")
-                        elif isinstance(value, str):
-                            text_chunks[key] = value
+                # ComfyUI writes PNG text chunks, read without decoding the
+                # pixels (#523). Other savers put the same keys in image.info
+                # (WebP, JPEG, GIF), so those images still link to their prompts.
+                text = png_text(image)
+                if not text and getattr(image, "info", None):
+                    text = {
+                        key: (
+                            value.decode("utf-8", errors="replace")
+                            if isinstance(value, bytes)
+                            else value
+                        )
+                        for key, value in image.info.items()
+                        if isinstance(value, (bytes, str))
+                    }
 
-                if text_chunks:
+                if text:
                     # Look for ComfyUI workflow data
-                    if "workflow" in text_chunks:
+                    if "workflow" in text:
                         try:
-                            workflow_data = json.loads(text_chunks["workflow"])
+                            workflow_data = json.loads(text["workflow"])
                             metadata["workflow"] = workflow_data
 
                             # Extract text encoder nodes from workflow
@@ -119,9 +122,9 @@ class ComfyUIMetadataExtractor:
                             self.logger.warning(f"Failed to parse workflow JSON: {e}")
 
                     # Look for prompt data
-                    if "prompt" in text_chunks:
+                    if "prompt" in text:
                         try:
-                            prompt_data = json.loads(text_chunks["prompt"])
+                            prompt_data = json.loads(text["prompt"])
                             metadata["prompt"] = prompt_data
                         except json.JSONDecodeError as e:
                             self.logger.warning(f"Failed to parse prompt JSON: {e}")
@@ -141,13 +144,13 @@ class ComfyUIMetadataExtractor:
                     ]
 
                     for field in metadata_fields:
-                        if field in text_chunks:
+                        if field in text:
                             try:
                                 # Try to parse as JSON first
-                                metadata[field] = json.loads(text_chunks[field])
+                                metadata[field] = json.loads(text[field])
                             except (json.JSONDecodeError, TypeError):
                                 # Store as string if not valid JSON
-                                metadata[field] = text_chunks[field]
+                                metadata[field] = text[field]
 
                 return (
                     metadata

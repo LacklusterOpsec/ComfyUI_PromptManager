@@ -21,6 +21,7 @@ export class InspectionSourceChangedError extends Error {
         super(SOURCE_CHANGED);
         this.name = 'InspectionSourceChangedError';
         this.refreshRequired = true;
+        this.code = 'source-changed';
     }
 }
 
@@ -44,6 +45,9 @@ export function inspectPath(image) {
     return `/prompt_manager/images/inspect/${image.path.split('/').map(encodeURIComponent).join('/')}?${query}`;
 }
 
+/** One path segment as the server quotes it (Python `quote(..., safe="/")` also escapes `!'()*`, #249 M11). */
+const quoteSegment = segment => encodeURIComponent(segment).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
 function downloadFor(image, required) {
     try {
         if (typeof image.url !== 'string' || !image.url) throw new TypeError('Missing original media URL');
@@ -55,7 +59,7 @@ function downloadFor(image, required) {
         const sameOrigin = 'Origin' in globalThis ?
             globalThis.Origin.from(url).isSameOrigin(globalThis.Origin.from(reference)) :
             url.origin !== 'null' && url.origin === reference.origin;
-        const expected = new URL(resolveUrl(`/prompt_manager/images/serve/${image.path.split('/').map(encodeURIComponent).join('/')}`), reference);
+        const expected = new URL(resolveUrl(`/prompt_manager/images/serve/${image.path.split('/').map(quoteSegment).join('/')}`), reference);
         const scope = descriptorScope(image);
         if (!sameOrigin || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash ||
             url.pathname !== expected.pathname || url.searchParams.getAll('root').length !== 1 || url.searchParams.get('root') !== String(image.root_index) ||
@@ -64,6 +68,48 @@ function downloadFor(image, required) {
         return { url: value, filename: image.path.split('/').at(-1) };
     } catch (error) {
         if (required) throw new TypeError('Invalid original media identity', { cause: error });
+        return null;
+    }
+}
+
+// The server's video extensions (py/api/inspection_service.py VIDEO_EXTENSIONS).
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.avi', '.mov', '.mkv', '.m4v', '.wmv']);
+// #317: the formats a preview is written in (WebP, JPEG XL, JPEG), for images and videos alike.
+const WRITTEN_PREVIEW_EXTENSIONS = ['.webp', '.jxl', '.jpg'];
+
+/**
+ * Every `thumbnails/<path>_thumb<ext>` the server may list as this file's preview (py/api/thumbnail_settings.py
+ * `owns`): a written format, or the name an older release gave it (the source's own extension, `.jpg` for a video).
+ */
+function previewPaths(path) {
+    const slash = path.lastIndexOf('/'), dot = path.lastIndexOf('.');
+    const cut = dot > slash ? dot : path.length, spelled = path.slice(cut), extension = spelled.toLowerCase();
+    const stem = `thumbnails/${path.slice(0, cut)}_thumb`;
+    const legacy = VIDEO_EXTENSIONS.has(extension) ? ['.jpg'] : [extension, spelled];
+    return new Set([...WRITTEN_PREVIEW_EXTENSIONS, ...legacy].filter(Boolean).map(ext => stem + ext));
+}
+
+/**
+ * #249: the listing's thumbnail of `image` as `{url}` for the inspector's cover, or null. Only the same-origin
+ * serve URL of this file's own preview (any format it owns, #317) under the same root and source scope is used;
+ * anything else keeps the original (a missing preview is made by the server on first view). The cover is only a
+ * placeholder: metadata, downloads and the viewer always use the original.
+ */
+function previewFor(image) {
+    try {
+        if (typeof image.thumbnail_url !== 'string' || !image.thumbnail_url) return null;
+        const location = globalThis.location || globalThis.window?.location;
+        const reference = new URL(location?.href || 'http://localhost/');
+        const resolveUrl = globalThis.window?.ApiClient?.resolveUrl || globalThis.ApiClient?.resolveUrl || (url => url);
+        const value = resolveUrl(image.thumbnail_url), url = new URL(value, reference);
+        const expected = new Set([...previewPaths(image.path)].map(preview =>
+            new URL(resolveUrl(`/prompt_manager/images/serve/${preview.split('/').map(quoteSegment).join('/')}`), reference).pathname));
+        const scope = descriptorScope(image);
+        if (url.origin !== reference.origin || url.username || url.password || url.hash || !expected.has(url.pathname) ||
+            url.searchParams.getAll('root').length !== 1 || url.searchParams.get('root') !== String(image.root_index) ||
+            url.searchParams.getAll('root_scope').length > 1 || (scope !== null && url.searchParams.get('root_scope') !== scope)) return null;
+        return { url: value };
+    } catch {
         return null;
     }
 }
@@ -87,8 +133,10 @@ function promptsFor(value) {
     return value;
 }
 
-function fileFor(value) {
-    if (!object(value) || value.observation !== 'current-file' || typeof value.source_label !== 'string' ||
+function fileFor(value, identity) {
+    // A local record observes the selected file itself; every other adapter observes a current server file.
+    const observation = identity?.kind === 'local-file' ? 'selected-local-file' : 'current-file';
+    if (!object(value) || value.observation !== observation || typeof value.source_label !== 'string' ||
         !['image', 'video'].includes(value.media_type) || typeof value.extension !== 'string' ||
         (value.format !== null && typeof value.format !== 'string')) throw new TypeError('Invalid inspection file');
     const file = { observation: value.observation, source_label: value.source_label, media_type: value.media_type, extension: value.extension, format: value.format };
@@ -153,14 +201,32 @@ function resolutionFor(value) {
 
 function libraryFor(value) {
     if (!object(value) || !['linked', 'none', 'ambiguous', 'unavailable', 'limited'].includes(value.status) || value.scope !== 'saved-library' ||
-        !Array.isArray(value.tags) || value.tags.some(tag => typeof tag !== 'string') || ![null, 'pair', 'positive'].includes(value.metadata_scope)) throw new TypeError('Invalid inspection library');
-    const library = { status: value.status, scope: value.scope, tags: [...value.tags], metadata_scope: value.metadata_scope };
+        !Array.isArray(value.tags) || value.tags.some(tag => typeof tag !== 'string') ||
+        ![null, 'pair', 'positive', 'image'].includes(value.category_scope) ||
+        ![null, 'pair', 'positive'].includes(value.tags_scope)) throw new TypeError('Invalid inspection library');
+    // #332: an image's own category (scope "image") may sit on any link status; tags never have that scope.
+    // D39: each field names its own source, so a recipe's category can sit beside its positive's tags.
+    const library = { status: value.status, scope: value.scope, tags: [...value.tags], category_scope: value.category_scope, tags_scope: value.tags_scope };
     for (const key of ['positive_id', 'pair_id', 'title', 'category']) {
         const item = value[key] ?? null;
         if (item !== null && (key.endsWith('_id') ? !Number.isSafeInteger(item) || item <= 0 : typeof item !== 'string')) throw new TypeError('Invalid inspection library field');
         library[key] = item;
     }
     return library;
+}
+
+// #249 PR C (D88): the file's own current image tags (S1). `none` and `unavailable` carry no names; a name is a
+// vocabulary tag name (1–50 characters, trimmed, no comma or control character), at most 100 of them.
+const IMAGE_TAG_STATES = ['current', 'none', 'unavailable'], MAX_IMAGE_TAGS = 100, IMAGE_TAG_LENGTH = 50;
+const imageTagName = name => typeof name === 'string' && name !== '' && name === name.trim() && [...name].length <= IMAGE_TAG_LENGTH &&
+    !/[,\x00-\x1f\x7f]/.test(name);
+
+function imageTagsFor(value) {
+    if (value === undefined) return null;
+    if (!object(value) || Object.keys(value).sort().join() !== 'state,tags' || !IMAGE_TAG_STATES.includes(value.state) ||
+        !Array.isArray(value.tags) || value.tags.length > MAX_IMAGE_TAGS || !value.tags.every(imageTagName) ||
+        (value.state !== 'current' && value.tags.length)) throw new TypeError('Invalid inspection image tags');
+    return { state: value.state, tags: [...value.tags] };
 }
 
 // The legacy workflow parse (comfy-metadata.js, as of #170) also feeds the gallery and
@@ -170,6 +236,55 @@ const LEGACY_FACTS = [['seed', 'seed'], ['steps', 'steps'], ['cfg', 'cfgScale'],
 
 function comfyMetadata() {
     return globalThis.ComfyMetadata || globalThis.window?.ComfyMetadata;
+}
+
+// #249: the legacy parse follows ConditioningZeroOut back to its input, so it reads the
+// positive text as the negative. Only the negative it actually read is checked: a direct
+// zero-out shows the server's zeroed state; a zero-out elsewhere on
+// that path, or a subgraph instance whose definition holds one, leaves the negative
+// unfilled. Any other negative keeps the legacy fill, so this page never shows less.
+const ZERO_OUT = 'ConditioningZeroOut';
+const ZEROED_NEGATIVE = Object.freeze({ status: 'resolved', text: '', source: 'zeroed-conditioning' });
+const MAX_NEGATIVE_VISITS = 2000;
+const MODE_MUTED = 2, MODE_BYPASSED = 4;
+const isLink = value => Array.isArray(value) && value.length === 2 && ['string', 'number'].includes(typeof value[0]);
+
+/** Subgraph definition IDs that run a zero-out, directly or through a nested instance. */
+function zeroOutSubgraphs(workflow) {
+    const definitions = Array.isArray(workflow?.definitions?.subgraphs) ? workflow.definitions.subgraphs.filter(object) : [];
+    const active = item => Array.isArray(item.nodes) ? item.nodes.filter(node => object(node) && ![MODE_MUTED, MODE_BYPASSED].includes(node.mode)) : [];
+    const found = new Set();
+    for (let changed = true; changed;) {
+        changed = false;
+        for (const item of definitions) {
+            if (found.has(item.id) || !active(item).some(node => node.type === ZERO_OUT || found.has(node.type))) continue;
+            found.add(item.id); changed = true;
+        }
+    }
+    return found;
+}
+
+/** 'zeroed', 'undecided' (do not fill), or null (the legacy fill applies). */
+function zeroOutNegative(source, workflow) {
+    if (!source || !object(source.graph) || !isLink(source.link)) return null;
+    const { graph } = source, subgraphs = zeroOutSubgraphs(workflow);
+    const zeroing = node => node.class_type === ZERO_OUT || subgraphs.has(node.class_type);
+    if (!Object.values(graph).some(node => object(node) && zeroing(node))) return null;
+    const node = graph[String(source.link[0])];
+    if (!object(node)) return 'undecided';
+    if (node.class_type === ZERO_OUT) return 'zeroed';
+    // One bounded walk upstream; an index pointer keeps it linear in the nodes visited.
+    const queue = [node], seen = new Set();
+    for (let index = 0; index < queue.length; index++) {
+        const current = queue[index];
+        if (zeroing(current) || seen.size >= MAX_NEGATIVE_VISITS) return 'undecided';
+        for (const value of object(current.inputs) ? Object.values(current.inputs) : []) {
+            const id = isLink(value) ? String(value[0]) : null;
+            if (id === null || seen.has(id) || !object(graph[id])) continue;
+            seen.add(id); queue.push(graph[id]);
+        }
+    }
+    return null;
 }
 
 function withWorkflowParams(record, parser = comfyMetadata()) {
@@ -182,14 +297,24 @@ function withWorkflowParams(record, parser = comfyMetadata()) {
     const found = key => typeof params[key] === 'string' || typeof params[key] === 'number' ?
         String(params[key]) !== '' && params[key] !== parser.PLACEHOLDERS?.[key] : false;
     const prompts = { ...record.prompts };
+    const read = prompts.negative?.status === 'resolved' || typeof parser.legacyNegativeSource !== 'function' ? null :
+        parser.legacyNegativeSource({ prompt: graph, workflow });
+    const zeroed = zeroOutNegative(read, workflow);
     for (const [role, key] of [['positive', 'positivePrompt'], ['negative', 'negativePrompt']]) {
         const current = prompts[role];
-        if (!found(key) || current?.status === 'resolved') continue;
+        if (current?.status === 'resolved') continue;
+        if (role === 'negative' && zeroed !== null) {
+            if (zeroed === 'zeroed') prompts.negative = { ...ZEROED_NEGATIVE };
+            continue;
+        }
+        if (!found(key)) continue;
         prompts[role] = { status: 'resolved', text: params[key], source: 'graph-inferred' };
     }
     record.prompts = prompts;
     for (const [field, key] of LEGACY_FACTS) {
         // Only open answers are filled: a known value or a definite "not recorded" stays.
+        // An ambiguous field (e.g. a compare grid's per-branch model) is filled too, on
+        // purpose: the legacy pages show this value, and this page never shows less.
         if (!found(key) || !['unresolved', 'ambiguous'].includes(record.generation[field]?.status)) continue;
         record.generation[field] = { status: 'known', value: String(params[key]), source: graph ? 'api-graph' : 'workflow', evidence: 'configuration', reason: null, sampler_id: null };
     }
@@ -207,20 +332,23 @@ export function toInspectionRecord(result, image, extractFacts = globalThis.Comf
     if (!legacy && result.inspection_version !== 1) throw new TypeError('Unsupported inspection version');
     if (!legacy && result.success !== true) throw new TypeError('Invalid inspection success status');
     if ((!legacy || result.image !== undefined) && (!object(result.image) || result.image.root_index !== image.root_index || result.image.path !== image.path || result.image.filename !== image.path.split('/').at(-1))) throw new TypeError('Mismatched inspection identity');
-    return projectInspectionPayload(result,
+    const record = projectInspectionPayload(result,
         { kind: 'rooted-file', key: imageKey(image), root_index: image.root_index, path: image.path, root_scope: scope },
         downloadFor(image, !legacy || scope !== null), extractFacts, legacy, parser);
+    record.preview = record.download ? previewFor(image) : null;
+    return record;
 }
 
 /** Shared bounded payload projection; adapters validate identity before entering here. */
 export function projectInspectionPayload(result, identity, download, extractFacts = globalThis.ComfyMetadata?.extractGenerationFacts || globalThis.window?.ComfyMetadata?.extractGenerationFacts, legacy = false, parser = comfyMetadata()) {
     const record = {
         identity, file: null, prompts: promptsFor(result.prompts), library: null, metadata: null,
-        generation: unavailableFacts(), historyTarget: null, download,
+        generation: unavailableFacts(), historyTarget: null, download, imageTags: null, preview: null,
     };
     if (legacy) return record;
+    record.imageTags = imageTagsFor(result.image_tags);
     const resolution = resolutionFor(result.resolution);
-    record.file = fileFor(result.file);
+    record.file = fileFor(result.file, identity);
     record.metadata = metadataFor(result.metadata);
     record.library = libraryFor(result.library);
     if (typeof extractFacts !== 'function') throw new TypeError('Inspection facts parser unavailable');
@@ -239,13 +367,16 @@ export const rootedFileAdapter = Object.freeze({
 export function createInspectionLoader(api, onChange, { extractFacts, adapter = rootedFileAdapter } = {}) {
     let request = null, disposed = false;
     return {
-        async load(image) {
+        /** `quiet`: publish only the answer, so the shown record stays until it lands (a re-read after a write). */
+        async load(image, { quiet = false } = {}) {
             if (disposed) return;
             request?.abort();
             const current = request = new AbortController();
-            onChange({ loading: true });
+            if (!quiet) onChange({ loading: true });
             try {
-                const result = await api.get(adapter.inspectionPath(image), { signal: current.signal });
+                // An adapter that reads by itself (a file chosen in this browser) never reaches the API.
+                const result = adapter.read ? await adapter.read(image, { signal: current.signal }) :
+                    await api.get(adapter.inspectionPath(image), { signal: current.signal });
                 if (disposed || request !== current) return;
                 const record = adapter.toRecord(result, image, extractFacts);
                 onChange({ prompts: record.prompts, record });
@@ -263,9 +394,16 @@ export function createInspectionLoader(api, onChange, { extractFacts, adapter = 
     };
 }
 
-const emptyState = () => ({ loading: false, error: false, record: null, prompts: undefined, message: '', refreshRequired: false, code: null, recovery: null });
+const emptyState = () => ({ loading: false, error: false, deferred: false, record: null, prompts: undefined, message: '', refreshRequired: false, code: null, recovery: null });
 
-export function createInspectionController({ api, extractFacts, adapter = rootedFileAdapter }) {
+/**
+ * One selection's inspection. #249 System S3 (Appearance): `autoLoad: false` ("Load metadata on selection" off) makes a
+ * selection publish `deferred` instead of reading, and `load()` reads it once on request; `cache: false` ("Cache
+ * metadata in this browser" off) re-reads the selected file when it is selected again, where the default reuses the one
+ * current record. A read in flight is shared either way, and a file whose source changed is never re-read by selecting
+ * it again (as `retry()` and `refresh()` refuse).
+ */
+export function createInspectionController({ api, extractFacts, adapter = rootedFileAdapter, autoLoad = true, cache = true }) {
     let state = Object.freeze(emptyState()), current = null, pending = null, disposed = false;
     let attempted, hasAttempt = false;
     const listeners = new Set();
@@ -276,8 +414,8 @@ export function createInspectionController({ api, extractFacts, adapter = rooted
     }
     const makeLoader = () => createInspectionLoader(api, publish, { extractFacts, adapter });
     let loader = makeLoader();
-    function read(image) {
-        pending = loader.load(image);
+    function read(image, options) {
+        pending = loader.load(image, options);
         return pending;
     }
     return {
@@ -288,18 +426,30 @@ export function createInspectionController({ api, extractFacts, adapter = rooted
             try {
                 adapter.validate(image);
                 const scope = adapter.scope(image), key = adapter.key(image), path = adapter.inspectionPath(image);
-                if (current?.key === key && current.scope === scope && current.path === path) return pending;
+                if (current?.key === key && current.scope === scope && current.path === path && (cache || state.loading || state.deferred || state.refreshRequired)) return pending;
                 selected = { key, scope, path };
             } catch {
                 // The loader publishes validation errors after invalidating the previous source.
             }
             loader.dispose(); loader = makeLoader(); current = selected;
             attempted = object(image) ? { ...image, ...(adapter !== rootedFileAdapter ? {occurrence:{...image.occurrence}, reference:{...image.reference}} : {}) } : image; hasAttempt = true;
+            if (!autoLoad && selected) { pending = null; publish({ deferred: true }); return undefined; }
+            return read(attempted);
+        },
+        /** Read a deferred selection (the inspector's "Load metadata"); a read already made or running is reused. */
+        load() {
+            if (disposed || !hasAttempt || !state.deferred) return pending ?? undefined;
             return read(attempted);
         },
         retry() {
             if (disposed || !hasAttempt || state.refreshRequired) return;
             return read(attempted);
+        },
+        /** Re-read the selected file keeping the shown record until the answer (a retry when none is shown). */
+        refresh() {
+            // A deferred selection loads only through `load()` (the user's "Load metadata").
+            if (disposed || !hasAttempt || state.refreshRequired || state.deferred) return;
+            return read(attempted, { quiet: Boolean(state.record) && !state.loading && !state.error });
         },
         clear() {
             if (disposed) return;

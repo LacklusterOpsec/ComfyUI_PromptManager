@@ -5,12 +5,16 @@ stream the upload to disk, reject anything that is not a healthy prompts
 database and leave the live database untouched when it does.
 """
 
+import asyncio
 import glob
+import hashlib
 import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 _mock_server = MagicMock()
@@ -34,6 +38,13 @@ from py.api import PromptManagerAPI, _public_path
 from utils.hashing import generate_prompt_hash
 
 
+def _is_upload(path):
+    """Not the safety backup's temp copy (database/safety_backup.py)."""
+    from database.safety_backup import SAFETY_TEMP_PREFIX
+
+    return not os.path.basename(path).startswith(SAFETY_TEMP_PREFIX)
+
+
 def _texts(path):
     conn = sqlite3.connect(path)
     try:
@@ -43,11 +54,13 @@ def _texts(path):
 
 
 class BackupRestoreTestCase(AioHTTPTestCase):
+    app_options = {}
+
     async def get_application(self):
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "prompts.db")
 
-        app = web.Application()
+        app = web.Application(**self.app_options)
         routes = web.RouteTableDef()
         self.api = PromptManagerAPI(db=PromptDatabase(self.db_path))
         self.api.add_routes(routes)
@@ -56,6 +69,8 @@ class BackupRestoreTestCase(AioHTTPTestCase):
 
     async def tearDownAsync(self):
         await super().tearDownAsync()  # closes the aiohttp test client
+        # The automatic preview worker writes into the temp tree: stop it first.
+        self.api.close_auto_thumbnails()
         PromptModel.close_all_instances()  # restore may have swapped api.db
         assert_closed(self, self.tmpdir)
         for name in os.listdir(self.tmpdir):
@@ -106,7 +121,7 @@ class TestBackupRoute(BackupRestoreTestCase):
             created.append(result[1])
             return result
 
-        with patch("py.api.admin.tempfile.mkstemp", spy_mkstemp):
+        with patch("tempfile.mkstemp", spy_mkstemp):
             resp = await self.client.get("/prompt_manager/backup")
 
         self.assertEqual(resp.status, 200)
@@ -117,6 +132,10 @@ class TestBackupRoute(BackupRestoreTestCase):
         self.assertTrue(disposition.rstrip('"').endswith(".db"))
 
         body = await resp.read()
+        # The handler removes its temp file after the last byte is sent,
+        # which can be just after the client holds it: wait on that state.
+        while self.api._jobs.active("backup") is not None or os.path.exists(created[0]):
+            await asyncio.sleep(0)
         downloaded = self._write("downloaded.db", body)
         self.assertEqual(
             _texts(downloaded), ["backup me 0", "backup me 1", "backup me 2"]
@@ -140,6 +159,85 @@ class TestBackupRoute(BackupRestoreTestCase):
         data = await resp.json()
         self.assertFalse(data["success"])
         self.assertIn("backup", data["error"].lower())
+
+
+class TestRestoreHoldsTheRegistry(BackupRestoreTestCase):
+    """A legacy restore and a workspace job refuse each other (#269 gap)."""
+
+    def _digest(self):
+        return {
+            suffix: hashlib.sha256(Path(self.db_path + suffix).read_bytes()).hexdigest()
+            for suffix in ("", "-wal")
+            if os.path.exists(self.db_path + suffix)
+        }
+
+    async def test_legacy_restore_refused_while_scan_job_runs(self):
+        self._save("keep me")
+        upload = self._make_db_file(["restored"])
+        gate = asyncio.Event()
+
+        async def runner(job):
+            await gate.wait()
+
+        scan = self.api._jobs.start(
+            "scan", "Scan for metadata", record_changing=True, scope={}, runner=runner
+        )
+        before = self._digest()
+        try:
+            resp = await self._restore(upload)
+            self.assertEqual(resp.status, 409)
+            self.assertEqual(
+                await resp.json(),
+                {"success": False, "error": "Scan for metadata already running"},
+            )
+            self.assertEqual(self._digest(), before)
+            self.assertEqual(
+                [p["text"] for p in self.api.db.search_prompts()], ["keep me"]
+            )
+            self.assertEqual(glob.glob(self.db_path + ".backup_*"), [])
+        finally:
+            gate.set()
+            await asyncio.wait_for(scan.task, 5)
+
+    async def test_scan_refused_while_legacy_restore_holds(self):
+        upload = self._make_db_file(["restored"])
+        entered = threading.Event()
+        release = threading.Event()
+        model = self.api.db.model
+        real_verify = model.verify_database_file
+
+        def gated(path, **kwargs):
+            entered.set()
+            release.wait(10)
+            return real_verify(path, **kwargs)
+
+        loop = asyncio.get_running_loop()
+        with patch.object(model, "verify_database_file", gated):
+            restore = asyncio.ensure_future(self._restore(upload))
+            self.assertTrue(await loop.run_in_executor(None, entered.wait, 10))
+            resp = await self.client.post("/prompt_manager/jobs/scan")
+            body = await resp.json()
+            listed = (await (await self.client.get("/prompt_manager/jobs")).json())[
+                "jobs"
+            ]
+            release.set()
+            restored = await restore
+
+        self.assertEqual((resp.status, body["code"]), (409, "busy"))
+        self.assertEqual(body["running"]["title"], "Database restore (admin page)")
+        self.assertEqual(
+            [(j["kind"], j["state"], j["cancellable"]) for j in listed],
+            [("restore", "running", False)],
+        )
+        self.assertEqual(restored.status, 200)
+        self.assertEqual(self.api._jobs.list()[0].state, "finished")
+        self.assertIsNone(self.api._jobs.active("restore"))
+
+    async def test_rejected_upload_ends_its_hold_failed(self):
+        resp = await self._restore(self._write("notes.txt", b"not a database"))
+        self.assertEqual(resp.status, 400)
+        job = self.api._jobs.list()[0]
+        self.assertEqual((job.kind, job.state), ("restore", "failed"))
 
 
 class TestRestoreRoute(BackupRestoreTestCase):
@@ -166,6 +264,41 @@ class TestRestoreRoute(BackupRestoreTestCase):
         texts = sorted(p["text"] for p in self.api.db.search_prompts())
         self.assertEqual(texts, ["restored a", "restored b"])
 
+    async def test_restore_round_trip_keeps_tags_and_image_links(self):
+        """A downloaded backup brings back every prompt with its tags and images.
+
+        The legacy admin page's Restore form left for System (#330); this keeps
+        its browser test's data check at the route.
+        """
+        db = self.api.db
+        originals = {}
+        for text, tags, image in (
+            ("round trip cat", ["cats", "pets"], "cat.png"),
+            ("round trip dog", ["dogs"], "dog.png"),
+        ):
+            prompt_id = db.save_prompt(
+                text=text, tags=tags, prompt_hash=generate_prompt_hash(text)
+            )
+            path = self._write(image, b"\x89PNG\r\n\x1a\n")
+            self.assertTrue(db.link_image_to_prompt(str(prompt_id), path))
+            originals[text] = (prompt_id, sorted(tags), [path])
+
+        resp = await self.client.get("/prompt_manager/backup")
+        self.assertEqual(resp.status, 200)
+        backup = self._write("downloaded.db", await resp.read())
+        self.assertTrue(db.delete_prompt(originals["round trip dog"][0]))
+
+        resp = await self._restore(backup)
+        self.assertEqual(resp.status, 200, await resp.text())
+
+        restored = {p["text"]: p for p in self.api.db.search_prompts()}
+        self.assertEqual(sorted(restored), sorted(originals))
+        for text, (prompt_id, tags, paths) in originals.items():
+            self.assertEqual(restored[text]["id"], prompt_id)
+            self.assertEqual(sorted(restored[text]["tags"]), tags)
+            images = self.api.db.get_prompt_images(str(prompt_id))
+            self.assertEqual([image["image_path"] for image in images], paths)
+
     async def test_restore_leaves_no_temp_files_behind(self):
         upload = self._make_db_file(["restored"])
         created = []
@@ -176,13 +309,18 @@ class TestRestoreRoute(BackupRestoreTestCase):
             created.append(result[1])
             return result
 
-        with patch("py.api.admin.tempfile.mkstemp", spy_mkstemp):
+        with patch("tempfile.mkstemp", spy_mkstemp):
             resp = await self._restore(upload)
 
         self.assertEqual(resp.status, 200)
-        self.assertEqual(len(created), 1)
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            self.assertFalse(os.path.exists(created[0] + suffix))
+        # One upload, in the library's folder; it and the safety backup's
+        # temp copy are gone afterwards.
+        uploads = [p for p in created if _is_upload(p)]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(os.path.dirname(uploads[0]), self.tmpdir)
+        for path in created:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                self.assertFalse(os.path.exists(path + suffix))
 
     async def test_text_file_is_rejected_and_database_untouched(self):
         self._save("keep me")
@@ -244,6 +382,15 @@ class TestRestoreRoute(BackupRestoreTestCase):
         self.assertIn("too large", data["error"].lower())
         self.assertEqual([p["text"] for p in self.api.db.search_prompts()], ["keep me"])
 
+    async def test_restore_cap_keeps_the_legacy_shape(self):
+        self.api.restore_max_bytes = 1024
+        upload = self._write("big.db", b"SQLite format 3\x00" + b"\x00" * 8192)
+        resp = await self._restore(upload)
+        data = await resp.json()
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(data["code"], "too-large")
+        self.assertNotIn(self.tmpdir, data["error"])
+
     async def test_non_multipart_request_is_rejected(self):
         resp = await self.client.post("/prompt_manager/restore", data=b"raw bytes")
         self.assertIn(resp.status, (400, 500))
@@ -253,3 +400,132 @@ class TestRestoreRoute(BackupRestoreTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+MIB = 2**20
+
+
+class TestLargeRestores(BackupRestoreTestCase):
+    """A real library's backup restores: room on disk decides, not 100 MB."""
+
+    # As ComfyUI builds its app: client_max_size is --max-upload-size (100
+    # MB by default). The restore streams with read_chunk, which it does not
+    # cap.
+    app_options = {"client_max_size": 100 * 2**20}
+
+    def _large_db_file(self, texts, pad_bytes):
+        path = self._make_db_file(texts, name="large.db")
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("CREATE TABLE padding(b BLOB)")
+            conn.execute("INSERT INTO padding VALUES (zeroblob(?))", (pad_bytes,))
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    async def _stream_restore(self, path, chunked=False):
+        with open(path, "rb") as fh:
+            data = fh.read()
+        form = aiohttp.FormData()
+        form.add_field(
+            "database_file",
+            data,
+            filename=os.path.basename(path),
+            content_type="application/octet-stream",
+        )
+        # chunked=False must not be passed: aiohttp 3.14 then frames the body
+        # as chunked while also sending a Content-Length.
+        options = {"chunked": True} if chunked else {}
+        return await self.client.post("/prompt_manager/restore", data=form, **options)
+
+    def _spy_uploads(self):
+        """Patch the upload's mkstemp; the list collects each temp path made."""
+        created = []
+        real_mkstemp = tempfile.mkstemp
+
+        def spy(*args, **kwargs):
+            result = real_mkstemp(*args, **kwargs)
+            created.append(result[1])
+            return result
+
+        return patch("tempfile.mkstemp", spy), created
+
+    def _assert_removed(self, created):
+        for path in created:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                self.assertFalse(os.path.exists(path + suffix), path + suffix)
+
+    async def test_a_150_mb_backup_restores(self):
+        self._save("before")
+        upload = self._large_db_file(["restored"], 150 * MIB)
+        self.assertGreater(os.path.getsize(upload), 150 * MIB)
+        spy, created = self._spy_uploads()
+        with spy:
+            resp = await self._stream_restore(upload)
+        data = await resp.json()
+        self.assertEqual(resp.status, 200, data)
+        self.assertEqual(
+            [p["text"] for p in self.api.db.search_prompts()], ["restored"]
+        )
+        self.assertEqual(len([p for p in created if _is_upload(p)]), 1)
+        self._assert_removed(created)
+
+    async def test_a_short_disk_is_refused_up_front(self):
+        from py.api import maintenance
+
+        self._save("keep me")
+        upload = self._make_db_file(["restored"])
+        spy, created = self._spy_uploads()
+        with spy, patch.object(maintenance, "_free_bytes", return_value=MIB):
+            resp = await self._restore(upload)
+        data = await resp.json()
+        self.assertEqual(resp.status, 507)
+        self.assertEqual(data["code"], "insufficient-space")
+        self.assertTrue(
+            data["error"].startswith("Not enough free disk space to restore a "),
+            data["error"],
+        )
+        self.assertTrue(data["error"].endswith("Nothing was changed."))
+        self.assertNotIn(self.tmpdir, data["error"])
+        self.assertNotIn(tempfile.gettempdir(), data["error"])
+        self.assertEqual([p["text"] for p in self.api.db.search_prompts()], ["keep me"])
+        self.assertEqual(created, [])  # refused before anything was written
+
+    async def test_a_short_disk_is_refused_while_streaming_without_a_length(self):
+        from py.api import maintenance
+
+        self._save("keep me")
+        upload = self._large_db_file(["restored"], 4 * MIB)
+        spy, created = self._spy_uploads()
+        # Room for 1 MiB only, and no Content-Length to refuse up front.
+        with spy, patch.object(maintenance, "restore_room", return_value=MIB):
+            resp = await self._stream_restore(upload, chunked=True)
+        data = await resp.json()
+        self.assertEqual(resp.status, 507)
+        self.assertEqual(data["code"], "insufficient-space")
+        self.assertTrue(data["error"].endswith("Nothing was changed."))
+        self.assertEqual([p["text"] for p in self.api.db.search_prompts()], ["keep me"])
+        self.assertEqual(len([p for p in created if _is_upload(p)]), 1)
+        self._assert_removed(created)
+
+
+class TestRestoreRoom(unittest.TestCase):
+    def test_room_counts_the_upload_its_staged_copy_and_the_swap(self):
+        from py.api import maintenance
+
+        tmp = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmp, "prompts.db")
+            free = 10 * 2**30
+            with (
+                patch.object(maintenance, "_free_bytes", return_value=free),
+                patch.object(maintenance, "_device", return_value="one disk"),
+            ):
+                room = maintenance.restore_room(db_path)
+            # Upload + staged copy + WAL growth on one disk, no database yet.
+            self.assertEqual(room, (free - maintenance.DISK_MARGIN_BYTES) // 3)
+            self.assertEqual(maintenance.size_label(int(1.6 * 2**30)), "1.6 GB")
+            self.assertEqual(maintenance.size_label(120 * 2**20), "120.0 MB")
+        finally:
+            os.rmdir(tmp)

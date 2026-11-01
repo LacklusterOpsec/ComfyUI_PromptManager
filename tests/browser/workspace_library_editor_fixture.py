@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shutil
 from typing import TYPE_CHECKING
 
 from aiohttp import web
 from PIL import Image
+from tests.browser.folder_trash import replace_folder
 
 if TYPE_CHECKING:
     from py.api import PromptManagerAPI
@@ -26,7 +26,16 @@ EDITOR_METADATA = {
     "notes": "Keep the soft light.",
 }
 _TABLES = (
+    "image_collection_items",
+    "image_collections",
+    "saved_views",
     "image_favorites",
+    "media_review_decisions",
+    "media_review_items",
+    "media_image_tags",
+    "media_annotation_bytes",
+    "media_annotation_files",
+    "image_categories",
     "image_prompt_pairs",
     "prompt_pair_tags",
     "prompt_pairs",
@@ -45,8 +54,7 @@ def seed_library_editor(api: PromptManagerAPI, root: Path) -> dict:
         for table in _TABLES:
             conn.execute(f"DELETE FROM {table}")
     for name in ("output", "input"):
-        shutil.rmtree(root / name)
-        (root / name).mkdir()
+        replace_folder(root / name)
     epoch = db.get_execution_epoch()
     receipt = db.create_library_recipe(
         EDITOR_POSITIVE,

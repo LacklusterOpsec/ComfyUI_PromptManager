@@ -1,4 +1,10 @@
-"""Read prompt evidence without inference, indexing, or decoding image pixels."""
+"""Read prompt evidence without inference, indexing, or decoding image pixels.
+
+``inspection_resolution`` is the inspector's resolve (inspection profile, then
+the recorded saver anchor, #386). Ingestion (the output scan, through
+``utils.file_prompt``) calls it too, only for files the default profile
+cannot decide (#247), so the inspector and ingestion cannot drift.
+"""
 
 import hashlib
 import io
@@ -10,6 +16,7 @@ import threading
 import zlib
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from PIL import Image
@@ -20,10 +27,19 @@ from .prompt_pair_resolver import (
     _FOOTER,
     EMPTY_POSITIVE_REASON,
     INSPECTION_PROFILE,
+    MALFORMED_EVIDENCE_REASON,
     ResolverProfile,
     resolve_prompt_pair,
 )
-from .video_metadata import ffprobe_path, is_video_path
+from .video_metadata import (
+    ENVELOPE_TAG_KEYS,
+    ROLE_TAG_KEYS,
+    VIDEO_TAG_KEYS,
+    DuplicateVideoTagError,
+    ffprobe_path,
+    is_video_path,
+    select_video_carrier,
+)
 
 # Role records (prompt, parameters, the pair execution record) share one
 # budget, encoded and decoded: roles cannot be trusted from a partial record,
@@ -36,7 +52,18 @@ WORKFLOW_METADATA_BYTES = 4 * 1024 * 1024
 # repeated chunks cost bounded I/O instead of file size.
 DUPLICATE_WORKFLOW_BYTES = 2 * WORKFLOW_METADATA_BYTES
 DUPLICATE_ROLE_BYTES = 2 * ROLE_METADATA_BYTES
-MAX_METADATA_BYTES = ROLE_METADATA_BYTES  # video stdout bound, unchanged here
+# ffprobe stdout bounds. ffprobe JSON-escapes tag text (at most doubling it),
+# and the decoded per-record budgets below are the only gate that may make a
+# record fail or ``limited``: a video must read exactly as the identical PNG.
+# So the first probe allows twice the role and workflow budgets plus 64 KiB of
+# JSON envelope; past that only the per-key ``workflow`` tag can be dropped,
+# and the re-probe asks for role and envelope tags within twice the role
+# budget (an envelope cannot be split, so an over-budget one fails the read).
+MAX_METADATA_BYTES = ROLE_METADATA_BYTES
+VIDEO_PROBE_BYTES = 2 * (ROLE_METADATA_BYTES + WORKFLOW_METADATA_BYTES) + 64 * 1024
+VIDEO_REPROBE_BYTES = 2 * ROLE_METADATA_BYTES + 64 * 1024
+VIDEO_PROBE_SECONDS = 3
+_VIDEO_ROLE_PROBE_KEYS = ROLE_TAG_KEYS + ENVELOPE_TAG_KEYS
 MAX_KEYWORD_BYTES = 80  # a 1-79 byte PNG keyword plus its NUL separator
 MAX_HEADER_BYTES = 8 * 1024 * 1024
 MAX_PNG_CHUNKS = 10_000
@@ -86,6 +113,7 @@ class _VideoInspection:
     metadata: dict[str, str | None]
     record_formats: dict[str, str]
     carrier_text: str | None
+    limited: frozenset[str] = dataclass_field(default_factory=frozenset)
 
 
 def _inflate(data: bytes, limit: int) -> bytes | None:
@@ -274,16 +302,16 @@ def _png_metadata(stream: Any, size: int) -> tuple[dict, frozenset, int, int]:
     raise MetadataReadError("PNG chunk count exceeds inspection limits")
 
 
-def _video_metadata(path: Path) -> _VideoInspection:
-    probe = ffprobe_path()
-    if not probe:
-        raise MetadataReadError("Video metadata reader is unavailable")
+def _probe_video_tags(
+    probe: str, path: Path, keys: tuple[str, ...], limit: int
+) -> bytes | None:
+    """ffprobe's JSON for the container tags ``keys``; ``None`` past ``limit``."""
     command = [
         probe,
         "-v",
         "quiet",
         "-show_entries",
-        "format_tags=comment,description",
+        "format_tags=" + ",".join(keys),
         "-of",
         "json",
         str(path),
@@ -303,13 +331,13 @@ def _video_metadata(path: Path) -> _VideoInspection:
                 # Timeout and final cleanup can race with the process exiting.
                 pass
 
-    timer = threading.Timer(3, stop)
+    timer = threading.Timer(VIDEO_PROBE_SECONDS, stop)
     timer.daemon = True
     timer.start()
     try:
-        raw = process.stdout.read(MAX_METADATA_BYTES + 1)
-        if len(raw) > MAX_METADATA_BYTES:
-            raise MetadataReadError("Video metadata exceeds inspection limits")
+        raw = process.stdout.read(limit + 1)
+        if len(raw) > limit:
+            return None
         process.wait()
         if process.returncode:
             raise MetadataReadError("Video metadata could not be read")
@@ -318,49 +346,45 @@ def _video_metadata(path: Path) -> _VideoInspection:
         stop()
         process.wait()
         process.stdout.close()
+    return raw
+
+
+def _video_metadata(path: Path) -> _VideoInspection:
+    probe = ffprobe_path()
+    if not probe:
+        raise MetadataReadError("Video metadata reader is unavailable")
+    limited = frozenset()
+    raw = _probe_video_tags(probe, path, VIDEO_TAG_KEYS, VIDEO_PROBE_BYTES)
+    if raw is None:
+        raw = _probe_video_tags(
+            probe, path, _VIDEO_ROLE_PROBE_KEYS, VIDEO_REPROBE_BYTES
+        )
+        if raw is None:
+            raise MetadataReadError("Video metadata exceeds inspection limits")
+        # Only the per-key workflow tag was left out, so it is the record over
+        # budget: limited when the per-key carrier (or no carrier) is selected.
+        limited = frozenset({"workflow"})
     probed = json.loads(raw)
     if not isinstance(probed, dict) or not isinstance(probed.get("format"), dict):
         raise MetadataReadError("Malformed video metadata")
     tags = probed["format"].get("tags", {})
     if not isinstance(tags, dict):
         raise MetadataReadError("Malformed video metadata")
-    # The scan normalizer drops null fields and unknown keys. Inspection must
-    # retain explicit prompt/execution markers so malformed evidence cannot
-    # silently fall back to an unrelated saved recipe or another comment.
-    candidates = []
-    for key in ("comment", "description"):
-        raw = tags.get(key)
-        if not isinstance(raw, str):
-            continue
-        try:
-            envelope = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(envelope, dict):
-            continue
-        candidates.append((raw, envelope))
-    selected = next(
-        (item for item in candidates if _ROLE_METADATA_KEYS.intersection(item[1])),
-        None,
-    )
+    # The shared selector keeps explicit null role markers so malformed
+    # evidence cannot silently fall back to an unrelated saved recipe or
+    # another carrier; ``read_inspection_file`` refuses them.
+    try:
+        selected = select_video_carrier(tags)
+    except DuplicateVideoTagError:
+        raise MetadataReadError("Duplicate prompt metadata") from None
     if selected is None:
-        selected = next((item for item in candidates if "workflow" in item[1]), None)
-    if selected is not None:
-        raw, envelope = selected
-        metadata, formats = {}, {}
-        for field in _METADATA_KEYS.intersection(envelope):
-            value = envelope[field]
-            if field == "workflow" and not isinstance(value, (str, dict)):
-                formats[field] = "invalid"
-                continue
-            metadata[field] = (
-                value if value is None or isinstance(value, str) else json.dumps(value)
-            )
-            formats[field] = (
-                "original-text" if isinstance(value, str) else "reserialized-json"
-            )
-        return _VideoInspection(metadata, formats, raw)
-    return _VideoInspection({}, {}, None)
+        return _VideoInspection({}, {}, None, limited)
+    metadata, formats, carrier = selected
+    if carrier is not None:
+        # An envelope carrier is whole; the dropped per-key workflow belonged
+        # to the carrier that lost.
+        limited = frozenset()
+    return _VideoInspection(metadata, formats, carrier, limited)
 
 
 def read_inspection_file(path: Path) -> InspectionRead:
@@ -370,10 +394,11 @@ def read_inspection_file(path: Path) -> InspectionRead:
         format_name = width = height = None
         if is_video_path(path):
             video = _video_metadata(path)
-            metadata, formats, carrier = (
+            metadata, formats, carrier, limited = (
                 video.metadata,
                 video.record_formats,
                 video.carrier_text,
+                video.limited,
             )
         else:
             with path.open("rb") as stream:
@@ -441,6 +466,14 @@ def read_inspection_file(path: Path) -> InspectionRead:
 def read_inspection_metadata(path: Path) -> dict[str, str]:
     """Compatible metadata-only projection of the single inspection read."""
     return read_inspection_file(path).metadata
+
+
+# A side whose branch recorded run history named (#386): the save node that
+# wrote the file picked the sampler; the text is still that branch's graph walk.
+RECORDED_RUN_SOURCE = "recorded-run"
+RECORDED_TEXT_REASON = "PromptManager recorded this text when the run executed"
+# Outcomes the file alone leaves open; only these ask recorded history.
+_UNDECIDED = frozenset({"ambiguous", "unresolved"})
 
 
 def _side(status: str, text: str | None = None, source: str | None = None) -> dict:
@@ -511,61 +544,101 @@ def _parsed_workflow(value: Any) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def inspect_prompt_evidence(
-    metadata: dict,
-    saved: dict | None = None,
-    *,
-    profile: ResolverProfile = INSPECTION_PROFILE,
-) -> dict:
-    """Keep uncertainty visible; a saved association never replaces file evidence.
+def _recorded_execution(resolved: dict, texts: Mapping) -> dict | None:
+    """Evidence from the texts recorded at one sampler of the file's run (#386).
 
-    Inspection routes resolve with ``INSPECTION_PROFILE``: bounded work, not
-    graph size. Ingestion (scan, live monitor, admin import) calls the resolver
-    directly with its default profile. ``resolution`` carries the closed
-    ``reason_code`` and, for a blocking node, ``node: {id, class_type}``.
+    Only for an outcome that names one sampler (a single stage stopped at a
+    run-time value, such as a language model's output feeding PromptManager)
+    and only when that sampler's positive text was recorded and is not empty.
     """
-    workflow = metadata.get("workflow")
-    metadata = {
-        key: value for key, value in metadata.items() if key in _ROLE_METADATA_KEYS
+    sampler = resolved.get("sampler_id")
+    roles = texts.get(sampler) if isinstance(sampler, str) else None
+    if not isinstance(roles, Mapping):
+        return None
+    positive = roles.get("positive")
+    if not isinstance(positive, str) or not positive.strip():
+        return None
+    negative = roles.get("negative")
+    prompts = {
+        "positive": _side("resolved", positive, "execution"),
+        "negative": (
+            _side("resolved", negative, "execution")
+            if isinstance(negative, str)
+            else _side("unresolved")
+        ),
     }
     resolution = {
-        "state": "unresolved",
-        "sampler_id": None,
-        "reason": "Prompt evidence is malformed",
-        "reason_code": "malformed",
+        "state": "resolved",
+        "sampler_id": sampler,
+        "reason": RECORDED_TEXT_REASON,
+        "reason_code": None,
         "node": None,
     }
-    if not metadata:
-        result = {role: _side("absent") for role in ("positive", "negative")}
-        if saved:
-            context = saved.get("pair_context")
-            paired = isinstance(saved.get("pair"), dict) or isinstance(context, dict)
-            for role in ("positive", "negative") if paired else ("positive",):
-                result[role] = {
-                    **_side("unresolved", source="saved-association"),
-                    "message": (
-                        "A saved library association exists, but it cannot be "
-                        "verified against this file."
-                    ),
-                }
-        return {
-            "prompts": result,
-            "resolution": {
-                "state": "absent",
-                "sampler_id": None,
-                "reason": "No parsed prompt metadata",
-                "reason_code": None,
-                "node": None,
-            },
-        }
-    canonical = dict(metadata)
-    malformed = {
-        "prompts": _explained(
-            {role: _side("unresolved") for role in ("positive", "negative")},
-            resolution,
-        ),
-        "resolution": resolution,
+    return {"prompts": prompts, "resolution": resolution}
+
+
+_ABSENT_RESOLUTION = {
+    "state": "absent",
+    "sampler_id": None,
+    "reason": "No parsed prompt metadata",
+    "reason_code": None,
+    "node": None,
+}
+_MALFORMED_RESOLUTION = {
+    "state": "unresolved",
+    "sampler_id": None,
+    "reason": MALFORMED_EVIDENCE_REASON,
+    "reason_code": "malformed",
+    "node": None,
+}
+
+
+@dataclass(frozen=True)
+class InspectionResult:
+    """The inspector's resolution of one file's metadata (#386, #247).
+
+    ``resolution`` is the result to use. ``anchored`` is the result anchored
+    on the recorded saver, kept or not (None when no anchored resolve ran).
+    ``by_record`` says the anchored result was kept: history's saver chose
+    the samplers and the result names the positive. ``malformed`` marks
+    metadata the inspector cannot read as a graph.
+    """
+
+    resolution: dict
+    anchored: dict | None = None
+    by_record: bool = False
+    malformed: bool = False
+
+
+def inspection_resolution(
+    metadata: Mapping,
+    file_name: str | None,
+    recorded_saver_id: str | None,
+    *,
+    profile: ResolverProfile = INSPECTION_PROFILE,
+    name_anchor: bool = True,
+) -> InspectionResult:
+    """Resolve raw file metadata as the inspector does.
+
+    Keeps only the role records, parses a string ``prompt`` and attaches the
+    parsed ``workflow`` only when the graph may hold a PromptManager node.
+    Resolves with ``profile``; when that leaves the prompt open and
+    ``recorded_saver_id`` is given, resolves again anchored on that saver
+    and keeps the anchored result only when it names the positive.
+
+    ``name_anchor=False`` (ingestion, #247) resolves the unanchored pass
+    without ``file_name``, so the saver its file name names anchors nothing:
+    such a file goes to Needs review, never linked (#390 ruling). The
+    recorded-saver pass still gets ``file_name``, only to refuse a saver the
+    name contradicts.
+    """
+    workflow = metadata.get("workflow")
+    canonical = {
+        key: value for key, value in metadata.items() if key in _ROLE_METADATA_KEYS
     }
+    if not canonical:
+        return InspectionResult(dict(_ABSENT_RESOLUTION))
+    malformed = InspectionResult(dict(_MALFORMED_RESOLUTION), malformed=True)
     if "prompt" not in canonical and "parameters" not in canonical:
         return malformed
     if isinstance(canonical.get("prompt"), str):
@@ -579,7 +652,92 @@ def inspect_prompt_evidence(
     if workflow is not None and "prompt" in canonical:
         # Only to recognize overwritten PromptManager text (R1); never a role.
         canonical["workflow"] = workflow
-    resolved = resolve_prompt_pair(canonical, profile=profile)
+    resolved = resolve_prompt_pair(
+        canonical, profile=profile, file_name=file_name if name_anchor else None
+    )
+    if resolved["state"] not in _UNDECIDED or recorded_saver_id is None:
+        return InspectionResult(resolved)
+    anchored = resolve_prompt_pair(
+        canonical,
+        profile=profile,
+        file_name=file_name,
+        recorded_saver_id=recorded_saver_id,
+    )
+    # Only a result whose samplers history's saver chose is about this file.
+    if (
+        anchored.get("recorded_anchor") is True
+        and anchored["state"] not in _UNDECIDED
+        and isinstance(anchored["positive"], dict)
+    ):
+        return InspectionResult(anchored, anchored, True)
+    return InspectionResult(resolved, anchored)
+
+
+def inspect_prompt_evidence(
+    metadata: dict,
+    saved: dict | None = None,
+    *,
+    profile: ResolverProfile = INSPECTION_PROFILE,
+    file_name: str | None = None,
+    recorded_saver_id: str | None = None,
+    recorded_texts: Mapping[str, Mapping[str, str | None]] | None = None,
+) -> dict:
+    """Keep uncertainty visible; a saved association never replaces file evidence.
+
+    ``recorded_saver_id`` is the save node recorded run history says wrote the
+    file (#386). It is asked only when the file alone leaves the prompt open
+    (ambiguous or unresolved), and the anchored result is kept only when it
+    names the positive (resolved, or a guider with no negative); its
+    graph-inferred sides are then labelled ``recorded-run``. ``recorded_texts``
+    (sampler id to the effective texts PromptManager recorded at execution in
+    that run) is used last: when the prompt is still open at one named sampler
+    whose positive text was recorded, the recorded texts are shown as
+    ``execution``.
+
+    Inspection routes resolve with ``INSPECTION_PROFILE``: bounded work, not
+    graph size. The resolve itself is ``inspection_resolution``, which
+    ingestion also calls for files its default profile cannot decide (#247).
+    ``resolution`` carries the closed ``reason_code`` and, for a blocking
+    node, ``node: {id, class_type}``.
+    """
+    roles = {key for key in metadata if key in _ROLE_METADATA_KEYS}
+    if not roles:
+        result = {role: _side("absent") for role in ("positive", "negative")}
+        if saved:
+            context = saved.get("pair_context")
+            paired = isinstance(saved.get("pair"), dict) or isinstance(context, dict)
+            for role in ("positive", "negative") if paired else ("positive",):
+                result[role] = {
+                    **_side("unresolved", source="saved-association"),
+                    "message": (
+                        "A saved library association exists, but it cannot be "
+                        "verified against this file."
+                    ),
+                }
+        return {"prompts": result, "resolution": dict(_ABSENT_RESOLUTION)}
+    inspected = inspection_resolution(
+        metadata, file_name, recorded_saver_id, profile=profile
+    )
+    if inspected.malformed:
+        resolution = inspected.resolution
+        return {
+            "prompts": _explained(
+                {role: _side("unresolved") for role in ("positive", "negative")},
+                resolution,
+            ),
+            "resolution": resolution,
+        }
+    resolved, recorded = inspected.resolution, inspected.by_record
+    anchored = inspected.anchored
+    if (
+        not recorded
+        and recorded_texts
+        and anchored is not None
+        and anchored.get("recorded_anchor") is True
+    ):
+        executed = _recorded_execution(anchored, recorded_texts)
+        if executed is not None:
+            return executed
     state = resolved["state"]
     result = {}
     for role in ("positive", "negative"):
@@ -589,9 +747,10 @@ def inspect_prompt_evidence(
             and isinstance(side, dict)
             and (role == "negative" or side["text"].strip())
         ):
-            result[role] = _side(
-                "resolved", side["text"], side["provenance"]["text_source"]
-            )
+            source = side["provenance"]["text_source"]
+            if recorded and source == "graph-inferred":
+                source = RECORDED_RUN_SOURCE
+            result[role] = _side("resolved", side["text"], source)
         elif state == "resolved" and isinstance(side, dict):
             # A resolved pair withholds only an empty positive.
             result[role] = {**_side("unresolved"), "message": _EMPTY_POSITIVE}

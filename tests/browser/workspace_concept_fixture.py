@@ -11,11 +11,11 @@ the same sidebar counts (24 images, 6 prompts, 15 tags). Nothing is mocked.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import datetime
 import json
 import math
 import os
 from pathlib import Path
-import shutil
 import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -33,6 +33,7 @@ from utils.execution_contexts import (
 from utils.execution_history_events import make_finish, make_start
 from utils.execution_outputs import OutputBundle, OutputReference, snapshot_output_roots
 from utils.pair_execution import EXECUTION_KEY
+from tests.browser.folder_trash import replace_folder
 
 if TYPE_CHECKING:
     from py.api import PromptManagerAPI
@@ -157,7 +158,12 @@ CONCEPT_MODEL = "illustrative-model.safetensors"
 MAX_EXTRA_IMAGES = 120
 # Unlinked, seedless images (D11 "W × H · PNG") newer than the concept's, for D3 checks.
 MAX_SEEDLESS_IMAGES = 2
+# A test's chosen "now" (epoch seconds) stays before the year 3000.
+MAX_EPOCH_SECONDS = 32_503_680_000
 SEEDLESS_SIZE = (1536, 1152)
+# The same 4:3 shape with a short "96 × 72 · PNG" subtitle that stays on one line at
+# 390px beside the card's Info and Tag (the D3 footer check).
+SHORT_SEEDLESS_SIZE = (96, 72)
 SESSION = "5c1f9a7e-3f0b-4a55-9d0e-2b8c4f6a7d10"
 _TABLES = (
     "execution_run_outputs",
@@ -168,7 +174,16 @@ _TABLES = (
     "execution_contexts",
     "execution_prompt_snapshots",
     "execution_context_texts",
+    "image_collection_items",
+    "image_collections",
+    "saved_views",
     "image_favorites",
+    "media_review_decisions",
+    "media_review_items",
+    "media_image_tags",
+    "media_annotation_bytes",
+    "media_annotation_files",
+    "image_categories",
     "image_prompt_pairs",
     "prompt_pair_tags",
     "prompt_pairs",
@@ -178,6 +193,10 @@ _TABLES = (
     "prompt_library_state",
     "prompts",
 )
+
+
+# The concept's collections and the slice of its images each holds (#331).
+CONCEPT_COLLECTIONS = (("Landscapes", slice(0, 12)), ("Experiments", slice(12, 20)))
 
 
 def concept_starred(prompt_index: int, round_index: int) -> bool:
@@ -288,8 +307,7 @@ def _clear(api: PromptManagerAPI, root: Path) -> None:
         for table in _TABLES:
             conn.execute(f"DELETE FROM {table}")
     for name in ("output", "input"):
-        shutil.rmtree(root / name)
-        (root / name).mkdir()
+        replace_folder(root / name)
 
 
 def _record_run(
@@ -322,9 +340,9 @@ def _record_run(
     return start.run_id
 
 
-def _write_seedless_png(path: Path) -> None:
+def _write_seedless_png(path: Path, size: tuple[int, int] = SEEDLESS_SIZE) -> None:
     """A plain PNG with no metadata: no prompt, no seed, no link."""
-    with Image.new("RGB", SEEDLESS_SIZE, "#2b3442") as image:
+    with Image.new("RGB", size, "#2b3442") as image:
         image.save(path)
 
 
@@ -335,26 +353,54 @@ def _bounded(name: str, value: int, maximum: int) -> None:
         raise ValueError(f"{name} is out of range")
 
 
+def _instant(now: float | None) -> float:
+    """The fixture's one "now": ``now`` itself, or the wall clock when omitted."""
+    if now is None:
+        return time.time()
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise TypeError("now must be a number of epoch seconds")
+    if not 0 < now < MAX_EPOCH_SECONDS:
+        raise ValueError("now is out of range")
+    return float(now)
+
+
 def seed_workspace_concept(
     api: PromptManagerAPI,
     root: Path,
     *,
     extra_images: int = 0,
     seedless_images: int = 0,
+    short_seedless: bool = False,
+    now: float | None = None,
 ) -> dict:
     """Replace this server's disposable rows and files with the concept's data.
 
+    Every relative time the fixture writes (the prompts' last use, the files'
+    mtimes, the runs' observation times) is taken from one instant, ``now``
+    (epoch seconds, the wall clock when omitted), returned as ``manifest["now"]``.
+    A browser whose clock is fixed at that instant reads the concept's "Used
+    today" and caption day however close to midnight the run starts.
+
     ``extra_images`` continues the concept's rounds (same prompts, dimensions and
     seed rule) after its 24 images, for bounded-rendering and Load more checks.
-    ``seedless_images`` adds unlinked PNGs without metadata, newest of all.
+    ``seedless_images`` adds unlinked PNGs without metadata, newest of all;
+    ``short_seedless`` makes them ``SHORT_SEEDLESS_SIZE`` instead.
     """
+    if not isinstance(short_seedless, bool):
+        raise TypeError("short_seedless must be a boolean")
     _bounded("extra_images", extra_images, MAX_EXTRA_IMAGES)
     _bounded("seedless_images", seedless_images, MAX_SEEDLESS_IMAGES)
+    now = _instant(now)
+    used_at = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(
+        timespec="microseconds"
+    )
     _clear(api, root)
     db = api.db
     epoch = db.get_execution_epoch()
     prompts = []
-    for prompt in CONCEPT_PROMPTS:
+    # The concept lists its prompts most recent first (renderLibrary under Recently
+    # added keeps the array order), so they are created last to first.
+    for prompt in reversed(CONCEPT_PROMPTS):
         first_name, first_text = prompt.negatives[0]
         receipt = db.create_library_recipe(
             prompt.positive,
@@ -372,10 +418,17 @@ def seed_workspace_concept(
         db.update_prompt_pair_metadata(pair_ids[0], title=first_name)
         for name, text in prompt.negatives[1:]:
             pair_ids.append(db.save_prompt_pair(prompt.positive, text, title=name))
-        # Real queue-hook counting (D23): four runs, the last one now.
+        # Real queue-hook counting (D23): four runs, the last one now, at the
+        # fixture's own instant rather than the database's later wall clock.
         db.record_prompt_use(positive_id, times=CONCEPT_RUN_COUNT)
-        prompts.append(
-            {"id": prompt.id, "positive_id": positive_id, "pair_ids": pair_ids}
+        with db.model.get_connection() as conn:
+            conn.execute(
+                "UPDATE prompts SET last_used_at = ? WHERE id = ?",
+                (used_at, positive_id),
+            )
+            conn.commit()
+        prompts.insert(
+            0, {"id": prompt.id, "positive_id": positive_id, "pair_ids": pair_ids}
         )
 
     folder = root / "output" / "concepts"
@@ -387,62 +440,87 @@ def seed_workspace_concept(
     favorite_root = _favorite_root_key(list(api._get_all_output_dirs())[0])
     total = len(CONCEPT_PROMPTS) * CONCEPT_IMAGE_ROUNDS + extra_images
     rounds = math.ceil(total / len(CONCEPT_PROMPTS))
-    now = time.time()
     images, runs = [], []
-    for round_index in range(rounds):
-        for prompt_index, prompt in enumerate(CONCEPT_PROMPTS):
-            index = round_index * len(CONCEPT_PROMPTS) + prompt_index
-            if index >= total:
-                break
-            name = concept_filename(prompt, round_index)
-            path = folder / name
-            facts = write_concept_png(path, prompt_index, round_index)
-            variant, negative, seed = facts["variant"], facts["negative"], facts["seed"]
-            # The concept lists images newest first in this order.
-            stamp = now - 60 - index * 60
-            os.utime(path, (stamp, stamp))
-            owner = prompts[prompt_index]
-            image_id = db.link_image_to_prompt(owner["positive_id"], str(path))
-            pair_id = owner["pair_ids"][variant]
-            db.link_image_to_pair(pair_id, image_id, {"source": "concept fixture"})
-            if concept_starred(prompt_index, round_index):
-                db.set_image_favorite(
-                    favorite_root, _favorite_relative_key(f"concepts/{name}")
-                )
-            context = RecipeContext(
-                "3", _snapshot(prompt.positive), _snapshot(negative), "inferred"
+    slots = [
+        (round_index, prompt_index, prompt)
+        for round_index in range(rounds)
+        for prompt_index, prompt in enumerate(CONCEPT_PROMPTS)
+        if round_index * len(CONCEPT_PROMPTS) + prompt_index < total
+    ]
+    # Linked and recorded oldest first, as real runs arrive, so link and run ids
+    # grow with time and every newest-first read (by id or by mtime) lists the
+    # concept's order (app.js:180-239). The manifest keeps the concept's order.
+    for round_index, prompt_index, prompt in reversed(slots):
+        index = round_index * len(CONCEPT_PROMPTS) + prompt_index
+        name = concept_filename(prompt, round_index)
+        path = folder / name
+        facts = write_concept_png(path, prompt_index, round_index)
+        variant, negative, seed = facts["variant"], facts["negative"], facts["seed"]
+        # The concept lists images newest first in this order.
+        stamp = now - 60 - index * 60
+        os.utime(path, (stamp, stamp))
+        owner = prompts[prompt_index]
+        image_id = db.link_image_to_prompt(owner["positive_id"], str(path))
+        pair_id = owner["pair_ids"][variant]
+        db.link_image_to_pair(pair_id, image_id, {"source": "concept fixture"})
+        # Real pair counting: each image is one run of its pair, as the
+        # concept's "<name> · N runs" counts its images (app.js a598, D26).
+        db.record_prompt_pair_use(pair_id)
+        if concept_starred(prompt_index, round_index):
+            db.set_image_favorite(
+                favorite_root, _favorite_relative_key(f"concepts/{name}")
             )
-            reference = OutputReference(
-                "4", 0, "output", "concepts", name, "posix", roots.output_key
+        context = RecipeContext(
+            "3", _snapshot(prompt.positive), _snapshot(negative), "inferred"
+        )
+        reference = OutputReference(
+            "4", 0, "output", "concepts", name, "posix", roots.output_key
+        )
+        runs.append(
+            _record_run(
+                api,
+                epoch=epoch,
+                item=index,
+                context=context,
+                output=reference,
+                observed_at=int(stamp * 1000),
             )
-            runs.append(
-                _record_run(
-                    api,
-                    epoch=epoch,
-                    item=index,
-                    context=context,
-                    output=reference,
-                    observed_at=int(stamp * 1000),
-                )
-            )
-            images.append(
-                {
-                    "filename": name,
-                    "image_id": image_id,
-                    "pair_id": pair_id,
-                    "prompt": prompt.id,
-                    "variant": variant,
-                    "seed": seed,
-                    "path": f"concepts/{name}",
-                    "width": facts["width"],
-                    "height": facts["height"],
-                }
-            )
+        )
+        images.append(
+            {
+                "filename": name,
+                "image_id": image_id,
+                "pair_id": pair_id,
+                "prompt": prompt.id,
+                "variant": variant,
+                "seed": seed,
+                "path": f"concepts/{name}",
+                "width": facts["width"],
+                "height": facts["height"],
+            }
+        )
+    images.reverse()
+    runs.reverse()
+    # The concept's COLLECTIONS rows (app.js a336–339): "Landscapes" holds the
+    # first 12 images in the concept's order and "Experiments" the next 8, so
+    # the rows and counts compare as the concept shows them (#331 D136).
+    collections = {}
+    for name, members in CONCEPT_COLLECTIONS:
+        added = db.add_to_collection(
+            name=name,
+            items=[
+                (favorite_root, _favorite_relative_key(image["path"]))
+                for image in images[members]
+            ],
+        )
+        collections[name] = added["collection"]["id"]
     seedless = []
     for number in range(seedless_images):
         name = f"seedless_{number + 1:05}.png"
         path = folder / name
-        _write_seedless_png(path)
+        _write_seedless_png(
+            path, SHORT_SEEDLESS_SIZE if short_seedless else SEEDLESS_SIZE
+        )
         stamp = now - 10 - number * 10
         os.utime(path, (stamp, stamp))
         seedless.append({"filename": name, "path": f"concepts/{name}"})
@@ -454,10 +532,17 @@ def seed_workspace_concept(
         tags = [row[0] for row in conn.execute("SELECT name FROM tags ORDER BY id")]
     if tuple(counts) != (len(CONCEPT_PROMPTS), CONCEPT_RUN_COUNT, CONCEPT_RUN_COUNT):
         raise RuntimeError(f"Concept fixture run counts are not real: {tuple(counts)}")
-    api._generate_gallery_thumbnails_sync(api._get_all_output_dirs(), (150, 150))
+    from py.api.thumbnail_settings import ThumbnailSettings
+
+    # 150 px previews in the default format (#317 thumbnail settings).
+    api._generate_gallery_thumbnails_sync(
+        api._get_all_output_dirs(), ThumbnailSettings("webp", 80, 150)
+    )
     api.invalidate_gallery_cache()
     return {
         "epoch": epoch,
+        # The fixture's "now" (epoch seconds), for the browser's fixed clock.
+        "now": now,
         # The newest file's mtime (epoch seconds), for the D17 caption date.
         "newest_modified": now - 10 if seedless_images else now - 60,
         "seedless": seedless,
@@ -465,4 +550,5 @@ def seed_workspace_concept(
         "images": images,
         "runs": runs,
         "tags": tags,
+        "collections": collections,
     }

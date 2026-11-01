@@ -1,7 +1,7 @@
 import {writeFile} from 'node:fs/promises';
-import {test,expect} from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import {test,expect} from './fixtures.mjs';
 import {captureCanonicalState} from './history-canonical-comparison.mjs';
-import {SIZES,THEMES,MOTIONS,seedConcept,openConcept,openProduction,inventoryOf,diffInventory,focusRingOf,hoverStateOf,mutate} from './concept-inventory.mjs';
+import {SIZES,THEMES,MOTIONS,seedConcept,openConcept as openConceptPage,openProduction,inventoryOf,diffInventory,focusRingOf,hoverStateOf,mutate} from './concept-inventory.mjs';
 
 // Task A6 of #249: the production shell (sidebar, topbar, heading, footer) against the immutable concept, with the
 // concept-shaped real fixture so the sidebar counts are the concept's own (24 images, 6 prompts, 15 tags). Both themes,
@@ -16,7 +16,16 @@ const FULL_HEADING=new Set(['tags']);
 
 const rowNamed=(nav,text)=>nav.rows.find(row=>row.text===text);
 
-const removedItem=item=>String(item.className).includes('concept-badge')||(item.tag==='button'&&item.text.startsWith('Activity'));
+const removedItem=item=>String(item.className).includes('concept-badge');
+
+/**
+ * The concept with its Activity count hidden (D52): production counts running jobs only and hides the count at 0, as
+ * the comparison fixture has none. The concept's own CSS then lays out its button without the count.
+ */
+async function openConcept(page,route,theme,motion) {
+    await openConceptPage(page,route,theme,motion);
+    await mutate(page,{css:'#activity-count { display: none }'});
+}
 
 /** Left offsets of flex items packed along a row of `width` by its `justify-content` and `gap`. */
 function packedLefts(items,width,justify,gap) {
@@ -37,10 +46,12 @@ function remainingTopActions(actions) {
     const gap=parseFloat(actions.columnGap);
     // A full-width row (<=700px) keeps its width; otherwise it shrinks to its remaining items.
     const width=actions.fullWidth?actions.width:shown.reduce((sum,item)=>sum+item.width,0)+gap*(shown.length-1);
-    // At <=700px the concept spreads three items with `space-between`, so its Theme select sits in the middle; with
-    // Activity removed (D5) the same rule puts Theme at the row's start. Offsets come from the concept's own sizes.
+    // At <=700px the concept spreads its shown items with `space-between`; the hidden pill (D53) takes no place.
+    // Offsets come from the concept's own sizes.
     const lefts=new Map(shown.map((item,index)=>[item,packedLefts(shown,width,actions.justifyContent,gap)[index]]));
     return {...actions,height,width,
+        // D52: the full-width row (<=700px) wraps its items when a zoomed phone is narrower than they are.
+        flexWrap:actions.fullWidth?'wrap':actions.flexWrap,
         items:kept.map(item=>item.shown?{...item,top:Math.round((height-item.height)/2),left:lefts.get(item)}:item)};
 }
 
@@ -53,20 +64,60 @@ function remainingFooter(footer,spans) {
 }
 
 // D28 ruling (final review A, Minor 1): Overview gets a distinct outline home glyph. The concept has no home icon, and
-// its `activity` pulse stays reserved for the Activity row D5 omits, so the two entries never share one glyph.
+// its `activity` pulse belongs to the Activity row, so the two entries never share one glyph.
 const OVERVIEW_GLYPH='M3 11 12 4l9 7M5 10v10h14V10M10 20v-6h4v6';
+
+/**
+ * The concept's SAVED VIEWS rows (app.js a331–335) as production lists them: Favorites with its count (D51), Needs
+ * review with the exact pending count (ruling R5), then the saved views. The concept's "3" is sample data: the concept
+ * fixture records no review items, so production's count reads "0".
+ */
+function savedNav(nav) {
+    return {...nav,rows:nav.rows.map(row=>row.text==='Needs review'?{...row,count:{...row.count,text:'0'}}:row)};
+}
+
+/**
+ * D136 (#331): the concept's COLLECTIONS rows (app.js a336–339) as production lists them, by name (DC1): the fixture's
+ * "Landscapes" and "Experiments" hold the concept's 12 and 8 images, so text and counts compare as they are and each
+ * place keeps the concept's row geometry. At <=950px the concept hides the nav, which would leave a phone no way to
+ * open a collection: production shows it as the concept lays out every other sidebar nav there (its SAVED VIEWS nav),
+ * its rows styled as that nav's rows. Text, widths and wrap gaps then follow the rows' own content.
+ */
+function collectionsNav(nav,navs) {
+    const byName=[...nav.rows].sort((a,b)=>a.text<b.text?-1:a.text>b.text?1:0);
+    if(nav.shown)return {...nav,rows:byName.map((row,index)=>({...row,gapAfter:nav.rows[index].gapAfter}))};
+    const saved=navs.find(item=>item.id==='saved-nav');
+    const {id,label,rows,...frame}=saved;
+    return {...nav,...frame,id:nav.id,label:nav.label,rows:byName.map(row=>({...rows[0],text:row.text,
+        count:row.count&&rows[0].count?{...rows[0].count,text:row.count.text}:rows[0].count,
+        icon:rows[0].icon&&row.icon?{...rows[0].icon,d:row.icon.d}:row.icon,
+        width:'(content)',hugs:'(content)',gapAfter:'(content)',current:null}))};
+}
+
+/** The production collections nav at <=950px with its content-sized values replaced, as collectionsNav maps them. */
+function contentFree(navs) {
+    return navs.map(nav=>nav.id!=='collections-nav'||!nav.shown?nav:{...nav,
+        rows:nav.rows.map(row=>({...row,width:'(content)',hugs:'(content)',gapAfter:'(content)'}))});
+}
+
+/** D136: where the concept hides COLLECTIONS, the production rows' content-sized values are not compared. */
+function comparableNavs(reference,navs) {
+    return reference.chrome.navs.find(nav=>nav.id==='collections-nav')?.shown?navs:contentFree(navs);
+}
 
 /** Recorded shell deviations only (spec §8). Everything else in the concept inventory must equal production. */
 function mapShellConcept(reference) {
     const {chrome}=reference;
     const navs=chrome.navs
-        // D28: SAVED VIEWS and COLLECTIONS are proposals with no persisted store, so their navs are not rendered.
-        .filter(nav=>nav.id!=='saved-nav'&&nav.id!=='collections-nav')
         .map(nav=>{
+            if(nav.id==='collections-nav')return collectionsNav(nav,chrome.navs);
+            if(nav.id==='saved-nav')return savedNav(nav);
             if(nav.id!=='system-nav')return nav;
             const system=rowNamed(nav,'System');
             return {...nav,rows:[
-                // D5: no Activity row until an activity center exists. D28: no Design review (prototype page).
+                // D52: the Activity row counts running jobs only, so with none it has no count.
+                {...rowNamed(nav,'Activity'),count:null},
+                // D28: no Design review (prototype page).
                 system,
                 // D28: the production Overview hub follows System, as a concept nav row without a count. Its icon is
                 // the ruling's own outline home glyph (OVERVIEW_GLYPH), never the concept's `activity` pulse.
@@ -76,27 +127,26 @@ function mapShellConcept(reference) {
     return {...reference,chrome:{...chrome,
         // D29: no prototype suffix in the document title.
         title:chrome.title.replace(/ · Prompt Manager concept$/,' · Prompt Manager'),
-        // D28: only the WORKSPACE group label remains.
-        labels:chrome.labels.filter(label=>label.text==='WORKSPACE'),
+        // D49: SAVED VIEWS without its "PROPOSED" badge. D136: COLLECTIONS without it either.
+        labels:chrome.labels.map(label=>label.text.endsWith(' PROPOSED')?{...label,text:label.text.replace(/ PROPOSED$/,'')}:label),
         navs,
         connection:{...chrome.connection,
             // D28: truthful copy instead of "Demo connection · Classic / Nodes 2.0".
             small:'Your library, on your server',
             // D28: no fake connection state, so the dot is the neutral muted token (the concept's label color).
             dot:{...chrome.connection.dot,backgroundColor:chrome.labels[0].color}},
-        // D29: no "Interactive concept" badge. D5: no Activity button. The row's size and the remaining items'
-        // centered offsets follow from the concept's own item sizes.
-        topActions:remainingTopActions(chrome.topActions),
+        // D29: no "Interactive concept" badge. D53: the progress pill before the Activity button, hidden with no running
+        // job. D52: the button's count is hidden at 0. The row's size and the remaining items' centered offsets follow
+        // from the concept's own item sizes.
+        topActions:remainingTopActions({...chrome.topActions,items:chrome.topActions.items.flatMap(item=>
+            item.tag==='button'&&item.text==='Activity'?[{tag:'a',className:'activity-pill',shown:false},{...item,count:'0'}]:[item])}),
         footer:(()=>{
             // D29: production footer copy (one line, as the concept's own copy is), and no "What changes & why"
             // (a prototype review page); the footer then holds only its span.
             const spans=chrome.footer.spans.map(span=>({...span,text:'ComfyAssets · Local tools. Your library.'}));
             return {...chrome.footer,spans,buttons:[],height:remainingFooter(chrome.footer,spans)};
         })(),
-    },
-    heading:reference.heading&&{...reference.heading,actions:reference.heading.actions&&{...reference.heading.actions,
-        // #245 vocabulary ruling D2 (mapVocabularyConcept): Auto-tag images is omitted until the image-annotation slice.
-        buttons:reference.heading.actions.buttons.filter(item=>item.text!=='Auto-tag images')}}};
+    }};
 }
 
 /** The heading without its page-owned description copy and actions; the h1 text is the shell's and stays compared. */
@@ -111,8 +161,9 @@ function headingFrame(heading) {
 function compare(route,reference,actual) {
     const expected=mapShellConcept(reference);
     const heading=FULL_HEADING.has(route);
+    const chrome={...actual.chrome,navs:comparableNavs(reference,actual.chrome.navs)};
     return [
-        ...diffInventory({chrome:expected.chrome,noPageScroll:expected.noPageScroll},{chrome:actual.chrome,noPageScroll:actual.noPageScroll}),
+        ...diffInventory({chrome:expected.chrome,noPageScroll:expected.noPageScroll},{chrome,noPageScroll:actual.noPageScroll}),
         ...diffInventory(heading?expected.heading:headingFrame(expected.heading),heading?actual.heading:headingFrame(actual.heading))
             .map(item=>({...item,path:`heading.${item.path}`})),
     ];
@@ -155,27 +206,28 @@ async function captureFooter(page,testInfo,name) {
 
 test.beforeEach(async({request})=>{await seedConcept(request);});
 
-for(const [width,height] of SIZES)for(const theme of THEMES)test(`shell geometry, tokens and controls match the concept ${width}x${height} ${theme}`,async({page},testInfo)=>{
+// One test per route, size, theme and motion. All of them in one test per size and theme (12 page loads, 12 captures,
+// 36 hovers) steadily took 22 s median and up to 33 s on CI WebKit, past the 30 s budget with no step stalled; one
+// route in one motion is a sixth of that work under the same budget.
+for(const [route,breadcrumb] of ROUTES)for(const [width,height] of SIZES)for(const theme of THEMES)for(const motion of MOTIONS)test(`shell geometry, tokens and controls match the concept on ${route} ${width}x${height} ${theme} ${motion}`,async({page},testInfo)=>{
     await page.setViewportSize({width,height});const result={};
-    for(const motion of MOTIONS)for(const [route,breadcrumb] of ROUTES) {
-        await openConcept(page,route,theme,motion);await page.mouse.move(0,0);
-        const reference=await inventoryOf(page,'#main');
-        if(motion==='no-preference')await captureCanonicalState(page,testInfo,`concept-shell-${route}-${width}-${theme}`);
-        const referenceRings=FULL_HEADING.has(route)?await ringsOf(page,'#main'):null;
-        const referenceHovers=await hoversOf(page);
-        if(motion==='no-preference')await captureFooter(page,testInfo,`concept-footer-${route}-${width}-${theme}`);
-        await openProduction(page,route,theme,motion);await page.mouse.move(0,0);
-        const actual=await inventoryOf(page,'#workspace-main');
-        if(motion==='no-preference')await captureCanonicalState(page,testInfo,`production-shell-${route}-${width}-${theme}`);
-        const actualRings=FULL_HEADING.has(route)?await ringsOf(page,'#workspace-main'):null;
-        const actualHovers=await hoversOf(page);
-        if(motion==='no-preference')await captureFooter(page,testInfo,`production-footer-${route}-${width}-${theme}`);
-        result[`${motion} ${route}`]={route,breadcrumb,reference,actual,diff:compare(route,reference,actual),referenceRings,actualRings,
-            referenceHovers,actualHovers};
-    }
-    const path=testInfo.outputPath('shell-geometry.json');await writeFile(path,JSON.stringify(result,null,2));
-    await testInfo.attach('shell-geometry',{path,contentType:'application/json'});
-    for(const [key,{route,breadcrumb,reference,actual,diff,referenceRings,actualRings,referenceHovers,actualHovers}] of Object.entries(result)) {
+    await openConcept(page,route,theme,motion);await page.mouse.move(0,0);
+    const reference=await inventoryOf(page,'#main');
+    if(motion==='no-preference')await captureCanonicalState(page,testInfo,`concept-shell-${route}-${width}-${theme}`);
+    const referenceRings=FULL_HEADING.has(route)?await ringsOf(page,'#main'):null;
+    const referenceHovers=await hoversOf(page);
+    if(motion==='no-preference')await captureFooter(page,testInfo,`concept-footer-${route}-${width}-${theme}`);
+    await openProduction(page,route,theme,motion);await page.mouse.move(0,0);
+    const actual=await inventoryOf(page,'#workspace-main');
+    if(motion==='no-preference')await captureCanonicalState(page,testInfo,`production-shell-${route}-${width}-${theme}`);
+    const actualRings=FULL_HEADING.has(route)?await ringsOf(page,'#workspace-main'):null;
+    const actualHovers=await hoversOf(page);
+    if(motion==='no-preference')await captureFooter(page,testInfo,`production-footer-${route}-${width}-${theme}`);
+    result[`${motion} ${route}`]={reference,actual,diff:compare(route,reference,actual),referenceRings,actualRings,
+        referenceHovers,actualHovers};
+    const path=testInfo.outputPath(`shell-geometry-${route}-${motion}.json`);await writeFile(path,JSON.stringify(result,null,2));
+    await testInfo.attach(`shell-geometry-${route}-${motion}`,{path,contentType:'application/json'});
+    for(const [key,{reference,actual,diff,referenceRings,actualRings,referenceHovers,actualHovers}] of Object.entries(result)) {
         // The concept itself is what this comparison assumes: its sample counts and its shell controls.
         expect.soft(reference.chrome.navs[0].rows.map(row=>[row.text,row.count?.text??null]),`${key} concept WORKSPACE rows`)
             .toEqual([['Images','24'],['Prompt library','6'],['Tags & categories','15'],['Inspect a file',null]]);
@@ -199,6 +251,31 @@ for(const [width,height] of SIZES)for(const theme of THEMES)test(`shell geometry
     }
 });
 
+// Saved views (#249 D16): a view saved from the Images toolbar adds the concept's own saved row (search icon, name, no
+// count) to SAVED VIEWS. The concept's demo action reads "Apply in prototype"; production's is "Save" (D29).
+for(const [width,height] of SIZES)test(`a saved view row matches the concept's ${width}x${height}`,async({page})=>{
+    await page.setViewportSize({width,height});
+    const save=async(action,mainSelector)=>{
+        await page.locator(`${mainSelector} .toolbar`).getByRole('button',{name:'Save view',exact:true}).click();
+        const dialog=page.getByRole('dialog',{name:'Save this view',exact:true});
+        await expect(dialog.getByRole('textbox',{name:'View name',exact:true})).toHaveValue('My workspace view');
+        await dialog.getByRole('textbox',{name:'View name',exact:true}).fill('Golden hour');
+        await dialog.getByRole('button',{name:action,exact:true}).click();
+        await expect(page.locator('#saved-nav').getByRole('link',{name:'Golden hour',exact:true})).toHaveCount(1);
+        await page.mouse.move(0,0);
+        return inventoryOf(page,mainSelector);
+    };
+    await openConcept(page,'images','dark');
+    const reference=await save('Apply in prototype','#main');
+    expect(reference.chrome.navs.find(nav=>nav.id==='saved-nav').rows.map(row=>row.text)).toEqual(['Favorites','Needs review','Golden hour']);
+    await openProduction(page,'images','dark');
+    const actual=await save('Save','#workspace-main');
+    expect(diffInventory(mapShellConcept(reference).chrome.navs,comparableNavs(reference,actual.chrome.navs))).toEqual([]);
+    const referenceRows=reference.chrome.navs.find(nav=>nav.id==='saved-nav').rows;
+    expect(actual.chrome.navs.find(nav=>nav.id==='saved-nav').rows.map(row=>[row.text,row.count]))
+        .toEqual([['Favorites',referenceRows[0].count],['Needs review',{...referenceRows[1].count,text:'0'}],['Golden hour',null]]);
+});
+
 test('the inventory reports a missing shell element by its path instead of failing',async({page})=>{
     await page.setViewportSize({width:1600,height:1100});
     await openConcept(page,'tags','dark');await page.mouse.move(0,0);
@@ -220,13 +297,13 @@ test('the concept fixture renders the concept inspector facts',async({page})=>{
     await page.setViewportSize({width:1600,height:1100});
     await openProduction(page,'images','dark');
     // The first image is the concept's first sample, selected into the panel on first load (D19).
-    const facts=page.locator('#workspace-main .generation-facts');
+    const facts=page.locator('#workspace-main #image-inspector .meta-grid');
     await expect(facts).toBeVisible();
     const pairs=await facts.evaluate(list=>Object.fromEntries([...list.querySelectorAll('dt')].map(term=>[term.textContent.trim(),term.nextElementSibling.textContent.trim()])));
     // app.js:404-408: the concept's facts for alpine_00001.png.
     expect(pairs).toEqual({Seed:'42001',Steps:'28',CFG:'6.5',Sampler:'dpmpp_2m',Scheduler:'karras',Model:'illustrative-model.safetensors'});
-    // D21 maps execution evidence to "Execution recorded" in PR D; today's panel names the same source this way.
-    await expect(page.locator('#workspace-main').getByText('Execution prompt evidence',{exact:true})).toBeVisible();
+    // D21: execution evidence is the concept's "Execution recorded" badge.
+    await expect(page.locator('#image-inspector span.chip.blue')).toHaveText('Execution recorded');
 });
 
 // Task A7: the comparison is only worth something if it notices a change. One CSS mutation (a nav-row height the

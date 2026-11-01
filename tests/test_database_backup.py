@@ -24,6 +24,9 @@ from database.operations import PromptDatabase
 from tests.open_handles import assert_closed
 from utils.hashing import generate_prompt_hash
 
+# A bound on thread hand-offs that only a hung test reaches (never a pacing timer).
+THREAD_WAIT_SECONDS = 120
+
 
 def _count_prompts(path):
     """Row count read through a brand-new connection (closed before return)."""
@@ -290,6 +293,8 @@ class TestRestoreFromFile(BackupTestCase):
                 super().backup(target, *args, **kwargs)
 
         def connect_with_failure(*args, **kwargs) -> sqlite3.Connection:
+            if "factory" in kwargs:  # the model's own managed connections
+                return connect(*args, **kwargs)
             return connect(*args, **kwargs, factory=FailingLiveBackup)
 
         with patch("database.models.sqlite3.connect", side_effect=connect_with_failure):
@@ -350,7 +355,13 @@ class TestRestoreFromFile(BackupTestCase):
         def worker():
             self.db.search_prompts(text="old")  # opens this thread's connection
             ready.set()
-            proceed.wait(5)
+            # Wait for the restore itself, not for a timer: a stalled Windows
+            # runner once took longer than 5 s to restore, and the worker then
+            # read the old database before the restore had run.
+            if not proceed.wait(THREAD_WAIT_SECONDS):
+                results["error"] = "the restore did not finish"
+                self.db.close()
+                return
             try:
                 results["texts"] = [p["text"] for p in self.db.search_prompts()]
             except Exception as exc:  # noqa: BLE001 - reported through results
@@ -360,12 +371,15 @@ class TestRestoreFromFile(BackupTestCase):
 
         thread = threading.Thread(target=worker)
         thread.start()
-        ready.wait(5)
+        self.assertTrue(ready.wait(THREAD_WAIT_SECONDS))
 
-        self.db.model.restore_from_file(src)
-        proceed.set()
-        thread.join(5)
+        try:
+            self.db.model.restore_from_file(src)
+        finally:
+            proceed.set()
+            thread.join(THREAD_WAIT_SECONDS)
 
+        self.assertFalse(thread.is_alive())
         self.assertNotIn("error", results)
         self.assertEqual(results["texts"], ["restored"])
         self.assertEqual([p["text"] for p in self.db.search_prompts()], ["restored"])
@@ -452,6 +466,112 @@ class TestRestoreFromFile(BackupTestCase):
                 ).fetchone()
             )
 
+    def test_restore_old_backup_without_annotations(self):
+        tables = (
+            "media_image_autotags",
+            "media_review_decisions",
+            "media_review_items",
+            "media_review_metadata",
+            "media_image_tags",
+            "media_annotation_bytes",
+            "media_annotation_files",
+            "media_annotation_metadata",
+        )
+        src = self._make_source_db(["predates image annotations"])
+        with closing(sqlite3.connect(src)) as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            for table in tables:
+                conn.execute(f"DROP TABLE {table}")
+            conn.commit()
+        self.assertTrue(PromptModel.verify_database_file(src)[0])
+        ok, reason = PromptModel.verify_database_file(src, require_library_state=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "Missing image annotation schema")
+
+        self.db.model.restore_from_file(src)
+
+        self.assertEqual(_texts(self.path), ["predates image annotations"])
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT * FROM media_annotation_metadata").fetchall(),
+                [(1, 1, 0)],
+            )
+        ok, reason = PromptModel.verify_database_file(
+            self.path, require_library_state=True
+        )
+        self.assertTrue(ok, reason)
+        with closing(sqlite3.connect(src)) as conn:  # the source is untouched
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'media_%'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_restore_annotations_era_backup_without_review_queue(self):
+        tables = (
+            "media_review_decisions",
+            "media_review_items",
+            "media_review_metadata",
+        )
+        src = self._make_source_db(["predates the review queue"])
+        with closing(sqlite3.connect(src)) as conn:
+            for table in tables:
+                conn.execute(f"DROP TABLE {table}")
+            conn.commit()
+        self.assertTrue(PromptModel.verify_database_file(src)[0])
+        ok, reason = PromptModel.verify_database_file(src, require_library_state=True)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "Missing review queue schema")
+
+        self.db.model.restore_from_file(src)
+
+        self.assertEqual(_texts(self.path), ["predates the review queue"])
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT * FROM media_review_metadata").fetchall(),
+                [(1, 1, 0)],
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM media_review_items").fetchone()[0],
+                0,
+            )
+        ok, reason = PromptModel.verify_database_file(
+            self.path, require_library_state=True
+        )
+        self.assertTrue(ok, reason)
+        with closing(sqlite3.connect(src)) as conn:  # the source is untouched
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'media_review%'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_restore_rejects_review_queue_without_annotations(self):
+        src = self._make_source_db(["review without annotations"])
+        with closing(sqlite3.connect(src)) as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            for table in (
+                "media_image_tags",
+                "media_annotation_bytes",
+                "media_annotation_files",
+                "media_annotation_metadata",
+            ):
+                conn.execute(f"DROP TABLE {table}")
+            conn.commit()
+        before = Path(src).read_bytes()
+        live_before = _texts(self.path)
+        ok, reason = PromptModel.verify_database_file(src)
+        self.assertFalse(ok)
+        self.assertIn("image annotation", reason)
+
+        with self.assertRaises(ValueError):
+            self.db.model.restore_from_file(src)
+
+        self.assertEqual(Path(src).read_bytes(), before)
+        self.assertEqual(_texts(self.path), live_before)
+
     def test_restore_preserves_favorites_and_closes_handles(self):
         self.db.set_image_favorite("output", "live.png")
         with tempfile.TemporaryDirectory() as directory:
@@ -493,6 +613,50 @@ class TestRestoreFromFile(BackupTestCase):
                 [("output", "live.png")],
             )
         assert_closed(self, str(backups[0]))
+
+    def test_backup_and_restore_keep_collections(self):
+        with self.db.model.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO image_collections (id, name, name_key, created_at) "
+                "VALUES (4, 'LoRa testing', 'lora testing', '2026-10-27T00:00:00Z')"
+            )
+            conn.execute(
+                "INSERT INTO image_collection_items VALUES "
+                "(4, 'root', 'grid.png', '2026-10-27T00:00:00Z')"
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            # The rows still sit in the WAL; a backup must carry them.
+            backup = os.path.join(directory, "backup.db")
+            self.assertTrue(self.db.model.backup_database(backup))
+            self.assertEqual(
+                PromptModel.verify_database_file(backup, require_library_state=True),
+                (True, "ok"),
+            )
+            with self.db.model.get_connection() as conn:
+                conn.execute("DELETE FROM image_collections")
+
+            self.db.model.restore_from_file(backup)
+
+            conn = self.db.model.get_connection()
+            self.assertEqual(
+                [
+                    tuple(r)
+                    for r in conn.execute("SELECT id, name FROM image_collections")
+                ],
+                [(4, "LoRa testing")],
+            )
+            self.assertEqual(
+                [
+                    tuple(r)
+                    for r in conn.execute(
+                        "SELECT collection_id, root_key, relative_path "
+                        "FROM image_collection_items"
+                    )
+                ],
+                [(4, "root", "grid.png")],
+            )
+            PromptModel.close_all_instances()
+            assert_closed(self, directory)
 
     def test_restore_without_a_live_database_returns_empty_backup_path(self):
         src = self._make_source_db(["fresh"])

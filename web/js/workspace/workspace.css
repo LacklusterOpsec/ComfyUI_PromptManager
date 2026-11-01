@@ -12,9 +12,68 @@ main:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 4px; }
    sidebar's min-content (the concept's `1fr`); the column is capped at the viewport as production's shell was. */
 @media (max-width: 950px) {
     .app-shell { grid-template-columns: minmax(0, 1fr); /* D31 */ }
+    /* D136 (#331): the concept hides COLLECTIONS here, which would leave a phone no way to open a collection; its rows
+       wrap like every other sidebar nav (the concept's `.sidebar nav` flex row). Its label stays hidden, as all are. */
+    #collections-nav { display: flex; /* D136 */ }
 }
 @media (forced-colors: active) {
     nav a[aria-current="page"] { border: 2px solid Highlight; color: LinkText; }
+}
+
+/* D53: the running job's progress pill before the Activity button (the approved Activity mockup's `.pill`), in the
+   concept's tokens. At <=700px it keeps its verb and percentage; the file counts and bar stay in its accessible name. */
+.activity-pill:not([hidden]) { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border: 1px solid var(--line);
+    border-radius: 999px; font-size: 12px; white-space: nowrap; color: var(--ca-text); background: var(--ca-surface); /* D53 */ }
+.activity-pill:hover { border-color: var(--ca-accent); /* D53 */ }
+.activity-pill-bar { display: block; inline-size: 70px; block-size: 5px; border-radius: 3px; background: var(--line); overflow: hidden; /* D53 */ }
+.activity-pill-bar i { display: block; block-size: 100%; inline-size: 0; background: var(--ca-accent); /* D53 */ }
+/* D111 (S5): a running job without a known total sweeps a short segment; reduced motion shows a dimmed full bar. */
+.activity-pill-bar.indeterminate i { inline-size: 40%; animation: activity-pill-sweep 1.4s ease-in-out infinite; /* D111 */ }
+@keyframes activity-pill-sweep { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+@media (prefers-reduced-motion: reduce) { .activity-pill-bar.indeterminate i { inline-size: 100%; opacity: .45; animation: none; /* D111 */ } }
+@media (pointer: coarse) { .activity-pill:not([hidden]) { min-block-size: 40px; /* D53 */ } }
+@media (max-width: 700px) {
+    /* D52: with the Activity button the full-width row can be wider than a zoomed phone, so its items wrap. */
+    .top-actions { flex-wrap: wrap; /* D52 */ }
+    .activity-pill:not([hidden]) { gap: 0; padding-inline: 10px; /* D53 */ }
+    .activity-pill-files, .activity-pill-bar { display: none; /* D53 */ }
+}
+
+/* D56: each Activity item's title links its job's view in the title's own colour. */
+.activity-item h3 a { color: inherit; text-decoration: none; /* D56 */ }
+.activity-item h3 a:hover { text-decoration: underline; /* D56 */ }
+
+/* D56: one job's view, the approved Activity mockup (activity-scan.html) in the concept's tokens: the counter tiles,
+   the outcome list beside the selected outcome's files, and the collapsible log. */
+.stat-row { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin: 16px 0; /* D56 */ }
+.stat-row .stat { border: 1px solid var(--line); border-radius: 7px; padding: 12px 14px; background: var(--ca-surface); min-inline-size: 0; /* D56 */ }
+.stat-row .stat dt { font-size: 11px; color: var(--ca-muted); /* D56 */ }
+.stat-row .stat dd { margin: 6px 0 0; font-size: 20px; font-weight: 600; /* D56 */ }
+.stat-row .stat.added dd { color: var(--green); /* D56 */ }
+.stat-row .stat.warn dd { color: var(--warning); /* D56 */ }
+.stat-row .stat.bad dd { color: var(--red); /* D56 */ }
+.surface > .panel-heading > .search-field { max-width: 320px; /* D56 */ }
+.outcomes { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; margin-top: 6px; /* D56 */ }
+.ca-tools .outcome-list button { display: flex; justify-content: space-between; width: 100%; margin-bottom: 6px; text-align: left; /* D56 */ }
+.ca-tools .outcome-list button[aria-pressed="true"] { border-color: var(--ca-accent); background: var(--soft-blue); /* D56 */ }
+.outcome-files .file-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 9px 4px;
+    border-bottom: 1px solid var(--line); font-size: 12px; /* D56 */ }
+.ca-tools button.file-row { width: 100%; min-height: 0; justify-content: normal; align-items: start; border: 0;
+    border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; color: inherit; text-align: left;
+    white-space: normal; font: inherit; font-size: 12px; /* D56 */ }
+.ca-tools button.file-row:hover:not(:disabled) { background: var(--ca-hover); /* D56 */ }
+.file-row .path { font-family: ui-monospace, monospace; overflow-wrap: anywhere; /* D56 */ }
+.file-row .why { color: var(--ca-muted); /* D56 */ }
+.outcome-files > p.small { color: var(--ca-muted); margin-top: 10px; /* D56 */ }
+.term { margin-top: 16px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; /* D56 */ }
+.term summary { padding: 11px 14px; cursor: pointer; font-size: 12px; background: var(--ca-surface); /* D56 */ }
+.term summary span { color: var(--ca-muted); /* D56 */ }
+.term pre { margin: 0; padding: 12px 14px; max-height: 180px; overflow: auto; font: 11px/1.7 ui-monospace, monospace;
+    color: var(--ca-muted); background: var(--page); white-space: pre-wrap; overflow-wrap: anywhere; /* D56 */ }
+@media (max-width: 700px) {
+    .stat-row { grid-template-columns: repeat(2, minmax(0, 1fr)); /* D56 */ }
+    .outcomes { grid-template-columns: minmax(0, 1fr); /* D56 */ }
+    .outcome-files .file-row { grid-template-columns: minmax(0, 1fr); gap: 4px; /* D56 */ }
 }
 
 /* Overview: real library statistics and the legacy tool cards inside a concept `.surface`. */
@@ -29,12 +88,32 @@ main:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 4px; }
 .tool-card { border: 1px solid var(--line); background: var(--ca-field); border-radius: 8px; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
 .tool-card p { flex: 1; margin: 0 0 12px; }
 .workspace-link { display: inline-flex; align-items: center; min-height: 44px; padding: 8px 0; font-size: 12px; overflow-wrap: anywhere; }
-.handoff .workspace-link { margin-top: 12px; }
+
+/* D92: System's Save row is aria-disabled while nothing is unsaved (or a save runs), and a setting the last save could
+   not save is highlighted, as its "Review the highlighted settings" status says. */
+.save-row button[aria-disabled="true"] { opacity: .55; cursor: not-allowed; /* D92 */ }
+.setting-row [aria-invalid="true"] { outline: 2px solid var(--red); outline-offset: 2px; /* D92 */ }
+/* D92: a source the last save was refused for (System › Sources) is highlighted the same way. */
+#source-list > .operation[aria-invalid="true"] { outline: 2px solid var(--red); outline-offset: 2px; /* D92 */ }
+/* D93: an Overview row whose action is not available yet (the review queue, Q6) keeps its button, disabled. */
+.operation .row-actions button[aria-disabled="true"] { opacity: .55; cursor: not-allowed; /* D93 */ }
+/* D97: Appearance's legacy display rows. "Show image details on cards" off keeps a card's Info and Tag at the end of
+   its row; "Collapse viewer details by default" gives the viewer's stage the whole width while its details are hidden. */
+.media-info > div[hidden] + .image-card-actions { margin-inline-start: auto; /* D97 */ }
+.viewer-layout:has(> #viewer-details[hidden]) { grid-template-columns: minmax(0, 1fr); /* D97 */ }
 @media (max-width: 700px) {
     .stat-grid { gap: 8px; }
     .stat { padding: 16px; }
     .stat dd { font-size: 26px; }
 }
+
+/* D182 (#530, the concept has the offset): the second card of a `.two-col` starts level with the first. The grid gap
+   already spaces them; `.surface + .surface` is for surfaces stacked in plain flow. */
+.two-col > .surface + .surface { margin-top: 0; /* D182 */ }
+/* D182: a surface after a two-column row has the same gap as stacked surfaces; the concept has none there. */
+.two-col + .surface { margin-top: 18px; /* D182 */ }
+/* D184 (#530, the concept stops System at 1000px): every System section uses the full content width, as other pages do. */
+.settings-layout { max-width: none; /* D184 */ }
 
 /* Tags & categories (#245): real vocabulary has unbounded names and bounded lists, which the concept's short samples
    never show. Proven by the 390px layout and long-name cases in workspace-vocabulary.spec.mjs. */
@@ -47,6 +126,14 @@ main:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 4px; }
 .vocabulary-main .vocabulary-continuation { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding-block: 15px 0; overflow-anchor: none; }
 .vocabulary-main .vocabulary-continuation p { margin: 0; flex: 1 1 200px; font-size: 12px; color: var(--ca-muted); }
 .vocabulary-main .vocabulary-continuation .vocabulary-error { color: var(--ca-error-text); }
+/* D183 (#530, beyond the concept, whose sample list is short): Reusable tags scrolls in its own window and the page keeps
+   its height. The first term is the smallest usable window; the subtraction leaves the heading, the card's own rows and
+   Load more on screen. D185: on touch and at 390px the window stays shorter than the screen and overscroll chains to the
+   page (the default), so a swipe is never trapped in the list. A collapsed border does not stick, so the header draws its
+   line instead of its border. */
+.vocabulary-main .table-wrap { overflow: auto; max-block-size: max(280px, calc(100dvh - 500px)); scroll-padding-block-start: 44px; }
+.vocabulary-main .table-wrap thead th { position: sticky; inset-block-start: 0; z-index: 1; background: var(--ca-surface); border-bottom-color: transparent; box-shadow: inset 0 -1px 0 var(--line); }
+.vocabulary-main .vocabulary-end { block-size: 1px; overflow-anchor: none; }
 @media (max-width: 700px) {
     /* One column: the Tag column has no fixed minimum and Actions asks only for its stacked width (the concept's 390px
        rows stack Browse over Rename / merge), so a wider fallback font wraps the name instead of hiding an action. */
@@ -74,6 +161,8 @@ main:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 4px; }
    absolute. Columns and gap still come from the concept's `.image-grid` tracks. */
 .image-grid { position: relative; /* D3 */ }
 .image-grid > .media-card { position: absolute; }
+/* #392 D135: a long-press on a card selects it, so no image callout (iOS) takes the press. */
+#image-grid > .media-card { -webkit-touch-callout: none; }
 /* #249 D3: a list row's info keeps its own height so it can be measured; centred, it looks as the stretched concept row.
    #249 D31: it may also shrink below a long nowrap title (the h3 ellipsis then applies, as in the grid). */
 .list-grid .media-info { align-self: center; min-width: 0; /* D3, D31 */ }
@@ -85,6 +174,8 @@ main:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 4px; }
    row stacks its text above Inspect, so neither the title nor the subtitle collapses to nothing beside the button. */
 .narrow-cards .media-info { flex-wrap: wrap; }
 .narrow-cards .media-info > div { flex: 1 0 100%; }
+/* #249 D31: Info and Tag (#249 C2) wrap onto two lines when even the stacked row cannot hold them side by side. */
+.narrow-cards .media-info > .image-card-actions { flex: 0 1 auto; min-width: 0; flex-wrap: wrap; /* D31 */ }
 /* A list row beside its art keeps room for Inspect. */
 .narrow-cards.list-grid .media-art { width: 40%; }
 .narrow-cards.list-grid .media-info { padding-inline: 4px; }
@@ -93,6 +184,13 @@ main:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 4px; }
 .image-open video { display: block; width: 100%; height: auto; aspect-ratio: 1.33; object-fit: cover; }
 .masonry-grid .image-open video { aspect-ratio: var(--media-ratio); object-fit: contain; }
 .list-grid .image-open video { height: 95px; aspect-ratio: auto; }
+
+/* #451 D157: a cover crop of a generated image keeps its top (heads, faces) instead of its middle. The vertical 20%
+   acts only when the image is taller than its box; a wider image overflows sideways and stays centred. Masonry shows
+   the whole image (contain) and keeps the centre. */
+.image-grid:not(.masonry-grid) .image-open :is(img, video), .card-art img, .detail-cover, .tag-image-preview {
+    object-position: 50% 20%; /* D157 */
+}
 
 /* Images viewer (#249 C6): the concept's `#viewer-dialog` shell (s1008–1058, ≤700 s1456–1474). #249 D34: real media,
    titles and states that the concept's one demo image never shows. */
@@ -105,6 +203,26 @@ main:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 4px; }
 /* #249 D34: under 200% page zoom the concept's 94dvh outgrows the viewport; the dialog keeps within it. */
 .ca-tools #viewer-dialog { max-height: min(94dvh, 94%); /* D34 */ }
 #viewer-dialog .dialog-header > div { min-width: 0; }
+/* #450 D156: the view switch sits before ✕ (8px apart; the header's gap is the concept's 18px), and Full screen fills the
+   browser window edge to edge (no outer margin), beating the concept's box, D34's max-height and the ≤700px height.
+   At ≤700px the viewer is already full-bleed, so the switch hides there. */
+#viewer-dialog .dialog-header > #viewer-mode { margin-inline-end: -10px; }
+/* #532 D170: ⌘ sits before the view switch, 8px apart, and takes the header's free space. */
+#viewer-dialog .dialog-header > #viewer-keys { margin-inline-start: auto; margin-inline-end: -10px; }
+.ca-tools #viewer-dialog.viewer-fullscreen[open] { inset: 0; width: auto; height: auto; max-width: none; max-height: none; margin: 0; border: 0; border-radius: 0; }
+/* `!important` only to beat the concept's `.icon-btn { display: inline-grid !important }`. */
+@media (max-width: 700px) { #viewer-dialog .dialog-header > :is(#viewer-mode, #viewer-keys) { display: none !important; } }
+/* #532 D170: the shortcuts overlay, a small dialog over the viewer. */
+.ca-tools #viewer-keys-dialog { width: min(600px, calc(100vw - 32px)); height: fit-content; max-height: 90dvh; overflow: auto; }
+#viewer-keys-dialog .viewer-keys-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px 24px; margin-bottom: 14px; }
+#viewer-keys-dialog h3 { margin: 0 0 8px; }
+#viewer-keys-dialog .dialog-header > button { margin-inline-start: auto; }
+#viewer-keys-dialog dl { display: grid; gap: 8px; margin: 0; }
+#viewer-keys-dialog dl > div { display: flex; align-items: center; gap: 12px; }
+#viewer-keys-dialog dt { flex: 0 0 64px; }
+#viewer-keys-dialog dd { margin: 0; }
+#viewer-keys-dialog kbd { display: inline-block; min-width: 28px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px; font: inherit; text-align: center; }
+#viewer-keys-dialog > p { margin: 0; }
 #viewer-title { overflow-wrap: anywhere; /* D34 */ }
 #viewer-dialog, #viewer-dialog::backdrop { overscroll-behavior: contain; }
 #viewer-details { overscroll-behavior: contain; /* D34 */ }
@@ -128,22 +246,376 @@ main:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 4px; }
 @media (pointer: coarse) {
     /* #249 D34: coarse pointers keep 40px square viewer targets (the concept's "−" and "+" are narrower). */
     #viewer-dialog :is(.dialog-header > button, #viewer-toolbar > button, #viewer-toolbar > a) { min-width: 40px; min-height: 40px; /* D34 */ }
+    /* #249 D34: the details' disclosure summaries and "Download original" keep 40px targets too (the concept's coarse
+       rule covers buttons only); the summary keeps its disclosure marker. */
+    #viewer-details summary { box-sizing: border-box; min-block-size: 40px; padding-block: 10px; /* D34 */ }
+    #viewer-details a { display: inline-flex; align-items: center; min-block-size: 40px; /* D34 */ }
 }
 @media (max-width: 700px) {
     #viewer-toolbar > .media-download { font-size: 10px; /* D34: as the concept's `.viewer-toolbar button` */ }
 }
 
-/* Interim page guards: concept element rules (`.ca-tools dialog`, `pre`) now reach production dialogs and prompt text
-   that keep their own design until their page PR rebuilds them in concept markup. */
-.panel { background: var(--ca-surface); border: 1px solid var(--line); } /* PR D: Images side panel (padding and radius in images.css) becomes `.detail-panel` */
-.ca-tools dialog.prompt-sender { width: min(760px, calc(100% - 32px)); max-width: none; max-height: calc(100dvh - 32px); padding: 22px; border-color: var(--ca-line); border-radius: 12px; } /* PR D */
-.ca-tools dialog.prompt-sender::backdrop { background: #000b; } /* PR D */
-.ca-tools dialog.recorded-run-dialog { width: min(1100px, calc(100% - 32px)); max-width: calc(100% - 32px); max-height: calc(100dvh - 32px); padding: 22px; border-radius: 7px; } /* PR F */
-pre.prompt-text { background: none; padding: 0; border: 0; border-radius: 0; max-height: none; overflow: visible; } /* PR D: prompt text becomes `p.prompt-text` */
-.ca-tools .prompt-actions .ca-icon-button { min-width: 30px; } /* PR D: the concept's 28px prompt action would shrink the toolkit icon button */
+.prompt-text[tabindex]:focus-visible { outline: 2px solid var(--ca-focus); outline-offset: 3px; } /* production-only: a confirmed prompt stays keyboard-reachable (#249 D22) */
+
+/* Images side panel (#249 D2), production-only. Real prompts can be far longer than the concept's samples, so the sticky
+   panel scrolls within the window and its footer stays reachable; where the concept unsticks it, it grows instead. */
+.detail-panel { min-inline-size: 0; max-block-size: calc(100dvh - 40px); overflow: auto; /* D2 */ }
+@media (max-width: 700px) { .detail-panel { max-block-size: none; /* D2 */ } }
+@container images-page (inline-size < 600px) { .detail-panel { position: static; max-block-size: none; /* D2 */ } }
+/* #249 D2/D20: the prompt blocks' mount point is transparent, so their sections sit in `.detail-inner` (panel) and the
+   viewer details' wrapper as the concept's do. */
+:is(.detail-inner, #viewer-details > div) > .prompt-inspector { display: contents; /* D20 */ }
+/* #249 D2: real titles and filenames can be one unbroken word; they wrap inside the 310px panel. */
+.panel-heading h2, .detail-inner > p.small { min-inline-size: 0; overflow-wrap: anywhere; }
+
+/* #249 D3: production-only rules kept from the retired images.css and inspector.css. Each has a live consumer. */
+/* The inspector wraps real unbroken literals (model paths, raw records) inside the 310px panel and the 340px viewer
+   details, and an unavailable download stays visibly inert next to its reason. */
+.file-inspector { min-inline-size: 0; overflow-wrap: anywhere; }
+.file-inspector [aria-disabled="true"] { opacity: .6; cursor: not-allowed; }
+/* #449 D154: the image's own tags and the linked prompt's or recipe's tags sit in the prompt sections' frame (concept
+   .prompt-section), under a muted .role-label; the heading's 8px spaces the chips, as it spaces a prompt's text. */
+.file-inspector .tag-section { border-top: 1px solid var(--line); padding-top: 15px; margin-top: 15px; }
+.file-inspector .tag-section .role-label { color: var(--ca-muted); }
+.file-inspector .tag-section > .tags { margin-top: 0; }
+/* #249 D20: the viewer details' pair send and history buttons wrap inside the narrow rail at 200% zoom with wider fonts,
+   where the toolkit's `nowrap` would push them past its edge. */
+.ca-tools #viewer-details > button { white-space: normal; /* D20 */ }
+/* LI-4: "Copy settings summary" after the facts wraps the same way in the narrow rail. */
+.ca-tools #viewer-details .settings-summary { white-space: normal; /* D117 */ }
+/* The Images page narrows to one column inside a narrow container (the Library-embedded gallery). */
+.images-main { container: images-page / inline-size; }
+@container images-page (inline-size < 600px) {
+    .image-workspace { grid-template-columns: minmax(0, 1fr); }
+}
+/* #249 D42: a discovery alert a rescan leaves scrolls clear of the concept's fixed toast (22px inset, 12px at 700px and
+   below, two 12px lines at 390px), never under it; the toast itself keeps the concept's placement. */
+.options-status { font-size: 12px; padding-inline: 4px; scroll-margin-block-end: 140px; /* D42, D187: clear of the toast and the chip above it */ }
+
+/* Prompt library cards (#249 PR E): the concept's `article.prompt-card` (s653–708) with real prompts, titles and media. */
+/* #249 D23: real prompts are far longer than the concept's samples, so the card clamps the positive to two lines; copy
+   and send keep the full text, and history shows all of it. */
+.prompt-card .prompt-text { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; /* D23 */ }
+/* #249 D23: the prompt blocks' mount point is transparent, so the section sits in `.card-content` as the concept's does. */
+.card-content > .prompt-inspector { display: contents; /* D23 */ }
+/* #249 D24: the history summary's prompt blocks sit in `article.surface` as the concept's do (app.js a598); the mount
+   point keeps its "Saved prompt texts" region name. */
+.library-history article.surface > .prompt-inspector { display: contents; /* D24 */ }
+/* #249 D25: each compared negative's block sits in the concept's `.compare-item` (app.js a600), so its mount point is
+   transparent and adds no margin. */
+.compare-item > .prompt-inspector { display: contents; /* D25 */ }
+/* #249 D23: a real title can be long or one unbroken word; it wraps inside the title row (the toolkit's buttons never
+   wrap), while the category chip keeps whole words beside it and wraps only a name wider than its share of the row. */
+.card-title button { min-width: 0; white-space: normal; overflow-wrap: anywhere; /* D23 */ }
+.card-title .chip { flex-shrink: 0; max-width: 60%; overflow-wrap: anywhere; /* D23 */ }
+.prompt-card .tags .chip { max-width: 100%; overflow-wrap: anywhere; /* D23 */ }
+/* #249 D23: a parent with one preview, or none, fills the art row instead of leaving the concept's second cell empty. */
+.prompt-card .card-art > :only-child { grid-column: 1 / -1; /* D23 */ }
+.prompt-card .card-art > .small { display: grid; place-content: center; min-width: 0; color: var(--ca-muted); /* D23 */ }
+/* #437 D148: the card's selection checkbox is the concept's Images `.image-overlays`, placed over the art as on an image
+   card; `.media-art` carries the concept's `position: relative` there, the prompt card carries it here. */
+.prompt-card { position: relative; /* D148 */ }
+
+/* Prompt library shelf (#249 PR E). #249 D3: rows stay windowed, as the Images grid's do; the concept's `.library-grid`
+   tracks and breakpoints lay them out, each row spans them, and appended rows never anchor the scroll. The row's
+   `min-inline-size: 0` is load-bearing: it keeps cards out of the concept's ≤700px `1fr` track's min-content. */
+.library-main .library-grid { overflow-anchor: none; /* D3 */ }
+.library-main .library-row { grid-column: 1 / -1; display: grid; grid-template-columns: inherit; gap: 18px; min-inline-size: 0; /* D3 */ }
+.library-main .library-row-spacer { grid-column: 1 / -1; pointer-events: none; /* D3 */ }
+/* #249 D40: the shelf's and history's production-only load, failure and continuation states. */
+.library-main .library-continuation { padding-block: 22px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; /* D40 */ }
+.library-main .library-status { flex: 1 1 240px; color: var(--ca-muted); /* D40 */ }
+
+/* History variants panel (#249 PR F). */
+/* D45: the panel's actions wrap their labels at 390px and 200% zoom (the toolkit's buttons never wrap). */
+.ca-tools .library-main .library-history .row-actions button { max-inline-size: 100%; white-space: normal; /* D45 */ }
+/* D45: the panel's paging buttons wrap like the recorded toolbar's. */
+.ca-tools .library-main :where(.timeline-panel, .history-toolbar) > button { max-inline-size: 100%; white-space: normal; /* D45 */ }
+/* D45: archived pairs (#235) are concept lanes at reduced emphasis (the .6 disabled-marker opacity); text stays at full contrast. */
+.library-history .variant-lane.library-variant-archived::before, .ca-tools .library-history .library-variant-archived .variant-dot { opacity: .6; /* D45 */ }
+.ca-tools .library-main .library-variant-restore { position: static; margin-inline-start: 8px; min-block-size: 24px; padding: 2px 8px; font-size: 10px; vertical-align: middle; /* D45 */ }
+@media (pointer: coarse) { .ca-tools .library-main .library-variant-restore { min-block-size: 40px; /* D45 */ } }
+/* D45: at 390px and 200% zoom the panel heading and the legend row wrap, and the All images button wraps its label,
+   so the page never scrolls sideways (the retired production footer did the same). */
+.library-history .timeline-panel > .panel-heading, .library-history .timeline-lower { flex-wrap: wrap; /* D45 */ }
+/* D45: while the repeat-run dot shows (left: 190px), the lane text wraps inside the 57px lane before it (43px + 139px). */
+.library-history .variant-lane:has(> .run-dot:not([hidden])) > span { max-inline-size: 139px; overflow-wrap: anywhere; /* D45 */ }
+.ca-tools .library-history .timeline-lower > button { max-inline-size: 100%; white-space: normal; /* D45 */ }
 @media (pointer: coarse) {
-    .ca-tools .recorded-history .history-toolbar button { min-height: 44px; } /* PR F: concept coarse buttons are 40px */
+    /* D45: a coarse pointer reaches the concept dot through a 47px target. */
+    .ca-tools .library-history .variant-dot::after { content: ""; position: absolute; inset: -9px; }
+    /* D45: the 12px repeat-run dot (8px inside its border) gets a 44px coarse target the same way. */
+    .ca-tools .library-history .run-dot::after { content: ""; position: absolute; inset: -18px; }
+}
+
+/* #249 D48: production surfaces the concept never shows keep their own rules, in the concept's tokens: recorded
+   executions and the Recorded run dialog (#209, D26), the Archive negative confirmation (#235) and the acknowledged
+   prompt sender (spec §2.2). The dialog rules name `dialog` so they win over the concept's `.ca-tools dialog`. */
+/* D48: recorded executions (#209) below the shared gallery. */
+.library-main .library-surface { padding: 22px; background: var(--ca-surface); border: 1px solid var(--ca-line); border-radius: 7px; margin-block: 18px; /* D48 */ }
+.history-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-block: 14px; /* D48 */ }
+.recorded-history > .muted, .history-count, .history-scope, .history-status, .history-legend { font-size: 11px; line-height: 1.65; overflow-wrap: anywhere; /* D48 */ }
+.library-main .recorded-history > h2 { font-size: 14px; line-height: 1.5; /* D48 */ }
+.library-main .recorded-history > h2 + p { font-size: 12px; line-height: 1.5; /* D48 */ }
+.history-timeline { position: relative; box-sizing: border-box; inline-size: 100%; max-inline-size: 100%; max-block-size: 490px; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; border: 1px solid var(--ca-line); border-radius: 6px; background: var(--ca-field); /* D48 */ }
+.history-canvas { position: relative; min-inline-size: calc(100% - 40px); margin: 18px 20px; /* D48 */ }
+.history-positive-lane { position: absolute; inset-block-start: 17px; inset-inline: 0; border-block-start: 2px solid var(--green); color: var(--green); font-size: 10px; line-height: 1.6; padding-inline-start: 38px; /* D48 */ }
+.history-positive-lane::before { content: "+"; position: absolute; inset-block-start: -13px; inset-inline-start: 0; border-radius: 50%; inline-size: 25px; block-size: 25px; background: var(--green); color: #172b22; text-align: center; font-size: 14px; line-height: 21px; /* D48 */ }
+.history-positive-lane > span { position: absolute; inset-block-start: -25px; inset-inline-start: 38px; font-size: 10px; color: var(--green); /* D48 */ }
+.history-earlier-edge { position: absolute; inset: 0 auto 0 0; inline-size: 1px; /* D48 */ }
+.history-context-branch { position: absolute; inset-inline-end: 0; block-size: 57px; border-block-start: 2px solid color-mix(in srgb, var(--red) 60%, transparent); /* D48 */ }
+.history-context-branch::before { content: ""; position: absolute; inset-block-start: -25px; inset-inline-start: -30px; inline-size: 30px; block-size: 25px; border-inline-start: 2px solid var(--red); border-block-end: 2px solid var(--red); border-end-start-radius: 22px; /* D48 */ }
+.history-context-label { position: absolute; inset-inline-start: 43px; inset-block-start: 6px; inline-size: 370px; max-inline-size: calc(100% - 43px); font-size: 10px; line-height: 1.5; color: var(--ca-muted); overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: clip; /* D48 */ }
+.history-run-list { position: absolute; inset: 0; margin: 0; padding: 0; list-style: none; /* D48 */ }
+.history-run-column { position: absolute; inset-block: 0; inline-size: 64px; pointer-events: none; /* D48 */ }
+.history-position { position: absolute; inset-block-start: 41px; font-size: 10px; color: var(--ca-muted); /* D48 */ }
+.ca-tools .history-run-marker { position: absolute; pointer-events: auto; transform: translate(-50%, -50%); inline-size: 12px; block-size: 12px; min-inline-size: 12px; min-block-size: 12px; border: 2px solid var(--red); border-radius: 50%; background: var(--ca-field); padding: 0; color: var(--ca-field); font-size: 16px; line-height: 1; /* D48 */ }
+.ca-tools .history-context-anchor { inline-size: 29px; block-size: 29px; min-inline-size: 29px; min-block-size: 29px; background: var(--red); color: #38151b; font-size: 12px; /* D48 */ }
+.history-run-marker[aria-pressed="true"], .history-run-marker:focus-visible { outline: 3px solid var(--ca-focus); outline-offset: 4px; /* D48 */ }
+.history-run-marker[aria-disabled="true"] { opacity: .6; cursor: progress; /* D48 */ }
+/* D48: the Recorded run dialog (#209, D26). */
+.ca-tools dialog.recorded-run-dialog { box-sizing: border-box; inline-size: min(1100px, calc(100% - 32px)); max-inline-size: calc(100% - 32px); max-block-size: calc(100dvh - 32px); padding: 22px; border-radius: 7px; overscroll-behavior: contain; scrollbar-gutter: stable; overflow-wrap: anywhere; /* D48 */ }
+.recorded-run-header { display: flex; gap: 12px; align-items: center; justify-content: space-between; /* D48 */ }
+.recorded-run-header h2 { font-size: 20px; /* D48 */ }
+.recorded-run-body, .recorded-run-body > section { min-inline-size: 0; /* D48 */ }
+.recorded-run-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; font-size: 12px; /* D48 */ }
+.recorded-run-facts dt { color: var(--ca-muted); font-size: 10px; /* D48 */ }
+.recorded-run-facts dd { margin: 4px 0 0; white-space: pre-wrap; /* D48 */ }
+.recorded-run-anchors, .recorded-run-mode { display: flex; flex-wrap: wrap; gap: 8px; margin-block: 18px; /* D48 */ }
+.recorded-run-dialog [aria-pressed="true"] { outline: 2px solid var(--ca-focus); outline-offset: 2px; /* D48 */ }
+.recorded-run-dialog :where(.muted:not(.prompt-text), .recorded-output-status) { font-size: 11px; line-height: 1.65; /* D48 */ }
+/* D48: the current file's prompt blocks sit below the dialog's evidence line (elsewhere their mount point is `display: contents`). */
+.recorded-run-dialog .prompt-inspector { margin-block-start: 22px; /* D48 */ }
+.recorded-provenance { border-block-start: 1px solid var(--ca-line); padding-block-start: 12px; margin-block: 18px; /* D48 */ }
+.recorded-outputs { margin-block: 24px; /* D48 */ }
+.recorded-receipts { list-style: decimal; padding-inline-start: 24px; /* D48 */ }
+.recorded-receipt { border: 1px solid var(--ca-line); border-radius: 5px; padding: 12px; margin-block: 10px; font-size: 12px; /* D48 */ }
+.recorded-receipt > div { margin-block-end: 10px; /* D48 */ }
+.recorded-receipt[aria-current="true"] { outline: 2px solid var(--ca-focus); outline-offset: 2px; /* D48 */ }
+.recorded-current-file { border-block-start: 1px solid var(--ca-line); padding-block-start: 16px; /* D48 */ }
+/* D48: the frozen field provenance and the Archive confirmation show stored text in `pre.prompt-text`, not as the
+   concept's code `pre`. */
+pre.prompt-text { font: inherit; font-size: 12px; line-height: 1.75; margin-block: 10px; background: none; padding: 0; border: 0; border-radius: 0; max-height: none; overflow: visible; /* D48 */ }
+/* D48: the Archive negative confirmation's negative block (#235). */
+.prompt-block { border-block-start: 1px solid var(--ca-line); padding-block: 13px; min-inline-size: 0; /* D48 */ }
+.prompt-block-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; /* D48 */ }
+.prompt-block.prompt-negative h3 { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; margin: 0; color: var(--red); /* D48 */ }
+.prompt-empty { font-size: 10px; /* D48 */ }
+/* D48: the acknowledged prompt sender (prompt-sender.mjs) and its labelled pair send button. */
+.prompt-send-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; color: var(--ca-focus); /* D48 */ }
+.prompt-send-button svg { inline-size: 16px; block-size: 16px; flex-shrink: 0; /* D48 */ }
+.ca-tools dialog.prompt-sender { inline-size: min(760px, calc(100% - 32px)); max-inline-size: none; max-block-size: calc(100dvh - 32px); padding: 22px; border-color: var(--ca-line); border-radius: 12px; /* D48 */ }
+.ca-tools dialog.prompt-sender::backdrop { background: #000b; /* D48 */ }
+.prompt-sender-header, .prompt-sender-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; /* D48 */ }
+.prompt-sender-header h2 { font-size: 20px; /* D48 */ }
+.prompt-sender-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-block: 20px; /* D48 */ }
+.prompt-sender-options .ca-field { display: flex; flex-direction: column; align-items: stretch; gap: 6px; /* D48 */ }
+.prompt-sender select { inline-size: 100%; min-block-size: 38px; /* D48 */ }
+.prompt-sender-status { font-size: 13px; line-height: 1.6; /* D48 */ }
+.prompt-sender-status[role="alert"] { color: var(--ca-error-text); /* D48 */ }
+.prompt-sender-preview { margin-block: 20px; min-inline-size: 0; /* D48 */ }
+.prompt-sender-field { border: 1px solid var(--ca-line); border-radius: 7px; padding: 14px; margin-block: 12px; min-inline-size: 0; /* D48 */ }
+.prompt-sender-field :where(pre, textarea), .prompt-sender-composition { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 12px; line-height: 1.65; max-inline-size: 100%; /* D48 */ }
+/* D191 (#542): each node of "All eligible nodes" reviews under its own heading. */
+.prompt-sender-node { border-block-start: 1px solid var(--ca-line); padding-block-start: 14px; margin-block: 18px; min-inline-size: 0; /* D191 */ }
+.prompt-sender-node > h4 { font-size: 15px; /* D191 */ }
+.prompt-sender-field textarea { inline-size: 100%; min-block-size: 100px; resize: vertical; /* D48 */ }
+.prompt-sender-composition { padding: 12px; background: var(--ca-field); border-radius: 6px; /* D48 */ }
+.prompt-sender-actions { justify-content: flex-end; margin-block-start: 18px; /* D48 */ }
+@media (max-width: 780px) {
+    .prompt-sender-options { grid-template-columns: minmax(0, 1fr); /* D48 */ }
 }
 @media (max-width: 700px) {
-    .ca-tools dialog.recorded-run-dialog { padding: 16px; } /* PR F */
+    .ca-tools dialog.recorded-run-dialog { padding: 16px; /* D48 */ }
+    .recorded-run-facts { grid-template-columns: minmax(0, 1fr); /* D48 */ }
 }
+@media (pointer: coarse) {
+    /* D48: the recorded toolbar, its scope disclosure and the dialog's controls keep 44px targets (concept coarse buttons are 40px). */
+    .ca-tools .recorded-history :is(.history-toolbar button, .history-scope summary) { min-inline-size: 44px; min-block-size: 44px; }
+    .ca-tools .history-run-marker { inline-size: 44px; block-size: 44px; min-inline-size: 44px; min-block-size: 44px; border: 0; background: transparent; color: transparent; }
+    .ca-tools .history-run-marker::before { content: ""; position: absolute; inset: 16px; box-sizing: border-box; border: 2px solid var(--red); border-radius: 50%; background: var(--ca-field); }
+    .ca-tools .history-context-anchor::before { content: "−"; inset: 7.5px; inline-size: 29px; block-size: 29px; line-height: 25px; color: #38151b; background: var(--red); }
+    .ca-tools .recorded-run-dialog :where(button, summary) { min-inline-size: 44px; min-block-size: 44px; }
+}
+@media (forced-colors: active) {
+    .history-context-branch, .history-context-branch::before, .history-run-marker, .history-run-marker::before { border-color: CanvasText; }
+    .history-run-marker[aria-pressed="true"] { outline-color: Highlight; }
+}
+
+/* Tag image dialog (#249 C2): the concept's `tagging-modal` (s1598–1694) as it stands, but D83 (ruling T4): the
+   suggestions are removable chips, each the concept's `.chip` corner (4px; the later `.tag-suggestion` row rule would
+   give 5px) around the row's 12px text in its checked suggestion row's tokens (`.tag-suggestion:has(input:checked)`,
+   s1655): a name, the confidence and a × button. */
+#tag-suggestions .chip.tag-suggestion, .skip-chips .chip.tag-suggestion { display: inline-flex; gap: 6px; padding: 2px 2px 2px 8px; margin-bottom: 0; cursor: default; color: inherit; border-color: var(--ca-accent); background: var(--soft-blue); border-radius: 4px; /* D83 */ }
+#tag-suggestions .chip.tag-suggestion .tag-confidence, .skip-chips .chip.tag-suggestion .tag-confidence { margin-inline-start: 0; /* D83 */ }
+.ca-tools #tag-suggestions .chip.tag-suggestion > button, .ca-tools .skip-chips .chip.tag-suggestion > button { min-block-size: 24px; min-inline-size: 24px; padding: 0 6px; /* D83 */ }
+@media (pointer: coarse) {
+    /* D83: the chip's × keeps the concept's 40px coarse target. */
+    .ca-tools #tag-suggestions .chip.tag-suggestion > button, .ca-tools .skip-chips .chip.tag-suggestion > button { min-block-size: 40px; min-inline-size: 40px; }
+}
+
+/* Needs review (#249 PR F): the concept's Metadata review page (app.js a749–760) in its own classes. */
+/* #249 D3: the review queue is not virtualized, so its cards stay in the concept grid's flow. */
+.image-grid.review-queue > .media-card { position: static; /* D3 */ }
+/* #249 D20: the prompt blocks' mount point is transparent, so the chosen path's sections sit in the panel as the
+   concept's do. */
+.review-panel > .prompt-inspector { display: contents; /* D20 */ }
+/* D119: a file that cannot be served (no current root) has an inert, empty media button that keeps the concept's
+   1.33 media area (app.js `.image-open img`), so its card lines up with the queue's other cards. */
+.review-queue .image-open[aria-disabled="true"] { cursor: not-allowed; aspect-ratio: 1.33; /* D119 */ }
+/* D119: a long file name in the panel wraps inside the panel, where the concept's sample name never overflows. */
+.review-panel > p.small { min-inline-size: 0; overflow-wrap: anywhere; /* D119 */ }
+/* #536: the concept's rows hidden when there is nothing to apply (D180), and the picker (D181). */
+.review-panel > [hidden], .review-panel .dialog-actions > [hidden], #modal .field[hidden] { display: none; }
+.review-unreadable { display: grid; gap: 6px; margin-block: 12px; overflow-wrap: anywhere; }
+.review-link-results { display: grid; gap: 6px; max-block-size: 40vh; overflow-y: auto; }
+.review-link-results > button { justify-content: flex-start; inline-size: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-link-results > button[aria-pressed="true"] { border-color: var(--ca-accent); background: var(--soft-blue); }
+.review-panel button[aria-disabled="true"], .review-link-actions button[aria-disabled="true"] { opacity: .55; cursor: not-allowed; }
+/* Auto-tag selected images (#249 PR D, D85/D90): the Tag image dialog's model panel, then How to apply, a radio group
+   in the concept's `.field` row whose radios keep their own size (the concept's `.field input` is a full-width text
+   field) beside their label, as the concept's own radio rows (s1160 `.compare-item label`). */
+.field[role="radiogroup"] > label { display: flex; align-items: center; gap: 8px; /* D90 */ }
+.field[role="radiogroup"] input[type="radio"] { width: auto; margin: 0; /* D90 */ }
+/* D129: the library-location notice sits above every page, in main's own padding and width, so its `.notice` lines
+   up with the page below; main's top padding then spaces it from the page. */
+.library-banner { max-width: 1900px; margin: auto; padding: 30px 30px 0; /* D129 */ }
+.library-banner > .notice { margin-bottom: 0; /* D129 */ }
+@media (max-width: 1250px) { .library-banner { padding: 24px 24px 0; /* D129 */ } }
+@media (max-width: 700px) { .library-banner { padding: 20px 14px 0; /* D129 */ } }
+/* D101: a duplicate copy's Keep label is its source and path, often long names with no space to break at; it wraps
+   inside its `.compare-item` so the review never scrolls sideways. */
+.duplicate-groups .compare-item label { overflow-wrap: anywhere; /* D101 */ }
+/* D105: a review's grid values (the restore's backup file name, a safety backup's name) may be long names with no space
+   to break at; they wrap inside their column, so the concept's two equal columns hold at phone width. */
+#modal-body > dl.meta-grid dd { overflow-wrap: anywhere; /* D105 */ }
+/* D106: Integrations' two selects keep their chosen option readable: they never shrink for the row's reason lines, and
+   at phone width they may grow past the concept's 120px cap (which cuts "Follow host renderer") up to 160px. */
+.setting-row :is(#send-destination, #renderer) { flex-shrink: 0; /* D106 */ }
+@media (max-width: 700px) {
+  #workspace-main .setting-row :is(#send-destination, #renderer) { max-width: 160px !important; /* D106 */ }
+}
+/* D202 (#431): System › Auto-tagging "Skipped tags", a setting whose control (an add input, the chips and the preview
+   line) is wider than a `.setting-row` column: the row's label and description tokens over the full width, the chips
+   in the Tag image dialog's D83 chip markup (an entry that hides no known tag is muted). */
+.setting-block { padding: 17px 0; border-top: 1px solid var(--line); /* D202 */ }
+.setting-block-text label { font-size: 12px; font-weight: 500; display: block; /* D202 */ }
+.setting-block-text p { font-size: 11px; color: var(--ca-muted); margin-top: 4px; max-width: 640px; /* D202 */ }
+.setting-block[aria-invalid="true"] { box-shadow: inset 3px 0 0 var(--red); padding-inline-start: 12px; /* D202 */ }
+.skip-add { display: flex; gap: 8px; margin-top: 12px; max-width: 460px; /* D202 */ }
+.skip-add input { flex: 1; min-width: 0; font-size: 12px; /* D202 */ }
+.skip-problem { color: var(--red); margin-top: 6px; /* D202 */ }
+.skip-problem:empty, .skip-chips:empty { display: none; /* D202 */ }
+.skip-chips .chip.tag-suggestion.none { border-color: var(--line); background: var(--ca-field); color: var(--ca-muted); /* D202 */ }
+.skip-preview { margin-top: 12px; max-width: 760px; /* D202 */ }
+.skip-preview b { font-weight: 500; color: var(--ca-text); /* D202 */ }
+@media (max-width: 700px) {
+    .skip-add { max-width: none; /* D202 */ }
+}
+
+/* D203 (#431): "Saved instructions": the list (Built-in first, its chips) beside the Name/Text editor, stacked under
+   it below 700px, and the note a deleted default leaves under the two default rows. */
+.instructions-layout { display: grid; grid-template-columns: minmax(200px, 260px) minmax(0, 1fr); gap: 18px; margin-top: 12px; /* D203 */ }
+.instruction-list { border: 1px solid var(--line); border-radius: 6px; background: var(--ca-field); max-height: 300px; overflow: auto; /* D203 */ }
+.instruction-list [role="option"] { display: flex; flex-direction: column; gap: 4px; padding: 9px 12px; cursor: pointer; border-bottom: 1px solid var(--line); font-size: 12px; /* D203 */ }
+.instruction-list [role="option"]:last-child { border-bottom: 0; /* D203 */ }
+.instruction-list [role="option"][aria-selected="true"] { background: var(--soft-blue); box-shadow: inset 3px 0 0 var(--ca-accent); /* D203 */ }
+.instruction-list .badges { display: flex; flex-wrap: wrap; gap: 4px; /* D203 */ }
+.instruction-actions { margin-top: 10px; flex-wrap: wrap; /* D203 */ }
+.instruction-editor .field:first-child { margin-top: 0; /* D203 */ }
+.instruction-editor input[readonly], .instruction-editor textarea[readonly] { color: var(--ca-muted); /* D203 */ }
+.instruction-editor label { display: flex; justify-content: space-between; gap: 8px; /* D203 */ }
+.instruction-reset { color: var(--warning); margin: 0 0 14px; /* D203 */ }
+.instruction-reset:empty { display: none; /* D203 */ }
+@media (max-width: 700px) {
+    .instructions-layout { grid-template-columns: 1fr; /* D203 */ }
+}
+
+/* D204 (#431): the one-off edit's note under "Tagging instructions" in the Tag image and Auto-tag selected dialogs. */
+.tag-model-panel .instructions-edited { margin: -6px 0 12px; /* D204 */ }
+.tag-model-panel .instructions-edited[hidden] { display: none; /* D204 */ }
+
+/* D132: at phone width the concept's 120px cap cuts every engine label ("WD14 SwinV2 · ~400 MB"); the Tagging model
+   select alone keeps its natural width there (its widest engine label) and, with no room beside the row text, wraps
+   under it. Existing tags (#398) never shrinks for its row text and, past the cap, keeps its natural width beside the
+   text ("Replace after review"), bounded by its row like the engine select. */
+.setting-row #tag-existing { flex-shrink: 0; /* D132 */ }
+/* D203: the default-instructions selects show their chosen name whole, as Existing tags does (#398). */
+.setting-row #instruction-default-gguf, .setting-row #instruction-default-hf { flex-shrink: 0; /* D203 */ }
+@media (max-width: 700px) {
+  #workspace-main .setting-row:has(> #tag-model) { flex-wrap: wrap; /* D132 */ }
+  #workspace-main .setting-row #tag-model { flex-shrink: 0; max-width: 100% !important; /* D132 */ }
+  #workspace-main .setting-row #tag-existing { max-width: 100% !important; /* D132 */ }
+  #workspace-main .setting-row #instruction-default-gguf, #workspace-main .setting-row #instruction-default-hf { max-width: 100% !important; /* D203 */ }
+}
+
+/* D109: System › Diagnostics & logs' added Lines field sits in the concept's toolbar like its Level select, and a value
+   outside 1–500 is highlighted as a refused setting is (D92). */
+.toolbar #log-limit { inline-size: 6em; min-height: 36px; font-size: 11px; /* D109 */ }
+.toolbar #log-limit[aria-invalid="true"] { outline: 2px solid var(--red); outline-offset: 2px; /* D109 */ }
+
+/* #332 D146: the category chip names its origin (" · this image", " · prompt", " · recipe") in muted text that never
+   splits; at 390px the chip may wrap between the category and its origin. */
+.chip .chip-source { color: var(--ca-muted); white-space: nowrap; }
+/* D147 (#430): a state that blocks Save shows its reason on its own row above the sticky actions, with Refresh for a
+   changed source; the disabled actions look disabled; a refused capture's empty preview says so. */
+.tagging-modal .dialog-actions [aria-disabled="true"], .tagging-modal .tag-model-panel [aria-disabled="true"] { opacity: .55; cursor: not-allowed; /* D147 */ }
+#modal .dialog-actions .image-delete-start[aria-disabled="true"], #modal .dialog-actions .image-delete-start[aria-disabled="true"]:hover { color: var(--ca-muted); border-color: var(--ca-border); background: transparent; opacity: .55; cursor: not-allowed; /* #480 D159: no mode chosen yet, #543 D190: or nothing can move: neutral, no danger colors */ }
+.tagging-modal .tag-action-notice { flex: 1 0 100%; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 0; color: var(--ca-text); font-size: 12px; /* D147 */ }
+.tagging-modal .tag-action-notice > span { flex: 1 1 16em; }
+.tag-image-preview.tag-preview-empty { display: grid; place-items: center; padding: 8px; text-align: center; font-size: 12px; color: var(--ca-muted); background: var(--ca-field); box-sizing: border-box; /* D147 */ }
+
+/* D163 (#512): the prompt page's "⋯" More menu. The concept has no menu; it uses the concept's button, surface, border
+   and toast shadow, opens under its button, right-aligned so it stays inside a 390px viewport. */
+.more-menu { position: relative; display: inline-flex; }
+.more-menu-list {
+    position: absolute; top: calc(100% + 6px); right: 0; z-index: 20; display: flex; flex-direction: column; gap: 4px;
+    min-width: 160px; padding: 6px; background: var(--ca-surface); border: 1px solid var(--ca-border); border-radius: 6px;
+    box-shadow: 0 8px 35px #0004;
+}
+.more-menu-list[hidden] { display: none; }
+.more-menu-list > button { justify-content: flex-start; text-align: left; width: 100%; white-space: nowrap; }
+.legacy-pages { margin: 16px 0 0; color: var(--muted); /* D165 */ }
+
+/* D164 (#524): the prompt page has four heading actions and titles of any length, which the concept never shows. From
+   the concept's sidebar breakpoint up the actions keep one row and the title takes what is left, clamped to two lines
+   (its full text stays in the DOM and in `title`). A short title lays out exactly as the concept's. */
+@media (min-width: 951px) {
+    .heading.prompt-page-heading > div:first-child { min-width: 0; }
+    .heading.prompt-page-heading > .heading-actions { flex: 0 0 auto; }
+    .heading.prompt-page-heading h1 {
+        display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
+        overflow: hidden; overflow-wrap: anywhere;
+    }
+}
+
+/* D186 (#531, beyond the concept): the selection bars stay in view while you select. This one rule is their position. `--selection-bar-block`
+   (sticky-chrome.mjs) is the room a shown bar takes; a focused card control and the Images panel keep clear of it
+   (scroll-margin on them, not scroll-padding on the root, which would scroll the page to reveal the bar's own buttons). At one
+   column the bar is one row that scrolls sideways, so it does not take a fifth of a phone screen. */
+#bulkbar, #library-bulkbar { position: sticky; inset-block-start: 8px; z-index: 5; }
+:is(#image-grid, .library-grid) :is(article, a, button, input, select, textarea, [tabindex]) { scroll-margin-block-start: var(--selection-bar-block, 0px); }
+.detail-panel { inset-block-start: max(20px, var(--selection-bar-block, 0px)); max-block-size: calc(100dvh - 20px - max(20px, var(--selection-bar-block, 0px))); /* D186 */ }
+@media (max-width: 700px) {
+    .detail-panel { max-block-size: none; /* D186 */ }
+    .bulkbar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; /* D186 */ }
+    .bulkbar > * { flex: none; /* D186 */ }
+}
+@container images-page (inline-size < 600px) { .detail-panel { max-block-size: none; /* D186 */ } }
+
+/* D187 (#531, beyond the concept): Back to top, in the toast's column. It rests above a two-line toast, so the usual
+   toast does not move it under a finger, and rises only for a taller one. */
+.ca-tools .back-to-top {
+    --toast-rest: 70px;
+    position: fixed; inset-inline-start: 50%; transform: translateX(-50%); z-index: 10;
+    inset-block-end: calc(22px + max(var(--toast-rest), var(--toast-block, 0px)));
+    padding: 6px 12px; border: 1px solid var(--ca-line); border-radius: 999px; background: var(--ca-surface);
+    box-shadow: 0 8px 35px #0004; font-size: 12px; white-space: nowrap;
+}
+@media (max-width: 700px) { .ca-tools .back-to-top { inset-block-end: calc(12px + max(var(--toast-rest), var(--toast-block, 0px))); } }
+@media (pointer: coarse) { .ca-tools .back-to-top { min-block-size: 40px; } }
+
+/* D188 (#531, beyond the concept): the Resolve panel stays with you as the Images panel does. */
+.review-panel { position: sticky; inset-block-start: 20px; }
+@media (max-width: 700px) { .review-panel { position: static; } }
+@media (min-width: 701px) and (max-height: 720px) { .review-panel { max-block-size: calc(100dvh - 40px); overflow: auto; } }

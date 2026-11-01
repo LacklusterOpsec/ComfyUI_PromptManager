@@ -4,10 +4,10 @@ const source = import('../../web/js/workspace/state.mjs');
 
 test('workspace routes resolve only supported deep links', async () => {
     const { resolveRoute } = await source;
-    for (const route of ['overview', 'images', 'library', 'tags', 'inspect', 'system']) {
+    for (const route of ['overview', 'images', 'library', 'tags', 'inspect', 'system', 'activity', 'review']) {
         assert.equal(resolveRoute(`#/${route}`).id, route);
     }
-    for (const hash of ['', '#', '#/unknown', '#/images/other', '#/<script>']) {
+    for (const hash of ['', '#', '#/unknown', '#/images/other', '#/<script>', '#/activity/abc', `#/activity/${'A'.repeat(32)}`]) {
         assert.equal(resolveRoute(hash).id, 'images');
     }
 });
@@ -17,27 +17,135 @@ test('tags is a native route titled Tags; only unbuilt routes hand off to legacy
     const tags = resolveRoute('#/tags');
     assert.equal(tags.label, 'Tags & categories');
     assert.equal(routeTitle(tags), 'Tags');
-    assert.equal(tags.href, '/prompt_manager/admin#/tags', 'Overview keeps the existing tag manager card');
+    assert.equal(tags.href, '#/tags', 'Overview opens the native page (#525)');
     for (const id of ['images', 'library', 'inspect', 'overview', 'system']) {
         const route = resolveRoute(`#/${id}`);
         assert.equal(routeTitle(route), route.label);
     }
     assert.equal(routeTitle(resolveRoute('#/library/7')), 'Prompt library');
-    for (const id of ['images', 'library', 'tags', 'overview']) assert.equal(isHandoff(resolveRoute(`#/${id}`)), false, id);
-    for (const id of ['inspect', 'system']) assert.equal(isHandoff(resolveRoute(`#/${id}`)), true, id);
+    // System is native from S2 (#249 System), and every section of it from S12 (D94 retired), not the route.
+    for (const id of ['images', 'library', 'tags', 'inspect', 'overview', 'activity', 'review', 'system']) assert.equal(isHandoff(resolveRoute(`#/${id}`)), false, id);
 });
 
-test('statistics preserve zero and reject incomplete or invalid counts', async () => {
-    const { summarizeStats } = await source;
-    assert.deepEqual(summarizeStats({total_prompts:0, total_images:12, total_tags:3}), [
-        ['Prompts', 0], ['Images', 12], ['Tags', 3],
-    ]);
-    for (const stats of [undefined, null, {}, {total_prompts:0, total_images:-1, total_tags:0},
-        {total_prompts:'2', total_images:0, total_tags:0},
-        {total_prompts:Infinity, total_images:0, total_tags:0},
-        {total_prompts:0, total_images:1.5, total_tags:0}]) {
-        assert.throws(() => summarizeStats(stats), /statistics/i);
+test('system resolves its sections; #/overview stays the production hub', async () => {
+    const { resolveRoute, routeTitle, isHandoff, routes } = await source;
+    // `#/system` is the Overview section and keeps the sidebar's hash.
+    const system = resolveRoute('#/system');
+    assert.deepEqual([system.id, system.section, system.hash, routeTitle(system), isHandoff(system)],
+        ['system', 'overview', '#/system', 'System', false]);
+    for (const section of ['overview', 'appearance', 'sources', 'integrations', 'tagging', 'maintenance', 'backups', 'diagnostics']) {
+        const route = resolveRoute(`#/system/${section}`);
+        assert.deepEqual([route.id, route.section, route.hash], ['system', section, `#/system/${section}`]);
     }
+    // An unknown child is the Overview section with a replaced hash.
+    for (const hash of ['#/system/general', '#/system/', '#/system/__proto__', '#/system/backups/1', '#/system/<b>']) {
+        const route = resolveRoute(hash);
+        assert.deepEqual([route.id, route.section, route.hash], ['system', 'overview', '#/system/overview'], hash);
+    }
+    // D28: the production hub is untouched.
+    const hub = resolveRoute('#/overview');
+    assert.deepEqual([hub.id, hub.section], ['overview', undefined]);
+    // Q12: Overview's System card opens the native System Overview, with no legacy href or action.
+    const card = routes.find(route => route.id === 'system');
+    assert.equal(card.href, '#/system/overview');
+    assert.equal(card.action, 'Open System');
+});
+
+test('the router renders again when only the System section changes', async () => {
+    const { mountRouter } = await source;
+    const win = new EventTarget();
+    win.location = { hash: '#/system' };
+    const replacements = [];
+    win.history = { state: null, replaceState(state, unused, hash) { replacements.push(hash); win.location.hash = hash; } };
+    const seen = [];
+    const dispose = mountRouter(win, route => seen.push([route.id, route.section]));
+    for (const hash of ['#/system/appearance', '#/system/appearance', '#/system/bogus', '#/system/overview', '#/images']) {
+        win.location.hash = hash;
+        win.dispatchEvent(new Event('hashchange'));
+    }
+    assert.deepEqual(seen, [['system', 'overview'], ['system', 'appearance'], ['system', 'overview'], ['images', undefined]]);
+    assert.deepEqual(replacements, ['#/system/overview']);
+    dispose();
+});
+
+test('inspect is the native Inspect a file page with the concept description', async () => {
+    const { resolveRoute, routeTitle, isHandoff } = await source;
+    const inspect = resolveRoute('#/inspect');
+    assert.equal(inspect.label, 'Inspect a file');
+    assert.equal(routeTitle(inspect), 'Inspect a file');
+    // The concept's heading description (app.js renderMetadata 743).
+    assert.equal(inspect.description, 'A standalone file uses the same image viewer and prompt actions.');
+    assert.equal(isHandoff(inspect), false);
+    // Overview's card opens the native page (#525); the legacy metadata page stays at its URL.
+    assert.equal(inspect.href, '#/inspect');
+    assert.equal(inspect.action, 'Open Inspect a file');
+});
+
+test('every Overview card opens its own native page, never a legacy one (#525)', async () => {
+    const { resolveRoute, routes } = await source;
+    const cards = routes.filter(route => route.href);
+    assert.deepEqual(cards.map(card => card.id), ['images', 'library', 'tags', 'inspect', 'system']);
+    for (const card of cards) {
+        assert.match(card.href, /^#\//, card.id);
+        assert.equal(resolveRoute(card.href).id, card.id);
+        assert.match(card.action, /^Open /, card.id);
+        assert.doesNotMatch(card.action, /existing/, card.id);
+    }
+});
+
+test('the legacy pages System links are the four that stay at their URLs (#525 D165)', async () => {
+    const { LEGACY_PAGES } = await source;
+    assert.deepEqual(LEGACY_PAGES.map(page => page.href), ['/prompt_manager/admin', '/prompt_manager/admin#/tags',
+        '/prompt_manager/gallery', '/prompt_manager/gallery.html']);
+    for (const page of LEGACY_PAGES) assert.ok(page.label);
+});
+
+test('a job of the Activity page is its own deep link', async () => {
+    const { resolveRoute, routeTitle, isHandoff } = await source;
+    const id = '0123456789abcdef'.repeat(2);
+    const route = resolveRoute(`#/activity/${id}`);
+    assert.deepEqual([route.id, route.jobId, route.hash, routeTitle(route), isHandoff(route)],
+        ['activity', id, `#/activity/${id}`, 'Activity', false]);
+    assert.equal(resolveRoute('#/activity').jobId, undefined);
+    assert.equal(route.href, undefined, 'Activity has no legacy card on Overview');
+    // The router renders again when only the job changes, and not for the same job.
+    const { mountRouter } = await source;
+    const other = 'f'.repeat(32);
+    const win = new EventTarget();
+    win.location = { hash: `#/activity/${id}` };
+    win.history = { state: null, replaceState(state, unused, hash) { win.location.hash = hash; } };
+    const seen = [];
+    const dispose = mountRouter(win, next => seen.push([next.id, next.jobId]));
+    win.dispatchEvent(new Event('hashchange'));
+    win.location.hash = `#/activity/${other}`; win.dispatchEvent(new Event('hashchange'));
+    win.location.hash = '#/activity'; win.dispatchEvent(new Event('hashchange'));
+    assert.deepEqual(seen, [['activity', id], ['activity', other], ['activity', undefined]]);
+    dispose();
+});
+
+test('Overview cards show the count of the page they name', async () => {
+    const { summarizeOverviewCounts, OVERVIEW_COUNT_ROUTES } = await source;
+    assert.deepEqual(OVERVIEW_COUNT_ROUTES, ['library', 'images', 'tags']);
+    const counts = new Map([['library', 64], ['images', 122], ['tags', 306], ['favorites', 8]]);
+    assert.deepEqual(summarizeOverviewCounts(counts), {
+        cards: [['Prompts', 64], ['Images', 122], ['Tags', 306]], pending: false, failed: false, empty: false,
+    });
+});
+
+test('Overview tells loading, failed and really empty counts apart', async () => {
+    const { summarizeOverviewCounts } = await source;
+    const nothing = summarizeOverviewCounts(new Map());
+    assert.deepEqual([nothing.pending, nothing.failed, nothing.empty], [true, false, false]);
+    assert.deepEqual(nothing.cards, [['Prompts', null], ['Images', null], ['Tags', null]]);
+    // A slow Images read does not hold back the cards already read.
+    const partial = summarizeOverviewCounts(new Map([['library', 0], ['tags', 0]]));
+    assert.deepEqual(partial.cards, [['Prompts', 0], ['Images', null], ['Tags', 0]]);
+    assert.deepEqual([partial.pending, partial.failed, partial.empty], [true, false, false]);
+    const failed = summarizeOverviewCounts(new Map([['library', 2], ['images', null], ['tags', 3]]));
+    assert.deepEqual([failed.pending, failed.failed, failed.empty], [false, true, false]);
+    assert.deepEqual(failed.cards[1], ['Images', null]);
+    const empty = summarizeOverviewCounts(new Map([['library', 0], ['images', 0], ['tags', 0]]));
+    assert.deepEqual([empty.pending, empty.failed, empty.empty], [false, false, true]);
 });
 
 test('router normalizes unknown routes, avoids duplicate renders, and disposes its listener', async () => {
@@ -79,18 +187,21 @@ test('positive library deep links preserve the selected identity without duplica
 
 test('nav counts reject negative, non-integer and missing totals', async () => {
     const { summarizeNavCounts } = await source;
-    const counts = summarizeNavCounts({images: {total: 24}, library: {total: 0}, tags: {total: 7}});
+    const counts = summarizeNavCounts({images: {total: 24}, favorites: {total: 3}, library: {total: 0}, tags: {total: 7},
+        review: {total: 3}});
     assert.ok(counts instanceof Map);
-    assert.deepEqual([...counts], [['images', 24], ['library', 0], ['tags', 7]]);
+    assert.deepEqual([...counts], [['images', 24], ['favorites', 3], ['library', 0], ['tags', 7], ['review', 3]]);
     assert.equal(counts.has('inspect'), false, 'Inspect a file has no count');
     for (const invalid of [undefined, null, {}, {total: -1}, {total: 1.5}, {total: '3'}, {total: NaN},
         {total: Infinity}, {total: Number.MAX_SAFE_INTEGER + 1}, {total: null}, [], 'x']) {
-        const result = summarizeNavCounts({images: invalid, library: {total: 2}, tags: invalid});
+        const result = summarizeNavCounts({images: invalid, favorites: invalid, library: {total: 2}, tags: invalid});
         assert.equal(result.get('images'), null, JSON.stringify(invalid));
+        assert.equal(result.get('favorites'), null);
         assert.equal(result.get('library'), 2);
         assert.equal(result.get('tags'), null);
     }
-    assert.deepEqual([...summarizeNavCounts()], [['images', null], ['library', null], ['tags', null]]);
+    assert.deepEqual([...summarizeNavCounts()], [['images', null], ['favorites', null], ['library', null], ['tags', null],
+        ['review', null]]);
 });
 
 test('nav counts settle independently so a slow images read never delays the others', async () => {
@@ -98,6 +209,7 @@ test('nav counts settle independently so a slow images read never delays the oth
     let releaseImages;
     const images = new Promise(resolve => { releaseImages = resolve; });
     const api = {get: async url => {
+        if (url.includes('favorites=1')) return {success: true, total: 2};
         if (url.startsWith('/prompt_manager/images')) return images;
         if (url.startsWith('/prompt_manager/library')) return {success: true, total: 3};
         throw new Error('Unavailable');
@@ -105,14 +217,14 @@ test('nav counts settle independently so a slow images read never delays the oth
     const settled = [];
     const done = loadNavCounts(api, new AbortController().signal, (id, count) => settled.push([id, count]));
     await new Promise(resolve => setTimeout(resolve, 0));
-    assert.deepEqual(settled.sort(), [['library', 3], ['tags', null]]);
+    assert.deepEqual(settled.sort(), [['favorites', 2], ['library', 3], ['review', null], ['tags', null]]);
     releaseImages({success: true, total: 40});
     const counts = await done;
     assert.deepEqual(settled.at(-1), ['images', 40]);
-    assert.deepEqual([...counts], [['images', 40], ['library', 3], ['tags', null]]);
+    assert.deepEqual([...counts], [['images', 40], ['favorites', 2], ['library', 3], ['tags', null], ['review', null]]);
 });
 
-test('nav counts issue three bounded requests and drop only the failed count', async () => {
+test('nav counts issue five bounded requests and drop only the failed count', async () => {
     const { loadNavCounts } = await source;
     const calls = [];
     const signal = new AbortController().signal;
@@ -120,16 +232,45 @@ test('nav counts issue three bounded requests and drop only the failed count', a
         calls.push([url, options.signal]);
         if (url.startsWith('/prompt_manager/library')) throw new Error('Unavailable');
         if (url.startsWith('/prompt_manager/vocabulary/tags')) return {success: true, total: 5};
+        if (url.startsWith('/prompt_manager/review/items')) return {success: true, total: 2};
         return {success: true, total: 12};
     }};
     const counts = await loadNavCounts(api, signal);
-    assert.deepEqual([...counts], [['images', 12], ['library', null], ['tags', 5]]);
+    assert.deepEqual([...counts], [['images', 12], ['favorites', 12], ['library', null], ['tags', 5], ['review', 2]]);
     const urls = calls.map(([url]) => new URL(url, 'http://host'));
     assert.deepEqual(urls.map(url => url.pathname),
-        ['/prompt_manager/images/output', '/prompt_manager/library', '/prompt_manager/vocabulary/tags']);
+        ['/prompt_manager/images/output', '/prompt_manager/images/output', '/prompt_manager/library', '/prompt_manager/vocabulary/tags',
+            '/prompt_manager/review/items']);
     for (const url of urls) assert.equal(url.searchParams.get('limit'), '1');
     assert.equal(urls[0].searchParams.get('mode'), 'workspace');
+    assert.equal(urls[0].searchParams.has('favorites'), false);
+    // D51: the Favorites count is the Favorites page's own listing.
+    assert.equal(urls[1].searchParams.get('mode'), 'workspace');
+    assert.equal(urls[1].searchParams.get('favorites'), '1');
     assert.ok(calls.every(([, used]) => used === signal));
+});
+
+test('a favorite change re-reads only the Favorites count', async () => {
+    const { loadNavCounts, FAVORITE_WRITE_COUNTS } = await source;
+    assert.deepEqual([...FAVORITE_WRITE_COUNTS], ['favorites']);
+    assert.ok(Object.isFrozen(FAVORITE_WRITE_COUNTS));
+    const calls = [];
+    const api = {get: async url => { calls.push(url); return {success: true, total: 0}; }};
+    const counts = await loadNavCounts(api, new AbortController().signal, () => {}, FAVORITE_WRITE_COUNTS);
+    assert.deepEqual(calls, ['/prompt_manager/images/output?mode=workspace&favorites=1&limit=1']);
+    // A real zero is a count, unlike an outstanding read.
+    assert.deepEqual([...counts], [['favorites', 0]]);
+});
+
+test('the Favorites route is native and resolves by its hash', async () => {
+    const { resolveRoute, isHandoff, routeTitle, routes } = await source;
+    const route = resolveRoute('#/favorites');
+    assert.equal(route.id, 'favorites');
+    assert.equal(route.label, 'Favorites');
+    assert.equal(routeTitle(route), 'Favorites');
+    assert.equal(isHandoff(route), false);
+    // No href: Overview lists no legacy card for it.
+    assert.equal(routes.find(item => item.id === 'favorites').href, undefined);
 });
 
 test('a Library or vocabulary write re-reads only the Library and Tags counts', async () => {
@@ -146,4 +287,83 @@ test('a Library or vocabulary write re-reads only the Library and Tags counts', 
     assert.deepEqual(calls, ['/prompt_manager/library', '/prompt_manager/vocabulary/tags']);
     assert.deepEqual(settled.sort(), [['library', 4], ['tags', 9]]);
     assert.deepEqual([...counts], [['library', 4], ['tags', 9]]);
+});
+
+test('navigating to the current route re-renders it, as the concept go() does', async () => {
+    const {mountRouter,navigateTo}=await source;
+    const win=new EventTarget();win.location={hash:'#/library/12'};
+    win.history={state:null,replaceState(state,unused,hash){win.location.hash=hash;}};
+    const seen=[];const dispose=mountRouter(win,route=>seen.push([route.id,route.positiveId]));
+    navigateTo('#/library/12',win);
+    assert.deepEqual(seen,[['library',12],['library',12]]);
+    // A different route only sets the hash; its hashchange renders it once.
+    navigateTo('#/library/13',win);assert.equal(win.location.hash,'#/library/13');assert.equal(seen.length,2);
+    win.dispatchEvent(new Event('hashchange'));assert.deepEqual(seen.at(-1),['library',13]);
+    dispose();navigateTo('#/library/13',win);assert.equal(seen.length,3);
+});
+
+// Saved views (#249 D16): `#/saved/<id>` opens one persisted view; the shell resolves it to its page.
+test('saved-view links resolve to their id and re-render only when the id changes', async () => {
+    const {resolveRoute,mountRouter,isHandoff,routes}=await source;
+    const route=resolveRoute('#/saved/7');
+    assert.deepEqual([route.id,route.savedId,route.hash],['saved',7,'#/saved/7']);
+    assert.equal(isHandoff(route),false);
+    assert.equal(routes.some(item=>item.id==='saved'),false,'saved views are not an Overview card or a WORKSPACE link');
+    for(const hash of ['#/saved','#/saved/0','#/saved/-2','#/saved/1.5','#/saved/9007199254740992','#/saved/3/x','#/saved/abc']) {
+        assert.equal(resolveRoute(hash).id,'images',hash);
+    }
+    const win=new EventTarget();win.location={hash:'#/saved/3'};
+    win.history={state:null,replaceState(state,unused,hash){win.location.hash=hash;}};
+    const seen=[];const dispose=mountRouter(win,next=>seen.push([next.id,next.savedId]));
+    assert.equal(win.location.hash,'#/saved/3');
+    win.dispatchEvent(new Event('hashchange'));
+    win.location.hash='#/saved/4';win.dispatchEvent(new Event('hashchange'));
+    win.location.hash='#/images';win.dispatchEvent(new Event('hashchange'));
+    assert.deepEqual(seen,[['saved',3],['saved',4],['images',undefined]]);
+    dispose();
+});
+
+test('Needs review is a native SAVED VIEWS route titled Review, with its own count', async () => {
+    const { resolveRoute, isHandoff, routeTitle, routes, loadNavCounts, REVIEW_WRITE_COUNTS, NAV_COUNT_ROUTES } = await source;
+    const route = resolveRoute('#/review');
+    assert.equal(route.id, 'review');
+    assert.equal(route.label, 'Needs review');
+    assert.equal(routeTitle(route), 'Review');
+    assert.equal(isHandoff(route), false);
+    // No href: Overview lists no legacy card for it.
+    assert.equal(routes.find(item => item.id === 'review').href, undefined);
+    assert.ok(NAV_COUNT_ROUTES.includes('review'));
+    assert.deepEqual([...REVIEW_WRITE_COUNTS], ['review']);
+    assert.ok(Object.isFrozen(REVIEW_WRITE_COUNTS));
+    const calls = [];
+    const api = {get: async url => { calls.push(url); return {success: true, total: 4}; }};
+    const counts = await loadNavCounts(api, new AbortController().signal, () => {}, REVIEW_WRITE_COUNTS);
+    assert.deepEqual(calls, ['/prompt_manager/review/items?limit=1']);
+    assert.deepEqual([...counts], [['review', 4]]);
+});
+
+// Collections (#331 D137): `#/collection/<id>` opens Images filtered to one collection; its breadcrumb is "Collection".
+test('collection links resolve to their id, title Collection, and re-render only when the id changes', async () => {
+    const {resolveRoute,mountRouter,isHandoff,routeTitle,routes,COLLECTION_ROUTE}=await source;
+    assert.deepEqual(COLLECTION_ROUTE,{id:'collection',label:'Collection'});
+    assert.ok(Object.isFrozen(COLLECTION_ROUTE));
+    const route=resolveRoute('#/collection/7');
+    assert.deepEqual([route.id,route.collectionId,route.hash,routeTitle(route)],['collection',7,'#/collection/7','Collection']);
+    assert.equal(isHandoff(route),false);
+    assert.equal(resolveRoute('#/collection/999999999').collectionId,999999999);
+    assert.equal(routes.some(item=>item.id==='collection'),false,'a collection is not an Overview card or a WORKSPACE link');
+    // The listing's and routes' id rule: 1 to 9 digits without a leading zero.
+    for(const hash of ['#/collection','#/collection/','#/collection/0','#/collection/07','#/collection/-2','#/collection/1.5',
+        '#/collection/1234567890','#/collection/3/x','#/collection/abc','#/collections/3']) {
+        assert.equal(resolveRoute(hash).id,'images',hash);
+    }
+    const win=new EventTarget();win.location={hash:'#/collection/3'};
+    win.history={state:null,replaceState(state,unused,hash){win.location.hash=hash;}};
+    const seen=[];const dispose=mountRouter(win,next=>seen.push([next.id,next.collectionId]));
+    win.dispatchEvent(new Event('hashchange'));
+    win.location.hash='#/collection/4';win.dispatchEvent(new Event('hashchange'));
+    win.location.hash='#/saved/4';win.dispatchEvent(new Event('hashchange'));
+    win.location.hash='#/collection/4';win.dispatchEvent(new Event('hashchange'));
+    assert.deepEqual(seen,[['collection',3],['collection',4],['saved',undefined],['collection',4]]);
+    dispose();
 });

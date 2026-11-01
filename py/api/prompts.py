@@ -8,8 +8,10 @@ import sqlite3
 from aiohttp import web
 
 try:
+    from ...database.library_commands import LibraryCommandError
     from ...database.pairs import PairDependencyError
 except ImportError:
+    from database.library_commands import LibraryCommandError
     from database.pairs import PairDependencyError
 from urllib.parse import quote
 
@@ -1128,7 +1130,14 @@ class PromptRoutesMixin:
     async def bulk_add_tags(self, request):
         """Bulk add tags to prompts."""
         try:
-            data = await request.json()
+            try:
+                data = await request.json()
+            except ValueError:
+                return bad_request("Invalid JSON body")
+            if not isinstance(data, dict):
+                return bad_request("Expected a JSON object")
+            if "expected_epoch" in data:
+                return await self._bulk_library_tags(data)
             prompt_ids = data.get("prompt_ids", [])
             new_tags = data.get("tags", [])
 
@@ -1178,6 +1187,10 @@ class PromptRoutesMixin:
                 return web.json_response(
                     {"success": False, "error": "Expected a JSON object"}, status=400
                 )
+            if "images_filter" in data:
+                return await self._bulk_category_by_filter(data)
+            if "expected_epoch" in data:
+                return await self._bulk_library_category(data)
             if not data.get("prompt_ids"):
                 return web.json_response(
                     {"success": False, "error": "No prompt IDs provided"}, status=400
@@ -1213,6 +1226,118 @@ class PromptRoutesMixin:
                 },
                 status=500,
             )
+
+    async def _bulk_library_tags(self, data: dict) -> web.Response:
+        """The workspace Library's fenced form (#442).
+
+        ``{prompt_ids, tags, expected_epoch}``: prompt tags only, never image tags.
+        """
+        return await self._fenced_library_write(
+            data, "tags", self.db.bulk_add_library_tags
+        )
+
+    async def _fenced_library_write(
+        self, data: dict, field: str, write
+    ) -> web.Response:
+        """One fenced Library bulk write: exact keys, checked ids, 409 on a restore."""
+        fields = {"prompt_ids", field, "expected_epoch"}
+        if set(data) != fields:
+            return bad_request(
+                "Request must contain exactly " + ", ".join(sorted(fields))
+            )
+        try:
+            prompt_ids = parse_bulk_prompt_ids(data["prompt_ids"])
+            result = await self._run_in_executor(
+                write, prompt_ids, data[field], expected_epoch=data["expected_epoch"]
+            )
+        except LibraryCommandError as exc:
+            return web.json_response(
+                {
+                    "success": False,
+                    "code": exc.code,
+                    "library_epoch": exc.epoch,
+                    "error": "Prompt storage was restored; refresh the library",
+                },
+                status=409,
+            )
+        except ValueError as exc:
+            return bad_request(str(exc))
+        return web.json_response({"success": True, **result})
+
+    async def _bulk_library_category(self, data: dict) -> web.Response:
+        """The workspace Library's fenced form (#437).
+
+        ``{prompt_ids, category, expected_epoch}``: a non-blank category on
+        the selected Library parents, refused with 409 ``storage-changed``
+        when prompt storage was restored since the page read its epoch.
+        """
+        return await self._fenced_library_write(
+            data, "category", self.db.bulk_set_library_category
+        )
+
+    async def _bulk_category_by_filter(self, data: dict) -> web.Response:
+        """Set the category on every linked positive a listing filter admits.
+
+        #392 "Select all N matching": ``{images_filter, category}``, the filter
+        being the Images listing's own query (parse_listing_filter), resolved
+        now. The answer adds ``prompt_count`` (the distinct linked positives)
+        and ``skipped`` (matching images without one); none linked changes
+        nothing.
+        """
+        from .images import (
+            MAX_LISTING_SELECTION,
+            CollectionMissing,
+            ListingSourceChanged,
+            collection_not_found,
+            parse_listing_filter,
+        )
+
+        def refused(message, **extra):
+            return web.json_response(
+                {"success": False, "error": message, **extra}, status=400
+            )
+
+        if set(data) != {"images_filter", "category"}:
+            return refused("Request must contain exactly category, images_filter")
+        category = data["category"]
+        try:
+            params = parse_listing_filter(data["images_filter"])
+            validate_category(category)
+            selection = await self.resolve_listing_filter(params)
+        except ListingSourceChanged:
+            return web.json_response(
+                {
+                    "success": False,
+                    "code": "source-changed",
+                    "error": "The source changed. Refresh the image collection.",
+                },
+                status=409,
+            )
+        except CollectionMissing:
+            return collection_not_found()
+        except ValueError as exc:
+            return refused(str(exc))
+        if selection.truncated:
+            return refused(
+                f"Narrow the view to at most {MAX_LISTING_SELECTION:,} images.",
+                code="too-many-images",
+            )
+        category = (category or "").strip()
+        ids = selection.positive_ids
+        updated = (
+            await self._run_in_executor(self.db.bulk_set_category, ids, category)
+            if ids
+            else 0
+        )
+        return web.json_response(
+            {
+                "success": True,
+                "message": f"Set category for {updated} prompts",
+                "updated_count": updated,
+                "prompt_count": len(ids),
+                "skipped": selection.unlinked,
+            }
+        )
 
     def _all_prompts_for_export(self):
         """Every prompt, fetched in EXPORT_PAGE_SIZE pages (blocking)."""

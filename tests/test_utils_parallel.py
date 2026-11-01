@@ -1,4 +1,8 @@
-"""Tests for utils/parallel.py: bounded thread-pool map used by long jobs."""
+"""Tests for utils/parallel.py: bounded thread-pool map used by long jobs.
+
+The jobs share one long-lived pool of Worker threads (#523): its threads (and
+their malloc arenas) are reused from job to job instead of a new set per call.
+"""
 
 import os
 import sys
@@ -8,10 +12,24 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.parallel import map_parallel  # noqa: E402
+from utils import exit_signal, parallel  # noqa: E402
+from utils.parallel import JOB_THREAD_PREFIX, map_parallel  # noqa: E402
+
+WAIT = 30
+# A map that has not returned by then is stuck (#593).
+HANG_LIMIT = 5
+
+
+def _job_threads():
+    return {
+        t for t in threading.enumerate() if t.name.startswith(JOB_THREAD_PREFIX + "_")
+    }
 
 
 class TestMapParallel(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(parallel.shutdown_job_pool(WAIT))
+        self.addCleanup(parallel.shutdown_job_pool, WAIT)
 
     def test_results_keep_input_order(self):
         def slow_square(n):
@@ -22,12 +40,102 @@ class TestMapParallel(unittest.TestCase):
             map_parallel(slow_square, [1, 2, 3, 4], workers=4), [1, 4, 9, 16]
         )
 
-    def test_one_worker_runs_on_the_calling_thread(self):
+    def test_one_worker_runs_on_the_one_job_thread(self):
         names = []
         map_parallel(
             lambda _: names.append(threading.current_thread().name), [1, 2, 3], 1
         )
-        self.assertEqual(set(names), {threading.current_thread().name})
+        self.assertEqual(len(set(names)), 1)
+        self.assertTrue(names[0].startswith(JOB_THREAD_PREFIX + "_"), names)
+
+    def test_jobs_reuse_the_same_long_lived_threads(self):
+        """Arenas are reused instead of a new set of threads per job."""
+        first, second = set(), set()
+        map_parallel(lambda _: first.add(threading.current_thread()), range(8), 2)
+        map_parallel(lambda _: second.add(threading.current_thread()), range(8), 2)
+        self.assertTrue(second <= first, (first, second))
+        self.assertLessEqual(len(_job_threads()), 2)
+        self.assertTrue(all(t.is_alive() for t in first | second))
+
+    def test_a_new_worker_count_replaces_the_pool(self):
+        map_parallel(lambda n: n, range(4), 2)
+        old = _job_threads()
+        map_parallel(lambda n: n, range(4), 3)
+        for thread in old:
+            thread.join(WAIT)
+            self.assertFalse(thread.is_alive(), thread.name)
+        self.assertLessEqual(len(_job_threads()), 3)
+
+    def test_shutdown_also_joins_a_pool_a_resize_retired(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def hold(_):
+            entered.set()
+            release.wait(WAIT)
+
+        caller = threading.Thread(target=map_parallel, args=(hold, [1], 1))
+        caller.start()
+        self.addCleanup(caller.join, WAIT)
+        self.addCleanup(release.set)
+        self.assertTrue(entered.wait(WAIT))
+        map_parallel(lambda n: n, [1, 2], 2)  # a new size retires the busy pool
+        self.assertFalse(parallel.shutdown_job_pool(0.05))
+        release.set()
+        caller.join(WAIT)
+        self.assertTrue(parallel.shutdown_job_pool(WAIT))
+        self.assertFalse(parallel.job_pool_started())
+
+    def test_an_item_run_from_a_job_thread_runs_inline(self):
+        """A nested map never waits for the threads it is running on."""
+
+        def outer(n):
+            return map_parallel(lambda m: (m, threading.current_thread()), [n], 1)
+
+        results = map_parallel(outer, [1, 2], 1)
+        self.assertEqual([r[0][0] for r in results], [1, 2])
+
+    def test_shutdown_stops_the_threads_and_a_later_job_starts_fresh(self):
+        map_parallel(lambda n: n, range(4), 2)
+        threads = _job_threads()
+        self.assertTrue(threads)
+        self.assertTrue(parallel.job_pool_started())
+        self.assertTrue(parallel.shutdown_job_pool(WAIT))
+        self.assertFalse(parallel.job_pool_started())
+        self.assertFalse(any(t.is_alive() for t in threads))
+        self.assertEqual(map_parallel(lambda n: n + 1, [1], 2), [2])
+
+    def test_shutdown_reports_a_thread_still_running(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def hold(_):
+            entered.set()
+            release.wait(WAIT)
+
+        caller = threading.Thread(target=map_parallel, args=(hold, [1], 1))
+        caller.start()
+        self.assertTrue(entered.wait(WAIT))
+        self.assertFalse(parallel.shutdown_job_pool(0.05))
+        release.set()
+        caller.join(WAIT)
+        self.assertFalse(caller.is_alive())
+
+    def test_a_failing_item_waits_for_the_running_ones(self):
+        """The caller sees the error only after its other items stopped."""
+        running = threading.Event()
+        finished = []
+
+        def item(n):
+            if n == 0:
+                self.assertTrue(running.wait(WAIT))
+                raise ValueError("zero")
+            running.set()
+            time.sleep(0.05)
+            finished.append(n)
+            return n
+
+        with self.assertRaises(ValueError):
+            map_parallel(item, [0, 1], 2)
+        self.assertEqual(finished, [1])
 
     def test_several_workers_use_several_threads(self):
         names = set()
@@ -55,6 +163,69 @@ class TestMapParallel(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             map_parallel(boom, [1, 2, 3], workers=3)
+
+
+class TestErrorAfterShutdownCancel(unittest.TestCase):
+    """#593: ``shutdown_job_pool`` cancels the call's queued items without
+    notifying them, so the error path must not wait on them (exit hung)."""
+
+    def setUp(self):
+        exit_signal.reset()
+        self.addCleanup(exit_signal.reset)
+        self.assertTrue(parallel.shutdown_job_pool(WAIT))
+        self.addCleanup(parallel.shutdown_job_pool, WAIT)
+
+    def _run_in_thread(self, func, items):
+        """``map_parallel`` on a daemon thread: (thread, outcome list), so a
+        hang fails the test instead of hanging the suite."""
+        outcome = []
+
+        def call():
+            try:
+                outcome.append(("result", map_parallel(func, items, 1)))
+            except Exception as error:  # the outcome the test checks
+                outcome.append(("error", error))
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        return thread, outcome
+
+    def _hold_first_then_cancel_rest(self, first):
+        """One worker runs item 0 (``first``) while items 1 and 2 queue;
+        shutdown cancels the queued two, then item 0 is released."""
+        entered, release = threading.Event(), threading.Event()
+
+        def item(n):
+            if n == 0:
+                entered.set()
+                self.assertTrue(release.wait(WAIT))
+                return first()
+            return n
+
+        thread, outcome = self._run_in_thread(item, [0, 1, 2])
+        self.assertTrue(entered.wait(WAIT))
+        self.assertFalse(parallel.shutdown_job_pool(0))  # item 0 still runs
+        release.set()
+        thread.join(HANG_LIMIT)
+        self.assertFalse(thread.is_alive(), "map_parallel hung on cancelled items")
+        return outcome
+
+    def test_a_running_item_raising_after_shutdown_cancel_returns(self):
+        def fail():
+            raise ValueError("zero")
+
+        outcome = self._hold_first_then_cancel_rest(fail)
+        self.assertEqual(outcome[0][0], "error")
+        self.assertIsInstance(outcome[0][1], ValueError)
+
+    def test_exit_requested_inline_after_shutdown_cancel_returns(self):
+        def signal_exit():
+            exit_signal.request()  # the cancelled items then run inline
+            return 0
+
+        outcome = self._hold_first_then_cancel_rest(signal_exit)
+        self.assertEqual(outcome[0][0], "error")
+        self.assertIsInstance(outcome[0][1], exit_signal.ExitRequested)
 
 
 if __name__ == "__main__":

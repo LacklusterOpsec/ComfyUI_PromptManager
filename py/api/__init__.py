@@ -5,7 +5,24 @@ Split into domain-specific mixins for maintainability:
 - ImageRoutesMixin: gallery, thumbnails, image serving and linking
 - AdminRoutesMixin: duplicates, stats, settings, diagnostics, maintenance, backup, scan
 - LoggingRoutesMixin: log management endpoints
+- LogCleanupMixin: the reviewed rotated-log cleanup (a maintenance plan)
+- DiagnosticsReportMixin: the shareable diagnostic report, without secrets or paths
 - AutotagRoutesMixin: auto-tagging model management and tagging
+- JobRoutesMixin: the session job registry behind Activity (py/api/jobs.py)
+- ImageTagJobsMixin: bulk Add tags / Auto-tag as image-tags jobs
+- ThumbnailJobsMixin: thumbnail plan, thumbnail job and the gallery stream on it
+- ThumbnailConvertMixin: Convert outdated thumbnails (#317), a thumbnail job mode
+- AutoThumbnailMixin: previews made on first view, on capture and after a scan
+- ReviewRoutesMixin: the Needs review queue, item detail and decisions
+- ReviewRecordingMixin: Needs review recording for the scan and the monitor
+- ReviewEventsMixin: the Needs review change stream an open page re-reads on
+- SystemRoutesMixin: System health check, Overview and usage statistics
+- LibraryLocationRoutesMixin: where the library lives, Move library, Keep it here
+- MaintenanceRoutesMixin: reviewed maintenance plans (preview, apply)
+- LibraryDeleteRoutesMixin: the Library's Delete… (archive paired) and Restore
+- WorkflowStorageRoutesMixin: store each workflow once, then Reclaim space
+- DuplicateFilesMixin: duplicate image files as find and removal jobs
+- LoraImportRoutesMixin: the reviewed, staged LoRA reference import job
 """
 
 import asyncio
@@ -13,28 +30,63 @@ import datetime
 import functools
 import gzip as gzip_module
 import json
+import math
 import ntpath
 import os
 import re
+import threading
 from pathlib import Path
 
 from aiohttp import web
 from PIL import Image
 
 from .prompts import PromptRoutesMixin
+from .revalidation import revalidated_response
 from .pairs import PairRoutesMixin
 from .library import LibraryRoutesMixin
+from .library_delete import LibraryDeleteRoutesMixin
 from .vocabulary import VocabularyRoutesMixin
+from .annotations import AnnotationRoutesMixin
+from .review import ReviewRoutesMixin
+from .review_recording import ReviewRecordingMixin
+from .review_events import ReviewEventsMixin
+from .saved_views import SavedViewRoutesMixin
+from .collections import CollectionRoutesMixin
 from .history import HistoryRoutesMixin
 from .images import ImageRoutesMixin
+from .gallery_listing import WALK_STOPPED, RootListing, WalkOutcome
 from .admin import AdminRoutesMixin
+from .settings_routes import SettingsRoutesMixin
+from .job_routes import JobRoutesMixin
+from .image_tag_jobs import ImageTagJobsMixin
+from .thumbnail_jobs import ThumbnailJobsMixin
+from .thumbnail_convert import ThumbnailConvertMixin
+from .thumbnail_auto import AutoThumbnailMixin
+from .system import SystemRoutesMixin
+from .library_location import LibraryLocationRoutesMixin
+from .maintenance import MaintenanceRoutesMixin
+from .backup_restore import BackupRestoreRoutesMixin
+from .workflow_storage import WorkflowStorageRoutesMixin
+from .duplicate_files import DuplicateFilesMixin
+from .maintenance_plans import PlanStore
+from .jobs import JobRegistry
 from .logging_routes import LoggingRoutesMixin
+from .log_cleanup import LogCleanupMixin
+from .diagnostics_report import DiagnosticsReportMixin
 from .autotag_routes import AutotagRoutesMixin
 from .lora_integration import LoraIntegrationMixin
+from .lora_import_routes import LoraImportRoutesMixin
+from .image_categories import ImageCategoryRoutesMixin
+from .image_delete import ImageDeleteMixin
+from .image_return import ImageReturnMixin
+from .source_rescope import SourceRescopeMixin
 
 try:
     from ...database.operations import PromptDatabase
+    from ...utils.file_prompt import parse_comfyui_prompt
     from ...utils.logging_config import get_logger
+    from ...utils.native_memory import release_free_memory
+    from ...utils.png_text import png_text
     from ...utils.video_metadata import is_video_path, read_video_metadata
 except ImportError:
     import sys
@@ -43,13 +95,28 @@ except ImportError:
         0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
     from database.operations import PromptDatabase
+    from utils.file_prompt import parse_comfyui_prompt
     from utils.logging_config import get_logger
+    from utils.native_memory import release_free_memory
+    from utils.png_text import png_text
     from utils.video_metadata import is_video_path, read_video_metadata
 
 
 def _get_project_root():
     """Get the project root directory (3 levels up from py/api/__init__.py)."""
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# How long an executor thread waits for the loop to drop the listings.
+_OFF_LOOP_DROP_WAIT = 30
+
+
+def _running_loop():
+    """The event loop running in this thread, or None."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 def _public_path(path) -> str:
@@ -100,16 +167,20 @@ STATIC_MIME_TYPES = {
     ".html": "text/html",
 }
 _STATIC_SEPARATORS = re.compile(r"[\\/]+")
+# Served by exact request path beside the extension allow-list: the browser's
+# copy of the inspection node table (local Inspect resolves with it, #249).
+STATIC_EXACT_FILES = {("js", "inspection-semantics.json"): "application/json"}
 
 
-def _resolve_static_file(root, filepath):
+def _resolve_static_file(root, filepath, allowed=STATIC_MIME_TYPES):
     """Real path of ``filepath`` under ``root``, or None when it must not be served.
 
     The request path is untrusted. It is rejected when it is empty, carries a
     ``..`` segment, is absolute on any platform (a leading slash or backslash,
     a drive letter such as ``C:`` or a UNC ``\\\\server\\share`` prefix all
     re-anchor ``os.path.join`` on Windows), has an extension outside
-    STATIC_MIME_TYPES, or resolves (symlinks included) outside ``root``.
+    ``allowed`` (STATIC_MIME_TYPES), or resolves (symlinks included) outside
+    ``root``.
     """
     if not isinstance(filepath, str) or not filepath:
         return None
@@ -122,7 +193,7 @@ def _resolve_static_file(root, filepath):
     segments = _STATIC_SEPARATORS.split(filepath)
     if any(segment in ("", ".", "..") for segment in segments):
         return None
-    if os.path.splitext(filepath)[1].lower() not in STATIC_MIME_TYPES:
+    if os.path.splitext(filepath)[1].lower() not in allowed:
         return None
     try:
         root_real = Path(os.path.normcase(os.path.realpath(root)))
@@ -238,6 +309,10 @@ async def _gzip_middleware(request, handler):
     if len(compressed) >= len(body):
         return response
 
+    # A length the handler declared is the uncompressed one: drop it so the
+    # compressed body's own length is sent (#329: a stale length made the
+    # browser wait for bytes that never came).
+    response.headers.pop("Content-Length", None)
     response.body = compressed
     response.headers["Content-Encoding"] = "gzip"
     response.headers["Vary"] = "Accept-Encoding"
@@ -247,14 +322,40 @@ async def _gzip_middleware(request, handler):
 class PromptManagerAPI(
     PairRoutesMixin,
     LibraryRoutesMixin,
+    LibraryDeleteRoutesMixin,
     VocabularyRoutesMixin,
+    AnnotationRoutesMixin,
+    ReviewRoutesMixin,
+    ReviewRecordingMixin,
+    ReviewEventsMixin,
+    SavedViewRoutesMixin,
+    CollectionRoutesMixin,
     HistoryRoutesMixin,
     PromptRoutesMixin,
     ImageRoutesMixin,
     AdminRoutesMixin,
+    SettingsRoutesMixin,
+    JobRoutesMixin,
+    ImageTagJobsMixin,
+    ThumbnailJobsMixin,
+    ThumbnailConvertMixin,
+    AutoThumbnailMixin,
+    SystemRoutesMixin,
+    LibraryLocationRoutesMixin,
+    MaintenanceRoutesMixin,
+    BackupRestoreRoutesMixin,
+    WorkflowStorageRoutesMixin,
+    DuplicateFilesMixin,
     LoggingRoutesMixin,
+    LogCleanupMixin,
+    DiagnosticsReportMixin,
     AutotagRoutesMixin,
     LoraIntegrationMixin,
+    LoraImportRoutesMixin,
+    ImageCategoryRoutesMixin,
+    ImageDeleteMixin,
+    ImageReturnMixin,
+    SourceRescopeMixin,
 ):
     """REST API handler for PromptManager operations and web interface.
 
@@ -279,10 +380,31 @@ class PromptManagerAPI(
         self.db = db if db is not None else PromptDatabase()
         self._history_read_fence = None
         self._history_reads_closed = False
+        # Private media captures of the annotation routes (py/api/annotations.py),
+        # created on first use with their restore subscription.
+        self._captures = None
+        # Capture tokens Generate suggestions ran on: a save of one marks the
+        # image auto-tagged (#379).
+        self._suggested_tokens = set()
+        self._captures_unsubscribe = None
+        # Set by close_annotation_captures (shutdown): no store is recreated.
+        self._captures_closed = False
         self._cached_output_dir = None  # Lazy-cached by _find_comfyui_output_dir()
         self._html_cache = {}  # Cached HTML file contents keyed by path
-        self._gallery_cache = {}  # dict: path_str -> (files, timestamp)
-        self._gallery_cache_ttl = 30  # Cache TTL in seconds
+        # One shared listing per output root, keyed by str(root), and the
+        # background walks refreshing them (py/api/gallery_listing.py, #348).
+        self._root_listings: dict[str, RootListing] = {}
+        self._listing_tasks: set = set()
+        # The loop the walks run on, set by the startup warm-up or the first
+        # walk; the monitor's thread hops onto it (notify_output_settled).
+        self._listing_loop = None
+        # Set by cleanup_gallery_listings: no background walk starts after it.
+        self._listings_closed = False
+        # The workspace caches rebuilt behind a stored walk that changed the
+        # listing, once the host's startup warm-up has run (#348).
+        self._workspace_warm_enabled = False
+        self._workspace_warm_task = None
+        self._workspace_warm_again = False
         # Workspace listing values and sort orders derived from a cached scan
         # (py/api/images.py _workspace_listed/_workspace_orders).
         self._workspace_listed_cache = {}
@@ -297,10 +419,45 @@ class PromptManagerAPI(
         # _acquire_long_job(). Created lazily so no lock binds to an event
         # loop before the server's loop exists.
         self._long_jobs: dict = {}
-        # The current output scan (py/api/scan_job.ScanJob), if one was started.
+        # This session's jobs (py/api/jobs.py): the metadata scan, and later
+        # every other long operation the Activity page tracks.
+        self._jobs = JobRegistry(self.logger)
+        # The latest metadata scan job (also in self._jobs), if one was started.
         self._scan_job = None
-        # The current duplicate scan (also a ScanJob), if one was started.
-        self._duplicate_job = None
+        # Duplicate-file finds by job id, with the groups each one holds for
+        # review (py/api/duplicate_files.py); the last few only.
+        self._duplicate_finds = {}
+        # The last System health report this session and the database
+        # generation it describes, bumped when a restore replaces self.db
+        # (py/api/system.py).
+        self._health_report = None
+        self._db_generation = 0
+        # Reviewed maintenance plans under single-use tokens; a restart
+        # forgets them (py/api/maintenance.py).
+        self._maintenance_plans = PlanStore()
+        # #480: the removal marks the workspace listing hides, read once now so
+        # a listing page reads no table until a mark or the database changes.
+        try:
+            self._removal_marks()
+        except Exception:
+            self.logger.warning("Removal marks could not be read", exc_info=True)
+
+        # A safety backup interrupted by a crash leaves its temp copy behind.
+        try:
+            from .maintenance import sweep_safety_temps
+
+            from .backup_restore import restore_stage
+
+            swept = sweep_safety_temps(self.db.model.db_path)
+            swept += restore_stage.sweep_restore_temps(self.db.model.db_path)
+            if swept:
+                self.logger.info(f"Removed {len(swept)} interrupted backup copies")
+        except Exception as e:
+            self.logger.warning(f"Could not sweep interrupted backup copies: {e}")
+
+        # A crash between Move library's switch and its rename left the old
+        # node-folder files under their own names (#249 S6b): rename them now.
+        self.finish_interrupted_library_move()
 
         # Run cleanup on initialization to remove any existing duplicates
         try:
@@ -343,6 +500,24 @@ class PromptManagerAPI(
         """409 envelope for a long job that is already running."""
         return _json_error(f"{label} already running", 409)
 
+    async def _run_held(self, kind, title, admission, operation):
+        """Run a legacy-page operation under a registry hold (D80).
+
+        While ``operation()`` runs, the registry lists it as a running,
+        non-cancellable job, so workspace jobs its admission class conflicts
+        with are refused, naming it. When the registry refuses the hold, the
+        legacy 409 envelope names the running job and nothing is done. A
+        response of 400 or above ends the hold ``failed``.
+        """
+        busy = self._jobs.blocker(kind, admission=admission)
+        if busy is not None:
+            return self._long_job_busy_response(busy.title)
+        async with self._jobs.hold(kind, title, admission=admission) as job:
+            response = await operation()
+            if getattr(response, "status", 200) >= 400:
+                job.finish("failed")
+            return response
+
     async def _run_in_executor(self, func, *args, **kwargs):
         """Run a blocking function in the default thread pool executor.
 
@@ -355,23 +530,130 @@ class PromptManagerAPI(
             return await loop.run_in_executor(None, call)
         return await loop.run_in_executor(None, func, *args)
 
-    def invalidate_gallery_cache(self):
-        """Invalidate the cached gallery file listing.
+    async def _release_job_memory(self):
+        """After a scan or thumbnail job: glibc's free heap pages go back to
+        the OS once (``malloc_trim(0)``; nothing elsewhere, #523)."""
+        try:
+            await self._run_in_executor(release_free_memory)
+        except Exception:  # best effort: the job's result already stands
+            self.logger.debug("Releasing free memory failed", exc_info=True)
 
-        Called by the image monitor when new files are detected. The workspace
-        keeps its per-file values and card facts, so the next request rebuilds
-        only new or changed files (see ImageRoutesMixin._workspace_listed and
-        _card_facts); its sort orders
-        are dropped, as the rescan replaces them anyway, and so is the
-        favorites lookup, which holds the old scan list.
+    def _root_listing(self, root) -> RootListing:
+        """The shared listing record of one output root (created empty)."""
+        return self._root_listings.setdefault(str(root), RootListing())
+
+    def invalidate_gallery_cache(self, retire=False):
+        """Drop every root's listing, so the next read waits for a new walk.
+
+        Called after files are deleted through the app (duplicate cleanup and
+        the legacy duplicate delete), never for thumbnail writes. A walk
+        running now is not stored (its generation moved on). The workspace
+        keeps its per-file values and card facts, so the next request
+        rebuilds only new or changed files (see ImageRoutesMixin.
+        _workspace_listed and _card_facts); its sort orders are dropped, as
+        the walk replaces them anyway, and so is the favorites lookup, which
+        holds the old list.
+
+        ``retire`` (the roots changed): no background walk of a root starts
+        again until a reader or the warm-up asks for it.
         """
-        self._gallery_cache = {}
+        loop = self._listing_loop
+        if loop is not None and loop.is_running() and _running_loop() is not loop:
+            # Called from an executor thread (a settings save, a test seed):
+            # listing records are touched only on the loop, and the caller
+            # expects the drop done when this returns.
+            dropped = threading.Event()
+
+            def drop():
+                try:
+                    self._drop_listings(retire)
+                finally:
+                    dropped.set()
+
+            loop.call_soon_threadsafe(drop)
+            if not dropped.wait(_OFF_LOOP_DROP_WAIT):
+                self.logger.warning("The Images listing drop is still queued")
+            return
+        self._drop_listings(retire)
+
+    def _drop_listings(self, retire=False):
+        for record in list(self._root_listings.values()):
+            record.drop()
+            if retire:
+                # The roots changed: a removed root must not come back through
+                # a pending timer, a trailing walk or a monitor mark.
+                record.retired = True
+                record.dirty = False
+                handle, record.rewalk_handle = record.rewalk_handle, None
+                if handle is not None:
+                    handle.cancel()
         self._workspace_order_cache = {}
         self._favorite_listing_cache = {}
 
+    async def warm_gallery_listings(self, app=None):
+        """Start one background walk per output root (aiohttp on_startup).
+
+        Registered by the root ``__init__.py``, so the first Images open after
+        ComfyUI starts finds the listing built. It never fails startup: a
+        root that cannot be walked is retried by the first read.
+        """
+        # Each stored walk that changes a listing then rebuilds the workspace's
+        # per-file values, orders and favorites behind it (_warm_workspace).
+        self._workspace_warm_enabled = True
+        self._listing_loop = asyncio.get_running_loop()
+        self._listings_closed = False
+        try:
+            for root in self._get_all_output_dirs():
+                self._root_listing(root).retired = False
+                self._schedule_walk(root)
+        except Exception as e:
+            self.logger.warning(f"Could not warm the Images listing: {e}")
+
+    def notify_output_settled(self, path):
+        """The image monitor settled an output at *path* (any thread).
+
+        Called on the monitor's worker thread with the resolved path. It only
+        hands the path to the event loop (``output_settled``) and never
+        touches a listing from this thread; before the loop is known, or once
+        the listings are cleaned up, it does nothing.
+        """
+        loop = self._listing_loop
+        if loop is None or self._listings_closed or not loop.is_running():
+            return
+        try:
+            loop.call_soon_threadsafe(self.output_settled, path)
+        except RuntimeError:
+            pass  # the loop closed meanwhile (shutdown)
+
+    async def cleanup_gallery_listings(self, app=None):
+        """Stop the background listing walks (aiohttp on_cleanup)."""
+        self._workspace_warm_enabled = False
+        # No mark, deferred walk or trailing walk starts a walk from now on.
+        self._listings_closed = True
+        # Before any await, so no delayed refresh can start a walk meanwhile.
+        for record in self._root_listings.values():
+            handle, record.rewalk_handle = record.rewalk_handle, None
+            if handle is not None:
+                handle.cancel()
+        warm, self._workspace_warm_task = self._workspace_warm_task, None
+        if warm is not None:
+            warm.cancel()
+            await asyncio.gather(warm, return_exceptions=True)
+        tasks = list(self._listing_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._listing_tasks.clear()
+        # A walk cancelled before its first step never ran its own cleanup.
+        for record in self._root_listings.values():
+            flight, record.flight = record.flight, None
+            if flight is not None and not flight.done():
+                flight.set_result(WalkOutcome.failed(RuntimeError(WALK_STOPPED)))
+
     def reset_gallery_roots_cache(self):
         """Drop every cached listing and derived workspace value (roots changed)."""
-        self.invalidate_gallery_cache()
+        self.invalidate_gallery_cache(retire=True)
         self._workspace_listed_cache = {}
         self._workspace_card_cache = {}
 
@@ -397,48 +679,71 @@ class PromptManagerAPI(
 
         @routes.get("/prompt_manager/workspace")
         async def serve_workspace_ui(request: web.Request) -> web.Response:
-            return self._serve_html_page("workspace.html", "Workspace")
+            return self._serve_html_page(request, "workspace.html", "Workspace")
 
         @routes.get("/prompt_manager/web")
         async def serve_web_ui(request):
-            return self._serve_html_page("index.html", "Web UI", cache=False)
+            return self._serve_html_page(request, "index.html", "Web UI", cache=False)
 
         @routes.get("/prompt_manager/gallery.html")
         async def serve_gallery_ui(request):
-            return self._serve_html_page("metadata.html", "Gallery")
+            return self._serve_html_page(request, "metadata.html", "Gallery")
 
         @routes.get("/prompt_manager/admin")
         async def serve_admin_ui(request):
-            return self._serve_html_page("admin.html", "Admin UI")
+            return self._serve_html_page(request, "admin.html", "Admin UI")
 
         @routes.get("/prompt_manager/gallery")
         async def serve_gallery_admin_ui(request):
-            return self._serve_html_page("gallery.html", "Gallery")
+            return self._serve_html_page(request, "gallery.html", "Gallery")
 
         # ── Static file serving ───────────────────────────────────────
 
         @routes.get("/prompt_manager/lib/{filepath:.*}")
         async def serve_lib_static(request):
             """Serve static library files (JS, CSS) from web/lib directory."""
-            return self._serve_static_file("lib", request.match_info.get("filepath"))
+            return self._serve_static_file(
+                request, "lib", request.match_info.get("filepath")
+            )
 
         @routes.get("/prompt_manager/js/{filepath:.*}")
         async def serve_js_static(request):
             """Serve static JavaScript files from web/js directory."""
-            return self._serve_static_file("js", request.match_info.get("filepath"))
+            return self._serve_static_file(
+                request, "js", request.match_info.get("filepath")
+            )
 
         # ── Register domain-specific routes from mixins ───────────────
 
         self._register_pair_routes(routes)
         self._register_library_routes(routes)
+        self._register_library_delete_routes(routes)
         self._register_vocabulary_routes(routes)
+        self._register_annotation_routes(routes)
+        self._register_review_routes(routes)
+        self._register_review_event_routes(routes)
+        self._register_saved_view_routes(routes)
+        self._register_collection_routes(routes)
         self._register_history_routes(routes)
         self._register_prompt_routes(routes)
         self._register_image_routes(routes)
         self._register_admin_routes(routes)
+        self._register_settings_routes(routes)
+        self._register_job_routes(routes)
+        self._register_system_routes(routes)
+        self._register_diagnostics_report_routes(routes)
+        self._register_library_location_routes(routes)
+        self._register_maintenance_routes(routes)
+        self._register_backup_restore_routes(routes)
+        self._register_duplicate_routes(routes)
         self._register_logging_routes(routes)
         self._register_autotag_routes(routes)
         self._register_lora_routes(routes)
+        self._register_lora_import_routes(routes)
+        self._register_image_category_routes(routes)
+        self._register_image_delete_routes(routes)
+        self._register_image_return_routes(routes)
+        self._register_rescope_routes(routes)
 
         # Register gzip compression middleware (once)
         global _gzip_registered
@@ -454,21 +759,32 @@ class PromptManagerAPI(
 
         self.logger.info("All routes registered with decorator pattern")
 
-    def _serve_static_file(self, subdir, filepath):
-        """Serve ``web/<subdir>/<filepath>``; 403 outside it, 404 when missing."""
+    def _serve_static_file(self, request, subdir, filepath):
+        """Serve ``web/<subdir>/<filepath>``; 403 outside it, 404 when missing.
+
+        A served file is revalidated on every reuse (#478, ``revalidation``).
+        """
         root = os.path.join(_get_project_root(), "web", subdir)
-        file_path = _resolve_static_file(root, filepath)
+        exact = STATIC_EXACT_FILES.get((subdir, filepath))
+        # An exact file passes the same containment check, its extension only.
+        allowed = STATIC_MIME_TYPES if exact is None else {".json"}
+        file_path = _resolve_static_file(root, filepath, allowed)
         if file_path is None:
             return web.Response(text="Forbidden", status=403)
+        content_type = (
+            exact or STATIC_MIME_TYPES[os.path.splitext(file_path)[1].lower()]
+        )
         if not os.path.isfile(file_path):
             return web.Response(text="Not Found", status=404)
-        ext = os.path.splitext(file_path)[1].lower()
         with open(file_path, "rb") as f:
             content = f.read()
-        return web.Response(body=content, content_type=STATIC_MIME_TYPES[ext])
+        return revalidated_response(request, content, content_type)
 
-    def _serve_html_page(self, filename, title, cache=True):
-        """Serve ``web/<filename>``; 404 when missing, 500 when unreadable."""
+    def _serve_html_page(self, request, filename, title, cache=True):
+        """Serve ``web/<filename>``; 404 when missing, 500 when unreadable.
+
+        A served page is revalidated on every reuse (#478, ``revalidation``).
+        """
         html_path = os.path.join(_get_project_root(), "web", filename)
         try:
             if cache and html_path in self._html_cache:
@@ -485,7 +801,9 @@ class PromptManagerAPI(
                     content_type="text/html",
                     status=404,
                 )
-            return web.Response(text=content, content_type="text/html", charset="utf-8")
+            return revalidated_response(
+                request, content.encode("utf-8"), "text/html", charset="utf-8"
+            )
         except Exception:
             self.logger.exception(f"Failed to load {title}")
             return web.Response(
@@ -498,7 +816,12 @@ class PromptManagerAPI(
     # ── Shared utilities used by multiple mixins ──────────────────────
 
     def _enrich_images(self, images):
-        """Add url and thumbnail_url to a flat list of image dicts."""
+        """Add url and thumbnail_url to a flat list of image dicts.
+
+        Each dict without ``is_video`` also gets ``is_video`` and
+        ``media_type`` from its extension (#355: a linked LoraManager video
+        outside the output folders is shown as a video, not a picture).
+        """
         from urllib.parse import quote as url_quote
 
         output_dirs = self._get_all_output_dirs()
@@ -507,6 +830,11 @@ class PromptManagerAPI(
             image_path_str = image.get("image_path", "")
             if not image_path_str:
                 continue
+
+            if "is_video" not in image:
+                video = is_video_path(image_path_str)
+                image["is_video"] = video
+                image["media_type"] = "video" if video else "image"
 
             img_path = Path(image_path_str)
 
@@ -524,16 +852,20 @@ class PromptManagerAPI(
                         f"{url_quote(rel_path.as_posix(), safe='/')}"
                     )
 
-                    # Check for thumbnail
-                    rel_no_ext = rel_path.with_suffix("")
-                    thumb_rel = (
-                        f"thumbnails/{rel_no_ext.as_posix()}_thumb{rel_path.suffix}"
-                    )
+                    # Any preview the file owns, the current format first (#317)
+                    from . import thumbnail_settings
                     from .prompts import thumbnail_url_for
 
-                    thumbnail_url = thumbnail_url_for(
-                        thumb_rel, output_path / thumb_rel
+                    existing = thumbnail_settings.existing_thumbnail(
+                        output_path, rel_path
                     )
+                    thumbnail_url = None
+                    if existing is not None:
+                        thumb_rel = (
+                            thumbnail_settings.thumbnail_stem_rel(rel_path)
+                            + existing.suffix
+                        )
+                        thumbnail_url = thumbnail_url_for(thumb_rel, existing)
                     if thumbnail_url:
                         image["thumbnail_url"] = thumbnail_url
                     break  # Found matching root, stop searching
@@ -549,12 +881,12 @@ class PromptManagerAPI(
         return prompts
 
     def _clean_nan_recursive(self, obj):
-        """Recursively clean NaN values from nested data structures."""
+        """Recursively replace NaN and Infinity in nested data with None."""
         if isinstance(obj, dict):
             return {key: self._clean_nan_recursive(value) for key, value in obj.items()}
         elif isinstance(obj, list):
             return [self._clean_nan_recursive(item) for item in obj]
-        elif isinstance(obj, float) and str(obj) == "nan":
+        elif isinstance(obj, float) and not math.isfinite(obj):
             return None
         else:
             return obj
@@ -677,6 +1009,13 @@ class PromptManagerAPI(
         Returns:
             List[Path]: Validated directory paths, possibly empty.
         """
+        return self._output_dirs_with_origin()[0]
+
+    def _output_dirs_with_origin(self):
+        """``(dirs, auto_detected)``: the ``_get_all_output_dirs`` list, and
+        whether it comes from detection or ComfyUI's output rather than from
+        a valid configured root (False when there is no directory at all).
+        """
         from ..config import GalleryConfig
 
         configured = list(GalleryConfig.MONITORING_DIRECTORIES)
@@ -695,15 +1034,16 @@ class PromptManagerAPI(
             output_dirs.append(Path(real))
 
         if output_dirs:
-            return output_dirs
+            return output_dirs, False
 
         if configured:
             # Every configured root was rejected: never let auto-detection
             # resurrect it, serve ComfyUI's own output directory instead.
-            return self._comfyui_output_dir_list()
-
-        fallback = self._find_comfyui_output_dir()
-        return [Path(fallback)] if fallback else []
+            fallback_dirs = self._comfyui_output_dir_list()
+        else:
+            fallback = self._find_comfyui_output_dir()
+            fallback_dirs = [Path(fallback)] if fallback else []
+        return fallback_dirs, bool(fallback_dirs)
 
     def _comfyui_output_dir_list(self):
         """ComfyUI's output directory as a one-element list, or [] if unknown."""
@@ -720,6 +1060,8 @@ class PromptManagerAPI(
     def _extract_comfyui_metadata(self, image_path):
         """Embedded ComfyUI metadata of an image (PNG text chunks) or a video.
 
+        PNG text is read without decoding the pixels (``utils.png_text``, #523).
+
         Videos go through ffprobe (see utils/video_metadata). Unreadable files
         are a warning, not an error: a scan over a large output tree meets
         truncated and foreign files, and it carries on past them.
@@ -728,7 +1070,7 @@ class PromptManagerAPI(
             return read_video_metadata(image_path)
         try:
             with Image.open(image_path) as img:
-                return dict(getattr(img, "text", None) or {})
+                return png_text(img)
         except Exception as e:
             self.logger.warning(
                 f"Unreadable image {os.path.basename(str(image_path))}: {e}"
@@ -737,278 +1079,4 @@ class PromptManagerAPI(
 
     def _parse_comfyui_prompt(self, metadata):
         """Parse ComfyUI and A1111 prompt data from metadata."""
-        result = {
-            "prompt": None,
-            "workflow": None,
-            "parameters": {},
-            "positive_prompt": None,
-            "negative_prompt": None,
-        }
-
-        # Check for A1111/Forge style parameters first.
-        # The chunk is one block: a possibly multi-line positive prompt, then a
-        # "Negative prompt:" section, then a trailing "Steps: ..." settings line.
-        # Taking lines[0] as the positive prompt truncates any multi-line prompt
-        # to one line, so split on the settings line instead.
-        if "parameters" in metadata:
-            import re as _re
-
-            params = metadata["parameters"]
-            body = params
-            settings = ""
-            _sm = _re.search(r"\nSteps:\s", body)
-            if _sm:
-                settings = body[_sm.start() + 1 :].strip()
-                body = body[: _sm.start()]
-            negative = None
-            _nm = _re.search(r"(?im)^\s*negative prompt:\s*", body)
-            if _nm:
-                negative = body[_nm.end() :].strip()
-                body = body[: _nm.start()]
-            elif body.lower().lstrip().startswith("negative prompt:"):
-                negative = body.lower().lstrip()[len("negative prompt:") :].strip()
-                body = ""
-            result["positive_prompt"] = body.strip() or None
-            if negative:
-                result["negative_prompt"] = negative
-            # Store raw parameters too
-            result["parameters"]["parameters"] = params
-            if settings:
-                for _f in ("Steps", "Sampler", "Schedule type", "CFG scale", "Seed"):
-                    _fm = _re.search(
-                        r"(?i)(?:^|,\s*)" + _re.escape(_f) + r":\s*([^,]+)", settings
-                    )
-                    if _fm:
-                        result["parameters"][_f.lower().replace(" ", "_")] = _fm.group(
-                            1
-                        ).strip()
-
-        # If no A1111 format found, proceed with ComfyUI parsing
-        if result["positive_prompt"] is None:
-            # Check for direct prompt field
-            if "prompt" in metadata:
-                try:
-                    prompt_data = json.loads(metadata["prompt"])
-                    result["prompt"] = prompt_data
-                except json.JSONDecodeError:
-                    result["prompt"] = metadata["prompt"]
-
-            # Check for workflow
-            if "workflow" in metadata:
-                try:
-                    workflow_data = json.loads(metadata["workflow"])
-                    result["workflow"] = workflow_data
-                except json.JSONDecodeError:
-                    result["workflow"] = metadata["workflow"]
-
-            # Check for other common ComfyUI fields
-            common_fields = [
-                "positive",
-                "negative",
-                "steps",
-                "cfg",
-                "sampler",
-                "scheduler",
-                "seed",
-            ]
-            for field in common_fields:
-                if field in metadata:
-                    try:
-                        result["parameters"][field] = json.loads(metadata[field])
-                    except json.JSONDecodeError:
-                        result["parameters"][field] = metadata[field]
-
-        return result
-
-    def _extract_readable_prompt(self, parsed_data):
-        """Extract human-readable prompt text from ComfyUI/A1111 data."""
-
-        def safe_to_string(value):
-            if isinstance(value, str):
-                return value
-            elif isinstance(value, list):
-                return " ".join(str(item) for item in value if item)
-            elif value is not None:
-                return str(value)
-            return None
-
-        # First check if we already extracted a positive prompt (A1111 format)
-        if parsed_data.get("positive_prompt"):
-            return parsed_data["positive_prompt"]
-
-        # Check if prompt is already a string
-        if isinstance(parsed_data.get("prompt"), str):
-            return parsed_data["prompt"]
-
-        # Check if prompt is a simple value that can be converted
-        if parsed_data.get("prompt") and not isinstance(
-            parsed_data.get("prompt"), dict
-        ):
-            return safe_to_string(parsed_data["prompt"])
-
-        prompt_data = parsed_data.get("prompt")
-        if isinstance(prompt_data, dict):
-            # Use the enhanced logic from parse-metadata.py
-            positive_prompt = self._extract_positive_prompt_from_comfyui_data(
-                prompt_data
-            )
-            if positive_prompt:
-                return positive_prompt
-
-        # Check workflow data if available
-        workflow_data = parsed_data.get("workflow")
-        if isinstance(workflow_data, dict):
-            positive_prompt = self._extract_positive_prompt_from_comfyui_data(
-                workflow_data
-            )
-            if positive_prompt:
-                return positive_prompt
-
-        # Check parameters for positive prompt
-        if parsed_data.get("parameters", {}).get("positive"):
-            return safe_to_string(parsed_data["parameters"]["positive"])
-
-        return None
-
-    def _get_node_inputs(self, node):
-        """Safely get inputs from a node, handling both dict and list formats.
-
-        Old format: inputs is a dict with direct key-value pairs
-            inputs = {"text": "my prompt", "seed": 123}
-
-        New format: inputs is a list of connection objects
-            inputs = [
-                {"name": "text", "type": "STRING", "link": null,
-                 "widget": {"name": "text"}},
-                {"name": "clip", "type": "CLIP", "link": 11}
-            ]
-        """
-        if not isinstance(node, dict):
-            return {}
-
-        inputs = node.get("inputs", {})
-
-        # If inputs is already a dict, return it
-        if isinstance(inputs, dict):
-            return inputs
-
-        # If inputs is a list, convert to dict format
-        if isinstance(inputs, list):
-            inputs_dict = {}
-            for input_item in inputs:
-                if isinstance(input_item, dict) and "name" in input_item:
-                    name = input_item["name"]
-                    inputs_dict[name] = input_item
-            return inputs_dict
-
-        return {}
-
-    def _find_text_in_node(self, node):
-        """Try to find text content in a node using various strategies.
-
-        Handles both old and new workflow formats.
-        """
-        if not isinstance(node, dict):
-            return None
-
-        # Strategy 1: Check normalized inputs for 'text' field
-        inputs = self._get_node_inputs(node)
-        if "text" in inputs and isinstance(inputs["text"], str):
-            return inputs["text"]
-
-        # Strategy 2: For text encoder nodes, check widgets_values
-        class_type = node.get("class_type", node.get("type", ""))
-        text_encoder_types = [
-            "CLIPTextEncode",
-            "CLIPTextEncodeSDXL",
-            "CLIPTextEncodeSDXLRefiner",
-            "CLIPTextEncodeFlux",
-            "PromptManager",
-            "PromptManagerText",
-            "BNK_CLIPTextEncoder",
-            "Text Encoder",
-            "CLIP Text Encode",
-        ]
-
-        if any(
-            encoder_type.lower() in class_type.lower()
-            for encoder_type in text_encoder_types
-        ):
-            widgets_values = node.get("widgets_values", [])
-            if widgets_values and len(widgets_values) > 0:
-                if isinstance(widgets_values[0], str) and widgets_values[0].strip():
-                    return widgets_values[0]
-
-        return None
-
-    def _extract_positive_prompt_from_comfyui_data(self, data):
-        """Extract positive prompt from ComfyUI data.
-
-        Handles both old and new formats.
-        """
-        if not isinstance(data, dict):
-            return None
-
-        # Build nodes dictionary
-        nodes_by_id = {}
-        if "nodes" in data:
-            # Handle nodes array format
-            for node in data["nodes"]:
-                if isinstance(node, dict):
-                    nid = node.get("id")
-                    if nid is not None:
-                        nodes_by_id[nid] = node
-        else:
-            # Handle flat dictionary format (node_id -> node_data)
-            for nid_str, node in data.items():
-                try:
-                    nid = int(nid_str)
-                except (ValueError, TypeError):
-                    nid = nid_str
-                if isinstance(node, dict):
-                    if "id" in node:
-                        nid = node["id"]
-                    nodes_by_id[nid] = node
-
-        if not nodes_by_id:
-            return None
-
-        # First, try to find positive/negative connection pattern
-        pos_id = None
-        for node in nodes_by_id.values():
-            if isinstance(node, dict):
-                inputs = self._get_node_inputs(node)
-                if "positive" in inputs and "negative" in inputs:
-                    try:
-                        pos_input = inputs["positive"]
-                        if isinstance(pos_input, list) and len(pos_input) > 0:
-                            pos_id = int(pos_input[0])
-                            break
-                    except (ValueError, TypeError, IndexError):
-                        continue
-
-        # Get text from the positive node
-        if pos_id is not None and pos_id in nodes_by_id:
-            text_val = self._find_text_in_node(nodes_by_id[pos_id])
-            if text_val:
-                return text_val
-
-        # Fallback: find any text encoder node with text content
-        text_nodes = []
-        for node in nodes_by_id.values():
-            if isinstance(node, dict):
-                text_val = self._find_text_in_node(node)
-                if text_val:
-                    # Try to determine if this is positive or negative
-                    node_title = node.get("title", "").lower()
-                    if "neg" not in node_title and "negative" not in node_title:
-                        # Prioritize non-negative prompts
-                        text_nodes.insert(0, text_val)
-                    else:
-                        text_nodes.append(text_val)
-
-        # Return the first positive-looking prompt
-        if text_nodes:
-            return text_nodes[0]
-
-        return None
+        return parse_comfyui_prompt(metadata)

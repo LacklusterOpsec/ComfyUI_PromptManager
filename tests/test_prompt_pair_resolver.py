@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest import mock
+import unittest.mock as mock
 
 from utils import inspection_semantics
 from utils import prompt_pair_resolver as resolver
@@ -54,11 +54,28 @@ class TestPromptPairResolver(unittest.TestCase):
         self.assertEqual(result["positive"]["text"], "portrait")
         self.assertIsNone(result["negative"])
 
-    def test_multiple_samplers_are_ambiguous_even_when_texts_match(self):
+    def test_multiple_samplers_with_matching_texts_resolve_to_the_shared_pair(self):
         source = graph()
         source["4"] = {
             "class_type": "KSamplerAdvanced",
             "inputs": source["3"]["inputs"],
+        }
+        result = resolve_prompt_pair(source)
+        self.assertEqual(result["state"], "resolved")
+        self.assertEqual(
+            (result["positive"]["text"], result["negative"]["text"]),
+            ("portrait", "blurry"),
+        )
+        self.assertIsNone(result["sampler_id"])
+        self.assertEqual(result["reason"], resolver.IDENTICAL_BRANCHES_REASON)
+        self.assertEqual(len(result["candidates"]), 2)
+
+    def test_multiple_samplers_with_different_texts_are_ambiguous(self):
+        source = graph()
+        source["5"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "other"}}
+        source["4"] = {
+            "class_type": "KSamplerAdvanced",
+            "inputs": {"positive": ["5", 0], "negative": ["2", 0]},
         }
         result = resolve_prompt_pair(source)
         self.assertEqual(result["state"], "ambiguous")
@@ -1002,7 +1019,8 @@ class TestResolverProfiles(unittest.TestCase):
 
     def test_unsupported_node_names_the_blocking_node(self):
         source = graph()
-        source["1"]["class_type"] = "UnknownEncoder"
+        # No text and no links: nothing passes through it (#381).
+        source["1"] = {"class_type": "UnknownEncoder", "inputs": {"seed": 1}}
         result = resolve_prompt_pair(source, profile=resolver.INSPECTION_PROFILE)
         self.assertEqual(result["reason_code"], "unsupported-node")
         self.assertEqual(result["node"], {"id": "1", "class_type": "UnknownEncoder"})
@@ -1144,14 +1162,9 @@ class TestGuiderSamplers(unittest.TestCase):
 
     def test_unsupported_node_names_first_blocking_node(self):
         source = _guided()
-        source["30"] = {
-            "class_type": "FutureConditioner",
-            "inputs": {"conditioning": ["6", 0]},
-        }
-        source["31"] = {
-            "class_type": "OtherConditioner",
-            "inputs": {"conditioning": ["7", 0]},
-        }
+        # No links: nothing passes through them (#381).
+        source["30"] = {"class_type": "FutureConditioner", "inputs": {"seed": 1}}
+        source["31"] = {"class_type": "OtherConditioner", "inputs": {"seed": 2}}
         source["21"]["inputs"]["positive"] = ["30", 0]
         source["21"]["inputs"]["negative"] = ["31", 0]
         result = _inspect(source)
@@ -1228,7 +1241,7 @@ class TestGuiderSamplers(unittest.TestCase):
         source["3"]["inputs"]["guider"] = [previous, 0]
         self.assertEqual(_inspect(source)["reason_code"], "depth-limit")
 
-    def test_custom_advanced_upstream_of_a_sampler_is_multistage(self):
+    def test_custom_advanced_upstream_of_a_sampler_is_a_compared_stage(self):
         source = _guided()
         source["41"] = {
             "class_type": "KSampler",
@@ -1239,15 +1252,18 @@ class TestGuiderSamplers(unittest.TestCase):
             },
         }
         source["8"]["inputs"]["samples"] = ["41", 0]
+        # 41 continues 3's latent and reads the same texts as 3's guider.
+        for anchor in ("9", None):
+            result = _inspect(source, output_node_id=anchor)
+            self.assertEqual(
+                (result["state"], result["sampler_id"]), ("resolved", "41")
+            )
+        source["41"]["inputs"]["negative"] = ["6", 0]
         result = _inspect(source, output_node_id="9")
-        self.assertEqual(result["sampler_id"], "41")
-        self.assertEqual(result["state"], "unresolved")
-        self.assertEqual(result["reason"], "Multistage sampler ancestry is ambiguous")
-        unanchored = _inspect(source)
-        self.assertEqual(unanchored["state"], "ambiguous")
+        self.assertEqual(result["state"], "ambiguous")
+        self.assertEqual(result["reason_code"], "multistage-differs")
         self.assertEqual(
-            sorted(item["sampler_id"] for item in unanchored["candidates"]),
-            ["3", "41"],
+            sorted(item["sampler_id"] for item in result["candidates"]), ["3", "41"]
         )
 
 
@@ -1528,7 +1544,8 @@ class TestConditioningSemantics(unittest.TestCase):
     def test_diverging_branch_that_cannot_be_traced_is_never_guessed(self):
         extra = {
             "10": _encoded(parity.POS),
-            "11": {"class_type": "FutureEncoder", "inputs": {"text": WOLF}},
+            # No text and no links: nothing passes through it (#381).
+            "11": {"class_type": "FutureEncoder", "inputs": {"strength": 1.0}},
             "12": _image_exists(),
         }
         source = _with_positive(_if_else(["12", 1], ["10", 0], ["11", 0]), extra)
@@ -2028,11 +2045,16 @@ class TestEncoderAndStringSemantics(unittest.TestCase):
                 result = _inspect(_with_positive(node))
                 self.assertEqual(result["reason_code"], "malformed")
 
-    def test_unverified_text_nodes_stay_unsupported_and_named(self):
-        # TextBoxMira was verified in its source in Task 2.7b and is listed.
+    def test_unknown_text_nodes_pass_their_text_through(self):
+        # #381: an unlisted node's ``text`` input is its text (the legacy rule);
+        # without one, and with nothing linked, it is still named.
         for name in ("LoRAfromText", "RegexReplace", "XYZPrompt"):
             with self.subTest(node=name):
                 node = {"class_type": name, "inputs": {"text": parity.POS}}
+                result = _inspect(_string_positive(node))
+                self.assertEqual(result["state"], "resolved")
+                self.assertEqual(result["positive"]["text"], parity.POS)
+                node = {"class_type": name, "inputs": {"pattern": parity.POS}}
                 result = _inspect(_string_positive(node))
                 self.assertEqual(result["reason_code"], "unsupported-node")
                 self.assertEqual(result["node"], {"id": "10", "class_type": name})
@@ -2253,12 +2275,14 @@ class TestDetailerStages(unittest.TestCase):
         self.assertEqual(_sides(result), (parity.DETAILER_POS, parity.NEG))
         self.assertEqual(result["sampler_id"], "50")
 
-    def test_raw_and_detailed_saves_stay_ambiguous_without_an_anchor(self):
+    def test_raw_and_detailed_saves_of_one_prompt_share_it_without_an_anchor(self):
         source = _detailed(same_prompt=True)
         source["14"] = {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}}
         result = _inspect(source)
-        self.assertEqual(result["state"], "ambiguous")
-        self.assertEqual(result["reason"], "Multiple sampler branches")
+        # #249: both saves used one pair, so it resolves with no sampler named.
+        self.assertEqual(result["state"], "resolved")
+        self.assertIsNone(result["sampler_id"])
+        self.assertEqual(result["reason"], resolver.IDENTICAL_BRANCHES_REASON)
         self.assertEqual(
             sorted(item["sampler_id"] for item in result["candidates"]), ["3", "50"]
         )
@@ -2291,7 +2315,8 @@ class TestDetailerStages(unittest.TestCase):
 
     def test_unresolved_stage_blocks_the_chain(self):
         source = _detailed(same_prompt=True)
-        source["30"] = {"class_type": "FutureConditioner", "inputs": {"c": ["6", 0]}}
+        # No links: nothing passes through it (#381).
+        source["30"] = {"class_type": "FutureConditioner", "inputs": {"c": 1.0}}
         source["3"]["inputs"]["positive"] = ["30", 0]
         source["50"]["inputs"]["positive"] = ["10", 0]
         result = _inspect(source)
@@ -2613,17 +2638,19 @@ class TestLatentAncestry(unittest.TestCase):
                 self.assertEqual(_sides(result), (parity.POS, parity.NEG))
                 self.assertEqual(_inspect(source, output_node_id="9"), result)
 
-    def test_upstream_sampler_through_vaedecode_vaeencode_is_multistage(self):
-        for positive in (OTHER, parity.POS):
-            with self.subTest(positive=positive):
-                result = _inspect(_image_to_image(positive), output_node_id="63")
-                # Until PR3 compares stage texts, never one stage's prompt.
-                self.assertEqual(result["state"], "unresolved")
-                self.assertEqual(result["sampler_id"], "61")
-                self.assertEqual(result["reason"], MULTISTAGE)
-                self.assertIsNone(result["reason_code"])
-                self.assertIsNone(result["positive"])
-                self.assertIsNone(result["negative"])
+    def test_upstream_sampler_through_vaedecode_vaeencode_is_compared(self):
+        # The latent continues the first stage's through lineage nodes: the
+        # stages are compared (spec 9.3), equal prompts resolve, others differ.
+        result = _inspect(_image_to_image(parity.POS), output_node_id="63")
+        self.assertEqual((result["state"], result["sampler_id"]), ("resolved", "61"))
+        self.assertEqual(_sides(result), (parity.POS, parity.NEG))
+        result = _inspect(_image_to_image(OTHER), output_node_id="63")
+        self.assertEqual(result["state"], "ambiguous")
+        self.assertEqual(result["sampler_id"], "61")
+        self.assertEqual(result["reason_code"], "multistage-differs")
+        self.assertEqual(
+            [item["sampler_id"] for item in result["candidates"]], ["61", "3"]
+        )
         # An upstream sampler reached through a non-latent input is a stage too.
         source = _latent_from(
             {
@@ -2638,11 +2665,13 @@ class TestLatentAncestry(unittest.TestCase):
             },
             {
                 "50": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+                # Its own encoder (#381: the same links would be one prompt).
+                "73": parity._enc(parity.POS),
                 "70": {
                     "class_type": "KSampler",
                     "inputs": {
                         "model": ["4", 0],
-                        "positive": ["6", 0],
+                        "positive": ["73", 0],
                         "negative": ["7", 0],
                         "latent_image": ["72", 0],
                     },
@@ -2940,8 +2969,15 @@ class TestLatentAncestry(unittest.TestCase):
         result = _inspect(source, output_node_id="9")
         self.assertEqual(result["reason_code"], "unsupported-node")
         self.assertEqual(result["node"], {"id": "60", "class_type": "MysteryUpscaler"})
-        # The listed stage is now an earlier sampler stage in the ancestry.
+        # The listed stage is now an earlier sampler stage, continued through
+        # VAEEncode: its prompt equals this stage's, so the chain resolves.
         source["60"]["class_type"] = "UltimateSDUpscale"
+        result = _inspect(source, output_node_id="9")
+        self.assertEqual((result["state"], result["sampler_id"]), ("resolved", "3"))
+        # Reached only through an unlisted image node, it stays unattributed:
+        # a detailer is never a plain first stage, even on the same links (#381).
+        source["61"] = {"class_type": "MysteryFilter", "inputs": {"image": ["60", 0]}}
+        source["5"]["inputs"]["pixels"] = ["61", 0]
         result = _inspect(source, output_node_id="9")
         self.assertEqual(result["reason"], resolver.MULTISTAGE_UNATTRIBUTED_REASON)
 

@@ -46,12 +46,12 @@ test('native image inspector previews and sends a pair into real visible widgets
         await workspace.getByRole('dialog',{name:'Import & inspect',exact:true}).getByRole('button',{name:'Rescan',exact:true}).click();
         const card=workspace.locator('article[data-image-key]').filter({has:workspace.getByRole('button',{name:`Open ${filename}`,exact:true})});
         await card.getByRole('button',{name:`Inspect ${filename}`,exact:true}).click();
-        const inspector=workspace.getByRole('region',{name:'Image details',exact:true});
+        const inspector=workspace.getByRole('complementary',{name:'Selected image details',exact:true});
         await expect(inspector.getByRole('region',{name:'Positive prompt',exact:true})).toContainText(positive);
-        await inspector.getByRole('button',{name:'Open full preview',exact:true}).click();
+        await card.getByRole('button',{name:`Open ${filename}`,exact:true}).click();
         const viewer=workspace.locator('dialog#viewer-dialog');
         await expect(viewer.locator('.viewer-canvas img')).toBeVisible();
-        await expect(viewer.locator('.generation-facts dd')).toHaveText(['9007199254740993','28','6.5','dpmpp_2m','karras','host-fixture.safetensors']);
+        await expect(viewer.locator('.meta-grid').first().locator('dd')).toHaveText(['9007199254740993','28','6.5','dpmpp_2m','karras','host-fixture.safetensors']);
         await viewer.getByText('Workflow & raw metadata',{exact:true}).click();
         await expect(viewer.locator('pre code').first()).toContainText('9007199254740993');
         await expect(viewer.getByRole('button',{name:'Download workflow JSON',exact:true})).not.toHaveAttribute('aria-disabled','true');
@@ -59,17 +59,23 @@ test('native image inspector previews and sends a pair into real visible widgets
         for(const renderer of [!testInfo.project.metadata.initialRenderer,testInfo.project.metadata.initialRenderer]) {
             await page.evaluate(async renderer=>{const {app}=await import('/scripts/app.js');await app.ui.settings.setSettingValue('Comfy.VueNodes.Enabled',renderer);await app.loadGraphData(app.graph.serialize());app.canvas.centerOnNode(app.graph._nodes[0]);},renderer);
             await expect.poll(()=>page.evaluate(()=>LiteGraph.vueNodesMode)).toBe(renderer);
-            await expect(viewer).toBeVisible();await expect(viewer.locator('.generation-facts dd').first()).toHaveText('9007199254740993');
+            await expect(viewer).toBeVisible();await expect(viewer.locator('.meta-grid dd').first()).toHaveText('9007199254740993');
             await expect(nodeRoot.getByRole('textbox',{name:'Positive prompt',exact:true})).toHaveValue('Before positive');
         }
         expect(await page.evaluate(()=>window.senderEffects.queue)).toBe(0);
         await page.evaluate(()=>{window.senderSendBaseline={...window.senderEffects};});
-        await viewer.getByRole('button',{name:'Send prompt pair',exact:true}).click();
+        await viewer.getByRole('button',{name:/^Send prompt pair to ComfyUI: /}).click();
         const sender=workspace.getByRole('dialog',{name:'Send to ComfyUI',exact:true});
         const hosts=sender.getByRole('combobox',{name:'ComfyUI window',exact:true});
         await expect(hosts.locator('option')).toHaveCount(2);
-        await hosts.selectOption({index:1});
-        await sender.getByRole('combobox',{name:'Destination node',exact:true}).selectOption({index:1});
+        // #535: the window is named by its tab, and one window with one node needs no choosing.
+        const tabTitle=await page.title();
+        await expect(hosts.locator('option').nth(1)).toHaveText(tabTitle);
+        expect(tabTitle).not.toContain('PromptManager');
+        await expect(hosts).not.toHaveValue('');
+        await expect(sender.getByRole('combobox',{name:'Destination node',exact:true})).not.toHaveValue('');
+        await expect(sender.getByRole('status')).toContainText(`in ${tabTitle}. Apply to send it, or preview the changes first.`);
+        await expect(sender.getByRole('combobox',{name:'Destination node',exact:true}).locator('option').nth(1)).toHaveText(new RegExp(`^#${id} `));
         await sender.getByRole('button',{name:'Preview changes',exact:true}).click();
         for(const text of ['Before positive','Before negative',positive,negative,`LoRA trigger ${positive} fine detail`])await expect(sender).toContainText(text);
         await expect(nodeRoot.getByRole('textbox',{name:'Positive prompt',exact:true})).toHaveValue('Before positive');
@@ -86,5 +92,95 @@ test('native image inspector previews and sends a pair into real visible widgets
         for(const name of ['inputs','serialized'])expect(state[name]).toMatchObject({text:positive,negative_text:negative,prepend_text:'LoRA trigger',append_text:'fine detail'});
         expect(state.effects).toEqual({queue:0,load:0});expect(errors).toEqual([]);
         await workspace.screenshot({path:testInfo.outputPath('full-inspector-host-send.png')});
+        // #535 D175: Apply without Preview, one click, and a double click sends once.
+        const apply=sender.getByRole('button',{name:'Apply to ComfyUI',exact:true});
+        const find0=sender.getByRole('button',{name:'Find ComfyUI windows',exact:true});
+        const positiveBox=nodeRoot.getByRole('textbox',{name:'Positive prompt',exact:true});
+        await positiveBox.fill('Typed before one click');
+        await find0.click();
+        await expect(apply).toBeEnabled();
+        await apply.dblclick();
+        await expect(sender).toContainText('Sent to ComfyUI.');
+        await expect(positiveBox).toHaveValue(positive);
+        await expect(apply).toBeDisabled();
+        // Edited in ComfyUI after the send: a stray second send would overwrite this.
+        await positiveBox.fill('Typed after the send');
+        await expect(positiveBox).toHaveValue('Typed after the send');
+        // A changed workflow since discovery refuses through one-click Apply, and writes nothing.
+        await find0.click();
+        await expect(apply).toBeEnabled();
+        await page.evaluate(async()=>{const {app}=await import('/scripts/app.js');await app.loadGraphData(app.graph.serialize());});
+        await apply.click();
+        await expect(sender.getByRole('alert')).toContainText(/workflow changed/i);
+        await expect(positiveBox).toHaveValue('Typed after the send');
+        // A field linked after discovery refuses the same way.
+        await find0.click();
+        await expect(apply).toBeEnabled();
+        await page.evaluate(async id=>{
+            const {app}=await import('/scripts/app.js');const {convertToInput}=await import('/extensions/core/widgetInputs.js');
+            const node=app.graph.getNodeById(id);const widget=node.widgets.find(widget=>widget.name==='negative_text');
+            if(!node.inputs.some(input=>input.name==='negative_text'))convertToInput(node,widget);
+            const source=LiteGraph.createNode('PrimitiveString');app.graph.add(source);
+            source.connect(0,node,node.inputs.findIndex(input=>input.name==='negative_text'));
+        },id);
+        await apply.click();
+        await expect(sender.getByRole('alert')).toContainText(/connected/i);
+        await expect(positiveBox).toHaveValue('Typed after the send');
+        await page.evaluate(async id=>{const {app}=await import('/scripts/app.js');const node=app.graph.getNodeById(id);node.disconnectInput(node.inputs.findIndex(input=>input.name==='negative_text'));},id);
+        // Two identical nodes are never selected for you, and read "#<id> <title>".
+        const twinId=await page.evaluate(async()=>{const {app}=await import('/scripts/app.js');const node=LiteGraph.createNode('PromptManagerPair');app.graph.add(node);return node.id;});
+        await find0.click();
+        const targets=sender.getByRole('combobox',{name:'Destination node',exact:true});
+        await expect(targets.locator('option')).toHaveCount(4);
+        await expect(targets).toHaveValue('');
+        await expect(apply).toBeDisabled();
+        await expect(targets.locator('option').nth(2)).toHaveText(new RegExp(`^#${twinId} `));
+        // #542 D191: "All 2 eligible nodes" writes both real nodes, one after another; a linked third node is not offered.
+        const linkedId=await page.evaluate(async()=>{
+            const {app}=await import('/scripts/app.js');const {convertToInput}=await import('/extensions/core/widgetInputs.js');
+            const node=LiteGraph.createNode('PromptManagerPair');app.graph.add(node);
+            const widget=node.widgets.find(widget=>widget.name==='text');
+            if(!node.inputs.some(input=>input.name==='text'))convertToInput(node,widget);
+            const source=LiteGraph.createNode('PrimitiveString');app.graph.add(source);
+            source.connect(0,node,node.inputs.findIndex(input=>input.name==='text'));
+            for(const each of app.graph._nodes.filter(item=>item.type==='PromptManagerPair')){const text=each.widgets.find(widget=>widget.name==='text');if(text)text.value=`Before all ${each.id}`;}
+            return node.id;
+        });
+        await find0.click();
+        await expect(targets.locator('option')).toHaveText(['Choose a destination node',new RegExp(`^#${id} `),new RegExp(`^#${twinId} `),'All 2 eligible nodes']);
+        await expect(sender.getByRole('status')).toContainText('1 other Prompt Manager node cannot receive this prompt.');
+        await targets.selectOption({label:'All 2 eligible nodes'});
+        await sender.getByRole('button',{name:'Preview changes',exact:true}).click();
+        await expect(sender.locator('section.prompt-sender-node > h4')).toHaveText([new RegExp(`^#${id} `),new RegExp(`^#${twinId} `)]);
+        await apply.click();
+        // The tab title gains ComfyUI's unsaved mark once the workflow changed, so the window is matched loosely.
+        await expect(sender.getByRole('status')).toHaveText(/^Sent to 2 of 2 nodes in .*ComfyUI\.$/);
+        await expect(apply).toBeDisabled();
+        const all=await page.evaluate(async ids=>{
+            const {app}=await import('/scripts/app.js');const output=(await app.graphToPrompt()).output;
+            return ids.map(nodeId=>{const node=app.graph.getNodeById(nodeId);const serialized=node.serialize();const index=node.widgets.findIndex(widget=>widget.name==='negative_text');
+                return{prompt:output[String(nodeId)]?.inputs.negative_text,serialized:serialized.widgets_values[index],text:node.widgets.find(widget=>widget.name==='text')?.value};});
+        },[id,twinId,linkedId]);
+        expect(all.slice(0,2)).toEqual([{prompt:negative,serialized:negative,text:positive},{prompt:negative,serialized:negative,text:positive}]);
+        expect(all[2].text).toBe(`Before all ${linkedId}`);
+        expect(await page.evaluate(()=>window.senderEffects.queue-window.senderSendBaseline.queue)).toBe(0);
+        await page.evaluate(async ids=>{const {app}=await import('/scripts/app.js');for(const nodeId of ids)app.graph.remove(app.graph.getNodeById(nodeId));},[twinId,linkedId]);
+        // #535: the status line says why a window cannot receive.
+        const find=sender.getByRole('button',{name:'Find ComfyUI windows',exact:true});
+        const preview=sender.getByRole('button',{name:'Preview changes',exact:true});
+        await page.evaluate(async id=>{
+            const {app}=await import('/scripts/app.js');const {convertToInput}=await import('/extensions/core/widgetInputs.js');
+            const node=app.graph.getNodeById(id);const widget=node.widgets.find(widget=>widget.name==='text');
+            if(!node.inputs.some(input=>input.name==='text'))convertToInput(node,widget);
+            const source=LiteGraph.createNode('PrimitiveString');app.graph.add(source);
+            source.connect(0,node,node.inputs.findIndex(input=>input.name==='text'));
+        },id);
+        await find.click();
+        await expect(sender).toContainText(/has its positive prompt linked to another node/);
+        await expect(preview).toBeDisabled();
+        await page.evaluate(async()=>{const {app}=await import('/scripts/app.js');app.graph.clear();});
+        await find.click();
+        await expect(sender).toContainText('has no Prompt Manager node.');
+        await expect(preview).toBeDisabled();
     } finally {await workspace.close();}
 });

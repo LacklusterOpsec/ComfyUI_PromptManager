@@ -2,16 +2,24 @@ import {createScope, createButton} from '../shared/toolkit/core.js';
 import {createViewerSession} from './viewer-state.mjs';
 import {rootedFileAdapter} from './inspection-state.mjs';
 import {mountFileInspector} from './file-inspector.mjs';
+import {displayPreferences, readPreferences} from './preferences.mjs';
+import {createWorkspaceIcon} from './icons.mjs';
 
 let viewerId = 0;
 // Upper bound on waiting for a closed Viewer's in-flight image view before destroying it.
 const PENDING_VIEW_DESTROY_MS = 10000;
+/** The video defaults, read through the shared display defaults (preferences.mjs, #249 System S3). */
 export function readViewerPreferences(getStorage = () => window.localStorage, normalize = globalThis.GallerySettings.normalizeGallerySettings) {
-    let stored;
-    try { stored = JSON.parse(getStorage().getItem('gallerySettings')); } catch { stored = null; }
-    const {videoAutoplay,videoMute,videoLoop} = normalize(stored);
+    const {videoAutoplay,videoMute,videoLoop} = readPreferences(getStorage,normalize).values;
     return {videoAutoplay,videoMute,videoLoop};
 }
+// #532: where ← and → stay with what has focus (a video's seek, text carets, a disclosure, scrolling text).
+const KEEPS_ARROWS = 'video,input,textarea,select,pre,summary,[contenteditable]';
+const SHORTCUTS = [
+    ['Move',[['←','Previous file'],['→','Next file'],['Space','Play or pause the slideshow']]],
+    ['Image',[['+','Zoom in'],['-','Zoom out'],['0','Fit'],['R','Rotate'],['H','Flip']]],
+    ['View',[['F','Full screen or centered'],['I','Show or hide details'],['?','These shortcuts'],['Esc','Close the viewer']]],
+    ['File',[['D','Download the original'],['Delete','Delete…, which asks first']]]];
 function element(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -19,12 +27,19 @@ function element(tag, className, text) {
     return node;
 }
 
-export function createMediaViewer({container,parentScope,inspectionController,sender,onSelect,onRefresh,onRestoreFocus,onClose,adapter = rootedFileAdapter}) {
+/**
+ * #331 D139: with the client store `collections`, the viewer's inspector offers "Collections…"; the changes it confirms
+ * reach `onCollectionsChanged({added, removed})` once the viewer closes, so the viewer keeps its place while open.
+ */
+export function createMediaViewer({api,container,parentScope,inspectionController,sender,onSelect,onRefresh,onRestoreFocus,onClose,onMediaError,adapter = rootedFileAdapter,
+    collections = null,onCollectionsChanged = null,onDelete = null}) {
     const scope = createScope();
     let active = null, retryVersion = 0;
     const dispose = () => scope.dispose();
     const stopSlideshow = () => active?.stop();
-    if (parentScope.signal.aborted) { scope.dispose(); return {open() {},dispose,stopSlideshow}; }
+    // Closes an open viewer without restoring focus (page leave); the viewer stays usable.
+    const close = () => active?.close(false);
+    if (parentScope.signal.aborted) { scope.dispose(); return {open() {},close,dispose,stopSlideshow}; }
     parentScope.signal.addEventListener('abort',dispose,{once:true});
     scope.cleanup(() => parentScope.signal.removeEventListener('abort',dispose));
     scope.cleanup(() => active?.close(false));
@@ -32,9 +47,9 @@ export function createMediaViewer({container,parentScope,inspectionController,se
     function open(options) {
         if (scope.signal.aborted) return;
         active?.close(false);
-        const {items,selectedKey,trigger = document.activeElement} = options;
-        let mounted = false, initial, entry, currentKey, viewer = null, mediaScope = null, closed = false;
-        let originalDownload = null, inspectionState = inspectionController.state;
+        const {items,selectedKey,trigger = document.activeElement,details:detailsMode} = options;
+        let mounted = false, initial, entry, currentKey, viewer = null, withoutViewer = false, mediaScope = null, closed = false;
+        let originalDownload = null, inspectionState = inspectionController.state, collectionChanges = null;
         const session = createViewerSession({adapter,items,initialKey:selectedKey,onChange:(state,selected) => {
             if (!mounted) { initial = [state,selected]; return; }
             update(state,selected);
@@ -49,7 +64,13 @@ export function createMediaViewer({container,parentScope,inspectionController,se
         const heading = element('div'), title = element('h2');title.id = 'viewer-title';
         heading.append(title,element('p','muted small','One viewer · image, prompts, generation data, workflow'));
         const close = createButton('×');close.id = 'viewer-close';close.setAttribute('aria-label','Close image viewer');close.autofocus = true;
-        header.append(heading,close);
+        // #450 (D156): the view switch before ✕ names the view it switches to; the stored default picks the first view.
+        let fullscreen = displayPreferences()?.viewerOpenMode === 'fullscreen';
+        const mode = createButton('','icon-btn');mode.id = 'viewer-mode';
+        // #532 (D170): ⌘ before the view switch lists the viewer's shortcuts.
+        const keys = createButton('','icon-btn');keys.id = 'viewer-keys';keys.title = 'Keyboard shortcuts';
+        keys.setAttribute('aria-label','Keyboard shortcuts');keys.append(createWorkspaceIcon('command'));
+        header.append(heading,keys,mode,close);
         const body = element('div','viewer-layout'), left = element('div','viewer-left');
         const stage = element('div');stage.id = 'viewer-stage';stage.tabIndex = 0;
         stage.setAttribute('role','region');stage.setAttribute('aria-label','Media preview');
@@ -71,17 +92,81 @@ export function createMediaViewer({container,parentScope,inspectionController,se
         const download = element('a','media-download','Download');download.setAttribute('aria-label','Download original');download.setAttribute('download','');
         local.listen(download,'click',event => {session.stop();if (download.getAttribute('aria-disabled') === 'true') event.preventDefault();});
         controls.append(download);
+        // #480: Delete… (the Images viewer only) pauses the media, then opens the delete review for this file.
+        let remove = null;
+        if (onDelete) {
+            remove = createButton('Delete…','danger');
+            local.listen(remove,'click',() => {
+                session.stop();
+                for (const video of dialog.querySelectorAll('video')) video.pause();
+                if (entry) onDelete(entry,remove);
+            });
+            controls.append(remove);
+        }
         const next = button('Next media','Next →',() => session.navigate(1));
+        // D97: "Collapse viewer details by default" opens the viewer with its details hidden behind one toggle. D155
+        // (#448): `details: 'shown'` (Inspect a file) keeps the toggle but opens with the details showing. D156 (#450):
+        // the toggle is also there while the view is full screen.
+        const collapsible = displayPreferences()?.sidebarCollapsedByDefault === true, collapsed = collapsible && detailsMode !== 'shown';
+        const detailsToggle = createButton('');detailsToggle.setAttribute('aria-controls','viewer-details');
         const position = element('p','media-position muted');position.id = `media-viewer-position-${++viewerId}`;
         position.setAttribute('role','status');
         const reason = element('p','media-reason muted');reason.id = `media-viewer-reason-${viewerId}`;
         const slideshowReason = element('p','media-slideshow-reason muted');slideshowReason.id = `media-viewer-slideshow-${viewerId}`;
         controls.append(position,reason,slideshowReason);left.append(stage,controls);
         const details = element('aside');details.id = 'viewer-details';details.setAttribute('aria-label','Image metadata');
+        details.hidden = collapsed;
+        function paintToggle() {
+            detailsToggle.textContent = details.hidden ? 'Show details' : 'Hide details';
+            detailsToggle.setAttribute('aria-expanded',String(!details.hidden));
+        }
+        /** The toggle is in the toolbar only in full screen or with the collapse setting; without both the details show. */
+        function syncToggle() {
+            if (collapsible || fullscreen) { if (!detailsToggle.isConnected) controls.insertBefore(detailsToggle,position); }
+            else { detailsToggle.remove();details.hidden = false; }
+            paintToggle();
+        }
+        function paintMode() {
+            if (fullscreen) dialog.classList.add('viewer-fullscreen'); else dialog.classList.remove('viewer-fullscreen');
+            const label = fullscreen ? 'Centered view' : 'Full screen view';
+            mode.setAttribute('aria-label',label);mode.title = label;
+            mode.replaceChildren(createWorkspaceIcon(fullscreen ? 'minimize' : 'maximize'));
+        }
+        local.listen(detailsToggle,'click',() => {details.hidden = !details.hidden;paintToggle();});
+        local.listen(mode,'click',() => {fullscreen = !fullscreen;paintMode();syncToggle();});
+        /** A modal inside the viewer: Esc closes only the top dialog, `close` and `cancel` do not bubble, focus returns to ⌘. */
+        function openShortcuts() {
+            session.stop();
+            const overlay = element('dialog');overlay.id = 'viewer-keys-dialog';overlay.setAttribute('aria-labelledby','viewer-keys-title');
+            const top = element('div','dialog-header'), name = element('h2',undefined,'Keyboard shortcuts');name.id = 'viewer-keys-title';
+            const dismiss = createButton('×');dismiss.setAttribute('aria-label','Close keyboard shortcuts');dismiss.autofocus = true;
+            top.append(name,dismiss);
+            const groups = element('div','viewer-keys-groups');
+            for (const [group,rows] of SHORTCUTS) {
+                const section = element('section'), list = element('dl');
+                for (const [key,action] of rows) {
+                    if (key === 'Delete' && !remove) continue;
+                    const row = element('div'), term = element('dt'), kbd = element('kbd',undefined,key);
+                    term.append(kbd);row.append(term,element('dd',undefined,action));list.append(row);
+                }
+                section.append(element('h3','small muted',group),list);groups.append(section);
+            }
+            overlay.append(top,groups,element('p','muted small','A video player or text with focus keeps its keys. A key does nothing when its button is unavailable for this file.'));
+            local.listen(dismiss,'click',() => overlay.close());
+            local.listen(overlay,'close',() => overlay.remove());
+            dialog.append(overlay);overlay.showModal();
+        }
+        local.listen(keys,'click',openShortcuts);
+        paintMode();syncToggle();
         body.append(left,details);dialog.append(header,body);container.append(dialog);
         const localSender = {open(roles,trigger) {session.stop();sender.open(roles,trigger);}};
-        const inspector = mountFileInspector(details,{sender:localSender,parentScope:local,onInteraction:() => session.stop(),onRetry:() => inspectionController.retry(),
-            onRefresh:onRefresh ? () => { closeViewer();onRefresh(); } : undefined});
+        const inspector = mountFileInspector(details,{api,sender:localSender,parentScope:local,variant:'full',onInteraction:() => session.stop(),onRetry:() => inspectionController.retry(),
+            onLoad:() => inspectionController.load?.(),
+            onRefresh:onRefresh ? () => { closeViewer();onRefresh(); } : undefined,collections,
+            onCollectionsChanged:({added,removed}) => {
+                collectionChanges ??= {added:[],removed:[]};
+                collectionChanges.added.push(...added);collectionChanges.removed.push(...removed);
+            }});
         function closeViewer(restore = true) {
             if (closed) return;
             closed = true;active = null;local.dispose();
@@ -90,6 +175,7 @@ export function createMediaViewer({container,parentScope,inspectionController,se
                 else onRestoreFocus?.(entry);
             }
             if (!scope.signal.aborted) onClose?.();
+            if (collectionChanges && !scope.signal.aborted) onCollectionsChanged?.(collectionChanges);
         }
         active = {close:closeViewer,stop:() => session.stop()};
         local.cleanup(() => {
@@ -102,26 +188,54 @@ export function createMediaViewer({container,parentScope,inspectionController,se
         local.listen(document,'visibilitychange',() => {if (document.hidden) session.stop();});
         local.listen(window,'pagehide',() => closeViewer(false));
         local.listen(retry,'click',() => {if (!inspectionState.refreshRequired) rebuild(entry);});
-        local.listen(dialog,'keydown',event => {
-            if (!['ArrowLeft','ArrowRight'].includes(event.key) || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey ||
-                (!stage.contains(event.target) && !controls.contains(event.target)) ||
-                event.target.closest('video,input,textarea,select,pre,summary,[contenteditable]') ||
-                !window.getSelection()?.isCollapsed || [...document.querySelectorAll('dialog[open]')].at(-1) !== dialog) return;
-            event.preventDefault();session.navigate(event.key === 'ArrowLeft' ? -1 : 1);
+        // #532: on the document, as the legacy gallery does: focus starts on ✕ and can fall to the page (a click on
+        // header text, a focused video replaced by navigating), where a key never reaches the dialog.
+        // A key clicks the toolbar's own control, whose handler checks `aria-disabled`, so the two cannot disagree; a
+        // control that is missing or hidden has no client rects. Only zoom repeats, so holding D downloads once.
+        const [zoomOut,zoomIn,fit,rotate,flip] = transforms;
+        const hotkeys = new Map([['+',zoomIn],['=',zoomIn],['-',zoomOut],['0',fit],['r',rotate],['h',flip],[' ',slideshow],
+            ['f',mode],['i',detailsToggle],['d',download],['Delete',remove]]);
+        const repeats = new Set(['+','=','-']);
+        const keysAreOurs = ({target,altKey,ctrlKey,metaKey,isComposing}) => !altKey && !ctrlKey && !metaKey && !isComposing &&
+            (dialog.contains(target) || target === document.body || target === document.documentElement) &&
+            !target.closest(KEEPS_ARROWS) && (!details.contains(target) || target.closest('button,a')) &&
+            window.getSelection()?.isCollapsed && [...document.querySelectorAll('dialog[open]')].at(-1) === dialog;
+        local.listen(document,'keydown',event => {
+            if (!keysAreOurs(event)) return;
+            const {key,target,repeat,shiftKey} = event;
+            if (key === 'ArrowLeft' || key === 'ArrowRight') {
+                if (shiftKey) return;
+                event.preventDefault();session.navigate(key === 'ArrowLeft' ? -1 : 1);return;
+            }
+            if (repeat && !repeats.has(key)) return;
+            if (key === '?') { event.preventDefault();openShortcuts();return; }
+            const control = hotkeys.get(key.length === 1 ? key.toLowerCase() : key);
+            if (!control?.getClientRects().length || (key === ' ' && target.closest('button,a'))) return;
+            event.preventDefault();control.click();
         });
         function rebuild(selected) {
             mediaScope?.dispose();mediaScope = createScope();viewer = null;
             for (const child of [...stage.children]) if (child !== failure) child.remove();
             failure.hidden = true;
-            const mediaLocal = mediaScope, key = session.state.key;
+            const mediaLocal = mediaScope, key = session.state.key, ViewerJs = window.Viewer;
+            // Transforms follow the Viewer.js this media was built with, which builds once the image has loaded.
+            withoutViewer = !ViewerJs;
             const current = () => !local.signal.aborted && !mediaLocal.signal.aborted && session.state.key === key;
-            let original;
-            try { original = adapter.originalDownload(selected); }
+            // An adapter's own media URL (a session-owned blob:) is used exactly, so a retry reuses it; a server
+            // original gets a fresh cache-buster on every build.
+            let original, src;
+            try { if (adapter.mediaUrl) src = adapter.mediaUrl(selected); else original = adapter.originalDownload(selected); }
             catch { session.failed(key);return; }
-            const url = new URL(original.url,window.location.href);
-            url.searchParams.set('_pm_viewer',`${Date.now()}-${++retryVersion}`);
+            if (adapter.mediaUrl) {
+                if (typeof src !== 'string' || !src) { session.failed(key);return; }
+            } else {
+                const url = new URL(original.url,window.location.href);
+                url.searchParams.set('_pm_viewer',`${Date.now()}-${++retryVersion}`);
+                src = url.href;
+            }
             const node = element(selected.is_video ? 'video' : 'img');
-            mediaLocal.listen(node,'error',() => {if (current()) session.failed(key);});
+            // #430: the page may find the file under a renumbered source (`onMediaError`).
+            mediaLocal.listen(node,'error',() => {if (current()) {session.failed(key);onMediaError?.(selected);}});
             if (selected.is_video) {
                 node.controls = true;node.playsInline = true;node.preload = 'metadata';
                 const preferences = readViewerPreferences();
@@ -133,19 +247,30 @@ export function createMediaViewer({container,parentScope,inspectionController,se
                 },{once:true});
             } else {
                 node.alt = selected.filename;node.decoding = 'async';
-                node.hidden = !!window.Viewer;
+                node.hidden = !!ViewerJs;
                 // With Viewer.js the src is released after the viewer (see release below).
-                if (!window.Viewer) {
+                if (!ViewerJs) {
                     mediaLocal.listen(node,'load',() => {if (current()) session.ready(key);});
                     mediaLocal.cleanup(() => node.removeAttribute('src'));
                 }
             }
-            node.src = url.href;stage.append(node);
-            if (!selected.is_video && window.Viewer) {
+            node.src = src;stage.append(node);
+            if (!selected.is_video && ViewerJs) {
+                // Viewer.js is built on an image that has loaded. Its own cancel removes its image listeners only
+                // while `image.complete` is false, so an image left with its load event still queued would build a
+                // viewer into the released image after destroy() (#293). Until then no viewer exists to cancel.
+                let mountedViewer = false;
+                mediaLocal.listen(node,'load',() => { if (current()) { mountedViewer = true;mountViewer(); } },{once:true});
+                mediaLocal.cleanup(() => { if (!mountedViewer) node.removeAttribute('src'); });
+            }
+            function mountViewer() {
                 let fitFrame = 0, fitWidth, fitHeight, viewSettled = false, released = false, fallback = 0;
                 const release = () => {
                     if (released) return;
-                    released = true;clearTimeout(fallback);instance.destroy();node.removeAttribute('src');
+                    released = true;clearTimeout(fallback);
+                    // Moving on empties the stage, and destroy() removes the built viewer from its parent.
+                    if (instance.viewer && !instance.viewer.parentNode) document.createElement('div').append(instance.viewer);
+                    instance.destroy();node.removeAttribute('src');
                 };
                 const scheduleFit = () => {
                     if (!current() || fitFrame) return;
@@ -157,7 +282,7 @@ export function createMediaViewer({container,parentScope,inspectionController,se
                         fitWidth = width;fitHeight = height;instance.resize();
                     });
                 };
-                const instance = new window.Viewer(node,{inline:true,toolbar:false,navbar:false,title:false,button:false,
+                const instance = new ViewerJs(node,{inline:true,toolbar:false,navbar:false,title:false,button:false,
                     keyboard:false,fullscreen:false,transition:false,viewed() {
                         viewSettled = true;
                         if (mediaLocal.signal.aborted) { release(); return; }
@@ -167,10 +292,12 @@ export function createMediaViewer({container,parentScope,inspectionController,se
                 const observer = new ResizeObserver(scheduleFit);observer.observe(stage);
                 viewer = instance;mediaLocal.cleanup(() => {
                     observer.disconnect();cancelAnimationFrame(fitFrame);
-                    // Inline Viewer.js keeps viewing a still-loading image after destroy(), and that view
-                    // rebuilds its list from images that still have a src; keep both until the view
-                    // settles, fails or times out.
-                    if (viewSettled) { release(); return; }
+                    // Before Viewer.js has built (its zero-delay build is pending), destroy() cancels that build;
+                    // deferring it would let the build run into the image the stage has just dropped.
+                    // Once built, inline Viewer.js keeps viewing a still-loading image after destroy(), and that
+                    // view rebuilds its list from images that still have a src; keep both until the view settles,
+                    // fails or times out.
+                    if (viewSettled || !instance.ready) { release(); return; }
                     node.addEventListener('error',release,{once:true});
                     fallback = setTimeout(release,PENDING_VIEW_DESTROY_MS);
                 });
@@ -179,7 +306,7 @@ export function createMediaViewer({container,parentScope,inspectionController,se
         }
         function updateControls(state) {
             const unavailable = inspectionState.refreshRequired ? inspectionState.message : state.phase === 'error' ? 'Media could not be loaded. Retry this file.' : entry.is_video ?
-                'Image transforms are unavailable for video.' : !viewer ?
+                'Image transforms are unavailable for video.' : withoutViewer ?
                 'Image transforms are unavailable because Viewer.js could not load.' : !state.mediaReady ? 'Image transforms are available when the image is ready.' : '';
             reason.textContent = unavailable;reason.hidden = !unavailable;
             for (const node of transforms) {
@@ -233,5 +360,5 @@ export function createMediaViewer({container,parentScope,inspectionController,se
             if (state.record?.identity.key === currentKey && state.record.library?.title) title.textContent = `${state.record.library.title} · ${entry.filename}`;
         }));
     }
-    return {open,dispose,stopSlideshow};
+    return {open,close,dispose,stopSlideshow};
 }

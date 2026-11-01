@@ -5,7 +5,9 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+from .library_folders import folder_condition, list_library_folders
 from .library_tokens import library_edit_token
+from .prompt_archive import ARCHIVED, SHELVED
 
 _ELIGIBLE = """(EXISTS(SELECT 1 FROM prompt_pairs ep WHERE ep.positive_prompt_id=p.id)
  OR EXISTS(SELECT 1 FROM generated_images eg WHERE eg.prompt_id=p.id)
@@ -105,6 +107,12 @@ ARCHIVE_SCOPES = {
 }
 
 
+# Shelves (#443): the parents on the shelf, or the archived ones.
+PARENT_SCOPES = {"active": SHELVED, "archived": ARCHIVED}
+# A positive pair owner that is on the shelf, as a condition on alias pp.
+SHELVED_PAIR = SHELVED.replace("p.id", "pp.positive_prompt_id")
+
+
 def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -121,7 +129,54 @@ def _archive(value: str) -> str:
     return ARCHIVE_SCOPES[value]
 
 
-def _filter(text: str, category: str | None, tags: list[str]) -> tuple[str, list]:
+# How the Tags filter matches (#444): every tag (AND), any of them (OR), or
+# parents without any tag.
+TAG_MODES = ("all", "any", "untagged")
+# A parent that no tag's Browse returns (#444 "Untagged prompts"): no tag of its
+# own and no active pair carrying one. The vocabulary's untagged count uses it too.
+UNTAGGED = (
+    "NOT EXISTS(SELECT 1 FROM prompt_tags ut WHERE ut.prompt_id=p.id) "
+    "AND NOT EXISTS(SELECT 1 FROM prompt_pairs up JOIN prompt_pair_tags upt "
+    "ON upt.pair_id=up.id WHERE up.positive_prompt_id=p.id AND up.archived=0)"
+)
+
+
+def _tag_mode(tag_mode: object, tags: list[str]) -> str:
+    if not isinstance(tag_mode, str) or tag_mode not in TAG_MODES:
+        raise ValueError("tag_mode must be one of " + ", ".join(TAG_MODES))
+    if tag_mode == "untagged" and tags:
+        raise ValueError("Untagged prompts cannot also filter by tags")
+    return tag_mode
+
+
+def _tag_conditions(tags: list[str], any_tag: bool) -> tuple[list, list, list]:
+    """Parent-arm and pair-arm tag conditions and the tags' parameters."""
+    parent_exists = (
+        "EXISTS(SELECT 1 FROM prompt_tags pt JOIN tags t ON t.id=pt.tag_id "
+        "WHERE pt.prompt_id=p.id AND t.name{test})"
+    )
+    pair_exists = (
+        "EXISTS(SELECT 1 FROM prompt_pair_tags pt JOIN tags t ON t.id=pt.tag_id "
+        "WHERE pt.pair_id=pp.id AND t.name{test})"
+    )
+    if any_tag and tags:
+        # One condition per arm: the card, or one active pair, carries any tag.
+        test = " IN (" + ",".join("?" for _ in tags) + ")"
+        return [parent_exists.format(test=test)], [pair_exists.format(test=test)], tags
+    return (
+        [parent_exists.format(test="=?") for _ in tags],
+        [pair_exists.format(test="=?") for _ in tags],
+        tags,
+    )
+
+
+def _filter(
+    text: str,
+    category: str | None,
+    tags: list[str],
+    tag_mode: str = "all",
+    folder_prefixes: list[str] | None = None,
+) -> tuple[str, list]:
     if not isinstance(text, str) or len(text) > 500:
         raise ValueError("Search text must be a string of at most 500 characters")
     if category is not None and (not isinstance(category, str) or len(category) > 200):
@@ -132,6 +187,8 @@ def _filter(text: str, category: str | None, tags: list[str]) -> tuple[str, list
         or any(not isinstance(tag, str) or not tag or len(tag) > 200 for tag in tags)
     ):
         raise ValueError("Invalid library tags")
+    mode = _tag_mode(tag_mode, tags)
+    untagged = mode == "untagged"
     parent, pair, parent_params, pair_params = [], ["pp.archived=0"], [], []
     if text:
         parent.append("(p.text LIKE ? ESCAPE '\\' OR ls.title LIKE ? ESCAPE '\\')")
@@ -146,17 +203,11 @@ def _filter(text: str, category: str | None, tags: list[str]) -> tuple[str, list
         pair.append("pp.category=?")
         parent_params.append(category)
         pair_params.append(category)
-    for tag in tags:
-        parent.append(
-            "EXISTS(SELECT 1 FROM prompt_tags pt JOIN tags t ON t.id=pt.tag_id "
-            "WHERE pt.prompt_id=p.id AND t.name=?)"
-        )
-        pair.append(
-            "EXISTS(SELECT 1 FROM prompt_pair_tags pt JOIN tags t ON t.id=pt.tag_id "
-            "WHERE pt.pair_id=pp.id AND t.name=?)"
-        )
-        parent_params.append(tag)
-        pair_params.append(tag)
+    parent_tags, pair_tags, tag_params = _tag_conditions(tags, mode == "any")
+    parent.extend(parent_tags)
+    pair.extend(pair_tags)
+    parent_params.extend(tag_params)
+    pair_params.extend(tag_params)
     condition = (
         "("
         + (" AND ".join(parent) or "1=1")
@@ -168,7 +219,17 @@ def _filter(text: str, category: str | None, tags: list[str]) -> tuple[str, list
         + " AND ".join(pair)
         + ")"
     )
-    return f"({_ELIGIBLE}) AND ({condition})", [*parent_params, *pair_params]
+    if untagged:
+        # A whole-card condition: inside the parent-or-pair OR an untagged pair
+        # would let a tagged parent through.
+        condition = f"({condition}) AND {UNTAGGED}"
+    params = [*parent_params, *pair_params]
+    if folder_prefixes:
+        # A whole-card condition around both arms: images link to the parent.
+        folder, folder_params = folder_condition(folder_prefixes)
+        condition = f"({condition}) AND {folder}"
+        params.extend(folder_params)
+    return f"({_ELIGIBLE}) AND ({condition})", params
 
 
 class LibraryOperations:
@@ -216,6 +277,8 @@ class LibraryOperations:
         rows = conn.execute(
             "SELECT p.id,p.text,ls.title,p.category,p.rating,p.notes,p.created_at,"
             "p.run_count,p.last_used_at,"
+            + ARCHIVED
+            + " AS archived,"
             + (f"{sort_expression} AS _sort," if sort_expression else "")
             + "(SELECT COUNT(*) FROM prompt_pairs v WHERE v.positive_prompt_id=p.id "
             "AND v.archived=0) AS variant_count,"
@@ -239,6 +302,7 @@ class LibraryOperations:
             # Usage is shown, never compared: the token hashes owner fields only.
             row["run_count"] = row["run_count"] if type(row["run_count"]) is int else 0
             row["last_used_at"] = utc_iso(row["last_used_at"])
+            row["archived"] = bool(row["archived"])
             row["edit_token"] = library_edit_token(epoch, row)
         return result
 
@@ -251,14 +315,21 @@ class LibraryOperations:
         text: str = "",
         category: str | None = None,
         tags: list[str] | None = None,
+        tag_mode: str = "all",
+        folder_prefixes: list[str] | None = None,
         sort: str = "newest",
         limit: int = 40,
         after: dict | None = None,
+        shelf: str = "active",
     ) -> dict:
         _limit(limit)
         if sort not in _ORDERS:
             raise ValueError("Unknown library sort order")
-        where, params = _filter(text, category, [] if tags is None else tags)
+        if not isinstance(shelf, str) or shelf not in PARENT_SCOPES:
+            raise ValueError("shelf must be active or archived")
+        where, params = _filter(
+            text, category, [] if tags is None else tags, tag_mode, folder_prefixes
+        )
         if after is not None:
             if (
                 not isinstance(after, dict)
@@ -270,15 +341,18 @@ class LibraryOperations:
             ceiling = after["ceiling"]
         where += " AND p.id<=?"
         params.append(ceiling)
-        # One SELECT counts the filtered parents and their active variants.
-        total, variant_total = conn.execute(
-            "SELECT COUNT(*),COALESCE(SUM((SELECT COUNT(*) FROM prompt_pairs v "
-            "WHERE v.positive_prompt_id=p.id AND v.archived=0)),0) FROM "
-            + _FROM
-            + " WHERE "
-            + where,
+        # One SELECT counts the filtered parents of this scope, their active
+        # variants, and the filtered archived parents (Show archived, #443).
+        scope = PARENT_SCOPES[shelf]
+        total, variant_total, archived_total = conn.execute(
+            f"SELECT COALESCE(SUM({scope}),0),"
+            f"COALESCE(SUM(CASE WHEN {scope} THEN (SELECT COUNT(*) "
+            "FROM prompt_pairs v WHERE v.positive_prompt_id=p.id "
+            "AND v.archived=0) ELSE 0 END),0),"
+            f"COALESCE(SUM({ARCHIVED}),0) FROM " + _FROM + " WHERE " + where,
             params,
         ).fetchone()
+        where += f" AND {scope}"
         expression, direction = _ORDERS[sort]
         if after is not None:
             operator = ">" if direction == "ASC" else "<"
@@ -311,6 +385,9 @@ class LibraryOperations:
             "items": rows,
             "total": total,
             "variant_total": variant_total,
+            "archived_total": archived_total,
+            # Echoed so a client can tell this read applied its tag match.
+            "tag_mode": tag_mode,
             "has_more": has_more,
             "next_key": next_key,
         }
@@ -321,9 +398,12 @@ class LibraryOperations:
         text: str = "",
         category: str | None = None,
         tags: list[str] | None = None,
+        tag_mode: str = "all",
+        folder_prefixes: list[str] | None = None,
         sort: str = "newest",
         limit: int = 40,
         after: dict | None = None,
+        shelf: str = "active",
     ) -> dict:
         with self.library_snapshot(include_ceiling=True) as (conn, epoch, ceiling):
             return self._list_library(
@@ -333,9 +413,12 @@ class LibraryOperations:
                 text=text,
                 category=category,
                 tags=tags,
+                tag_mode=tag_mode,
+                folder_prefixes=folder_prefixes,
                 sort=sort,
                 limit=limit,
                 after=after,
+                shelf=shelf,
             )
 
     def _is_library_positive(self, conn: sqlite3.Connection, positive_id: int) -> bool:
@@ -388,7 +471,7 @@ class LibraryOperations:
             for row in conn.execute(
                 "SELECT pp.id,COALESCE(n.text,'') AS negative_text,"
                 "pp.category,pp.title,pp.archived,"
-                "pp.negative_prompt_id IS NULL AS explicit_empty,"
+                "pp.negative_prompt_id IS NULL AS explicit_empty,pp.run_count,"
                 "(SELECT COUNT(DISTINCT image_id) FROM image_prompt_pairs ip "
                 "WHERE ip.pair_id=pp.id) AS image_count "
                 "FROM prompt_pairs pp "
@@ -404,6 +487,8 @@ class LibraryOperations:
             row["tags"] = []
             row["archived"] = bool(row["archived"])
             row["explicit_empty"] = bool(row["explicit_empty"])
+            # The history lane's "N runs" (#249): queue-hook pair uses, 0 when unset.
+            row["run_count"] = row["run_count"] if type(row["run_count"]) is int else 0
         if by_id:
             marks = ",".join("?" for _ in by_id)
             for row in conn.execute(
@@ -461,9 +546,13 @@ class LibraryOperations:
             "categories": [row["category"] for row in rows],
         }
 
-    def get_library_options(self) -> dict:
+    def get_library_options(self, folder_roots=None) -> dict:
+        """Categories; with *folder_roots* (root spellings) also ``folders``."""
         with self.library_snapshot() as (conn, epoch, _ceiling):
-            return self._get_library_options(conn, epoch)
+            result = self._get_library_options(conn, epoch)
+            if folder_roots is not None:
+                result["folders"] = list_library_folders(conn, folder_roots, _ELIGIBLE)
+            return result
 
     def get_library_previews(self, positive_ids: list[int]) -> dict[int, list[dict]]:
         """Read at most two links per parent in one bounded page query."""
@@ -574,7 +663,9 @@ class LibraryOperations:
             owners = {}
             order = []
             for row in conn.execute(
-                "SELECT p.id,p.text,ls.title,p.category,p.rating,p.notes FROM "
+                "SELECT p.id,p.text,ls.title,p.category,p.rating,p.notes,"
+                + ARCHIVED
+                + " AS archived FROM "
                 + _FROM
                 + " WHERE "
                 + _ELIGIBLE
@@ -587,6 +678,7 @@ class LibraryOperations:
                     "tags": [],
                     "rating": row["rating"],
                     "notes": row["notes"],
+                    "archived": bool(row["archived"]),
                     "variants": [],
                 }
                 order.append(row["id"])
@@ -626,3 +718,64 @@ class LibraryOperations:
                 "kind": "prompt-manager-library",
                 "positives": [owners[key] for key in order],
             }
+
+    def library_counts(self) -> dict:
+        """System › Overview counts from one snapshot, writing nothing.
+
+        ``positive_prompts`` and ``negative_variants`` are the unfiltered
+        Library's ``total`` and ``variant_total``: eligible parents on the
+        shelf (not archived, #443) and their active pairs (every pair's
+        positive is eligible). ``images`` counts indexed
+        ``generated_images`` rows, not files on disk. An image has no rating
+        of its own (it shows its linked prompt's), so ``rated_images`` counts
+        the indexed images whose linked prompt is rated. ``review_pending`` is
+        the Needs review queue's pending total.
+        """
+        with self.library_snapshot() as (conn, _epoch, _ceiling):
+            row = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM prompts p WHERE "
+                + _ELIGIBLE
+                + " AND "
+                + SHELVED
+                + "),"
+                "(SELECT COUNT(*) FROM prompt_pairs pp WHERE pp.archived=0 AND "
+                + SHELVED_PAIR
+                + "),"
+                "(SELECT COUNT(*) FROM generated_images),"
+                "(SELECT COUNT(*) FROM generated_images gi JOIN prompts r "
+                "ON r.id=gi.prompt_id WHERE r.rating IS NOT NULL),"
+                "(SELECT COUNT(*) FROM media_review_items WHERE state='pending')"
+            ).fetchone()
+        return {
+            "positive_prompts": row[0],
+            "negative_variants": row[1],
+            "images": row[2],
+            "rated_images": row[3],
+            "review_pending": row[4],
+        }
+
+    def usage_by_category(self) -> list[dict]:
+        """Runs and average rating of the Library's parents, per category.
+
+        Only eligible parents count, so a negative-only prompt's runs (which
+        repeat its pairs' runs) are never added twice. A blank category groups
+        with no category as ``None``. Unrated parents are left out of the
+        average, which is ``None`` when no parent is rated. Most runs first.
+        """
+        with self.library_snapshot() as (conn, _epoch, _ceiling):
+            rows = conn.execute(
+                "SELECT * FROM (SELECT NULLIF(TRIM(p.category),'') AS category,"
+                "COALESCE(SUM(p.run_count),0) AS runs,AVG(p.rating) AS rating "
+                "FROM prompts p WHERE " + _ELIGIBLE + " GROUP BY 1) "
+                "ORDER BY runs DESC,category IS NULL,category"
+            ).fetchall()
+        return [
+            {
+                "category": row["category"],
+                "runs": row["runs"],
+                "average_rating": (
+                    None if row["rating"] is None else round(row["rating"], 2)
+                ),
+            }
+            for row in rows
+        ]

@@ -15,7 +15,7 @@
     "use strict";
 
     class ApiError extends Error {
-        constructor(status, message, code = null, recovery = null) {
+        constructor(status, message, code = null, recovery = null, current = null) {
             super(message);
             this.name = "ApiError";
             this.status = status;
@@ -31,6 +31,47 @@
                     recovery.limit >= 1 && recovery.limit <= 100) {
                     this.recovery = { action: "smaller-limit", limit: recovery.limit };
                 }
+            }
+            // A tag-conflict answer carries the image's current tag set; only a
+            // well-formed one is kept, copied, so the dialog can show it.
+            this.current = null;
+            if (current && Array.isArray(current.tags) && current.tags.length <= 100 &&
+                current.tags.every(tag => typeof tag === "string") &&
+                Number.isSafeInteger(current.tag_revision) && current.tag_revision >= 0) {
+                this.current = { tags: current.tags.slice(), tag_revision: current.tag_revision };
+            }
+            // A busy answer names the running job that holds the slot; an
+            // invalid-source answer names the source it refused. Only
+            // well-formed values are kept.
+            this.running = null;
+            const running = current && current.running;
+            if (this.code === "busy" && running && typeof running.id === "string" &&
+                /^[A-Za-z0-9_-]{1,64}$/.test(running.id) && typeof running.title === "string" &&
+                running.title.length > 0 && running.title.length <= 200) {
+                this.running = { id: running.id, title: running.title };
+            }
+            // Whether our server itself refused: its body parsed and says success:false. A proxy's error page or an
+            // unreadable body is not a refusal (the request may have done its work; System S7 review I1).
+            this.refused = Boolean(current && typeof current === "object" && !Array.isArray(current) &&
+                current.success === false);
+            // A used plan names the job that applied it (System S7); its title is null once that job was pruned.
+            this.job = null;
+            const job = current && current.job;
+            if (this.code === "plan-used" && job && typeof job.id === "string" &&
+                /^[A-Za-z0-9_-]{1,64}$/.test(job.id) && (job.title === null ||
+                (typeof job.title === "string" && job.title.length > 0 && job.title.length <= 200))) {
+                this.job = { id: job.id, title: job.title };
+            }
+            this.source = null;
+            if (this.code === "invalid-source" && current && typeof current.source === "string" &&
+                current.source.length > 0 && current.source.length <= 4096) {
+                this.source = current.source;
+            }
+            // A model-busy answer names the operation that holds the tagging model (#328).
+            this.operation = null;
+            if (this.code === "model-busy" && current && typeof current.operation === "string" &&
+                current.operation.length > 0 && current.operation.length <= 200) {
+                this.operation = current.operation;
             }
         }
     }
@@ -56,9 +97,11 @@
     function createApiClient(fetchImpl) {
         const doFetch = fetchImpl || ((...args) => globalThis.fetch(...args));
 
-        async function request(method, url, { body, signal, cache } = {}) {
+        async function request(method, url, { body, signal, cache, keepalive } = {}) {
             const init = { method, headers: {} };
             if (cache !== undefined) init.cache = cache;
+            // keepalive lets a write or a release finish while its page unloads (pagehide).
+            if (keepalive) init.keepalive = true;
             if (body !== undefined) {
                 init.headers["Content-Type"] = "application/json";
                 init.body = JSON.stringify(body);
@@ -76,11 +119,11 @@
 
             const serverMessage = data && typeof data === "object" ? data.error || data.message : undefined;
             if (!response.ok) {
-                throw new ApiError(response.status, serverMessage || response.statusText || `HTTP ${response.status}`, data?.code, data?.recovery);
+                throw new ApiError(response.status, serverMessage || response.statusText || `HTTP ${response.status}`, data?.code, data?.recovery, data);
             }
             if (!parsed) throw new ApiError(response.status, "Invalid JSON response");
             if (data && typeof data === "object" && data.success === false) {
-                throw new ApiError(response.status, serverMessage || "Request failed", data.code, data.recovery);
+                throw new ApiError(response.status, serverMessage || "Request failed", data.code, data.recovery, data);
             }
             return data;
         }
@@ -88,29 +131,37 @@
         return {
             // cache is a fetch RequestCache mode such as "no-store"; omitted keeps the default.
             get: (url, { signal, cache } = {}) => request("GET", url, { signal, cache }),
-            post: (url, body, { signal } = {}) => request("POST", url, { body, signal }),
-            put: (url, body, { signal } = {}) => request("PUT", url, { body, signal }),
+            post: (url, body, { signal, keepalive } = {}) => request("POST", url, { body, signal, keepalive }),
+            put: (url, body, { signal, keepalive } = {}) => request("PUT", url, { body, signal, keepalive }),
             patch: (url, body, { signal } = {}) => request("PATCH", url, { body, signal }),
             // A DELETE body is optional; the favorites store names its file in one.
-            del: (url, { signal, body } = {}) => request("DELETE", url, { body, signal }),
+            del: (url, { signal, body, keepalive } = {}) => request("DELETE", url, { body, signal, keepalive }),
         };
     }
 
     /**
+     * @param {{lifetime?: AbortSignal}} [options] - `lifetime` ends with the page (its pagehide):
+     *   then no call starts a request, the one in flight is aborted, and both resolve to STALE.
+     *   WebKit fails a fetch that a leaving page starts and logs it as a page error.
      * @returns {(run: (signal: AbortSignal) => Promise<*>) => Promise<*>} wrapper that
      *   aborts the previous call's signal and resolves superseded calls to STALE
      */
-    function latestOnly() {
+    function latestOnly({ lifetime } = {}) {
         let current = null;
+        lifetime?.addEventListener("abort", () => current?.abort(), { once: true });
         return async function (run) {
             if (current) current.abort();
+            if (lifetime?.aborted) {
+                current = null;
+                return STALE;
+            }
             const controller = new AbortController();
             current = controller;
             try {
                 const result = await run(controller.signal);
-                return controller === current ? result : STALE;
+                return controller === current && !lifetime?.aborted ? result : STALE;
             } catch (error) {
-                if (controller !== current) return STALE;
+                if (controller !== current || lifetime?.aborted) return STALE;
                 throw error;
             }
         };

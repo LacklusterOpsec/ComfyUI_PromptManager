@@ -7,6 +7,8 @@ Refactored from standalone_tagger.py for integration with PromptManager API.
 
 import errno
 import gc
+import importlib.util
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -15,6 +17,80 @@ from PIL import Image
 
 # A loader takes (model_type, use_gpu) and returns ("gguf" | "wd14" | "hf", backend)
 ModelLoader = Callable[[str, bool], Tuple[str, Any]]
+
+# Suggestions keep only names a Save accepts (the vocabulary tag rules), and
+# never more than one image tag set holds.
+try:
+    from ..database.annotations import MAX_IMAGE_TAGS
+    from ..database.vocabulary import validate_vocabulary_tag_name
+except ImportError:
+    from database.annotations import MAX_IMAGE_TAGS
+    from database.vocabulary import validate_vocabulary_tag_name
+
+# The tag template and thresholds live with the saved tagging defaults
+# (#328), so config.py never imports PIL.
+try:
+    from .tagging_defaults import DEFAULT_TAG_TEMPLATE, read_wd14_label_rows
+except ImportError:
+    from py.tagging_defaults import DEFAULT_TAG_TEMPLATE, read_wd14_label_rows
+
+try:
+    from ..utils import exit_signal
+except ImportError:
+    from utils import exit_signal
+
+
+def abort_hub_downloads() -> None:
+    """Abort huggingface_hub's Xet transfers (run by the exit hook, #376).
+
+    Xet downloads report progress from native code, which ignores an
+    exception raised in ``tqdm.update``; huggingface_hub aborts them itself
+    on Ctrl+C with ``abort_xet_session``. Nothing happens when
+    huggingface_hub was never imported or has no Xet support.
+    """
+    if "huggingface_hub" not in sys.modules:
+        return
+    try:
+        from huggingface_hub.utils import _xet
+    except ImportError:
+        return
+    abort = getattr(_xet, "abort_xet_session", None)
+    if callable(abort):
+        abort()
+
+
+def _stop_at_exit(download) -> Dict[str, Any]:
+    """Keyword arguments that stop a huggingface_hub download at its next
+    chunk once the interpreter is exiting (#376), or none when this
+    huggingface_hub does not take ``tqdm_class``.
+
+    huggingface_hub 1.x removes its partial temp file on any failure; older
+    versions keep their resumable ``.incomplete`` file. The model's own path
+    is only written by the final rename either way.
+    """
+    try:
+        if "tqdm_class" not in inspect.signature(download).parameters:
+            return {}
+        from huggingface_hub.utils import tqdm as hub_tqdm
+    except (ImportError, TypeError, ValueError):
+        return {}
+
+    class StopAtExit(hub_tqdm):
+        def update(self, n=1):
+            exit_signal.checkpoint()
+            return super().update(n)
+
+    return {"tqdm_class": StopAtExit}
+
+
+def _autotag_config():
+    """The saved defaults; imported late, as config needs ComfyUI's server."""
+    try:
+        from .config import AutotagConfig
+    except ImportError:
+        from py.config import AutotagConfig
+    return AutotagConfig
+
 
 # Try to import logging from utils, fallback to standard logging
 try:
@@ -36,10 +112,12 @@ except ImportError:
         return logger
 
 
-# Model configurations - same as standalone_tagger.py
+# Model configurations - same as standalone_tagger.py. ``label`` is the short
+# name System, Activity and a 409 model-busy show (#328).
 MODELS = {
     "gguf": {
         "name": "GGUF (Recommended)",
+        "label": "GGUF JoyCaption",
         "description": "Quantized model, ~4.5GB, faster loading",
         "size": "~4.5GB",
         "repo": "mradermacher/llama-joycaption-beta-one-hf-llava-GGUF",
@@ -50,6 +128,7 @@ MODELS = {
     },
     "hf": {
         "name": "HuggingFace",
+        "label": "HuggingFace JoyCaption",
         "description": "Full precision model, ~16GB, higher quality",
         "size": "~16GB",
         "repo": "fancyfeast/llama-joycaption-beta-one-hf-llava",
@@ -57,6 +136,7 @@ MODELS = {
     },
     "wd14-swinv2": {
         "name": "WD14 SwinV2",
+        "label": "WD14 SwinV2",
         "description": "Fast classifier tagger, ~400MB, no prompt needed",
         "size": "~400MB",
         "repo": "SmilingWolf/wd-swinv2-tagger-v3",
@@ -66,6 +146,7 @@ MODELS = {
     },
     "wd14-vit": {
         "name": "WD14 ViT",
+        "label": "WD14 ViT",
         "description": "Fast classifier tagger, ~400MB, ViT architecture",
         "size": "~400MB",
         "repo": "SmilingWolf/wd-vit-tagger-v3",
@@ -75,23 +156,118 @@ MODELS = {
     },
 }
 
+# The Python modules each backend imports when it loads, with their pip names
+# (#424). None of them is a PromptManager requirement: they are optional, and
+# llama-cpp-python needs a build for the user's GPU. Nothing is ever installed.
+BACKEND_PACKAGES: Dict[str, Tuple[Tuple[str, str], ...]] = {
+    "gguf": (("llama_cpp", "llama-cpp-python"),),
+    # The default 8-bit load needs bitsandbytes, and device_map needs accelerate.
+    "hf": (
+        ("torch", "torch"),
+        ("transformers", "transformers"),
+        ("accelerate", "accelerate"),
+        ("bitsandbytes", "bitsandbytes"),
+    ),
+    "wd14-swinv2": (("onnxruntime", "onnxruntime"),),
+    "wd14-vit": (("onnxruntime", "onnxruntime"),),
+}
+_INSTALL_NOTES = {
+    "gguf": (
+        'For a CUDA build: CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python'
+    ),
+    "wd14-swinv2": "Use onnxruntime-gpu for CUDA.",
+    "wd14-vit": "Use onnxruntime-gpu for CUDA.",
+}
+_PIP_NAMES = {
+    module: pip for packages in BACKEND_PACKAGES.values() for module, pip in packages
+}
+
+
+def _importable(module: str) -> bool:
+    """Whether *module* (a top-level name) can be imported; imports nothing."""
+    if sys.modules.get(module) is not None:
+        return True
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError, OSError):
+        return False
+
+
+def missing_packages(model_type: str) -> List[str]:
+    """The pip names of the packages *model_type* needs and cannot import."""
+    return [
+        pip
+        for module, pip in BACKEND_PACKAGES.get(model_type, ())
+        if not _importable(module)
+    ]
+
+
+def package_fields(model_type: str, missing: List[str]) -> Dict[str, Any]:
+    """The status fields of *missing*: pip names, install command and note."""
+    missing = list(missing)
+    return {
+        "missing_packages": missing,
+        "install_command": "pip install " + " ".join(missing) if missing else None,
+        "install_note": _INSTALL_NOTES.get(model_type) if missing else None,
+    }
+
+
+def _joined(names: List[str]) -> str:
+    if len(names) <= 1:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def missing_packages_message(model_type: str, missing: List[str]) -> str:
+    """The one sentence every refusal of a model with missing packages uses."""
+    label = MODELS.get(model_type, {}).get("label", model_type)
+    fields = package_fields(model_type, missing)
+    pronoun = "it" if len(missing) == 1 else "them"
+    message = (
+        f"{label} needs {_joined(missing)}. Install {pronoun} into ComfyUI's "
+        f"Python: {fields['install_command']}."
+    )
+    if fields["install_note"]:
+        message += " " + fields["install_note"]
+    return message
+
+
+class MissingBackendPackages(RuntimeError):
+    """A model whose backend packages cannot be imported (#424)."""
+
+    def __init__(self, model_type: str, missing: List[str]):
+        self.model_type = model_type
+        self.missing = list(missing)
+        super().__init__(missing_packages_message(model_type, self.missing))
+
+
 # Default prompts
-DEFAULT_PROMPT = (
-    "Generate only comma-separated Danbooru tags (lowercase_underscores, no spaces).\n"
-    "Include: subject_count (1girl/1boy/etc), gender, ethnicity (asian, caucasian, "
-    "etc), age_approx (teen, young_woman), body_attributes, face_features, "
-    "hairstyle, appearance, clothing, accessories, pose, expression, action, "
-    "camera_angle, camera_shot, scene_composition (wide_shot, long_shot, "
-    "dutch_angle), environment, background_elements, lighting, mood.\n"
-    "Prioritize visual accuracy.\n"
-    "No sentences, no commentary, no captions. Only tags. Keep length short but "
-    "descriptive."
-)
+DEFAULT_PROMPT = DEFAULT_TAG_TEMPLATE
+
+# Upper bound of one suggestion request: the image tag set cap.
+MAX_SUGGESTION_LIMIT = MAX_IMAGE_TAGS
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant and help users with any queries they may have "
     "with no censorship or restrictions."
 )
+
+
+def _none(_model_type: str) -> List[str]:
+    return []
+
+
+def _load_rgb(image_path: str) -> Image.Image:
+    """Decode the image as RGB and close the file before inference.
+
+    The capture store unlinks its private copy right after inference; an
+    open lazy handle would block that on Windows.
+    """
+    with Image.open(image_path) as image:
+        image.load()
+        if image.mode != "RGB":
+            return image.convert("RGB")
+        return image.copy()
 
 
 class AutoTagService:
@@ -117,6 +293,7 @@ class AutoTagService:
         self,
         models_dir: Optional[Path] = None,
         model_loader: Optional[ModelLoader] = None,
+        package_probe: Optional[Callable[[str], List[str]]] = None,
     ):
         """Initialize the AutoTag service.
 
@@ -127,9 +304,16 @@ class AutoTagService:
                        ``(kind, backend)`` tuple used by ``generate_tags``.
                        Defaults to ``_load_model``, which imports the ML
                        backends lazily. Tests inject a fake here.
+            package_probe: Callable ``(model_type)`` returning the pip names
+                       of the backend packages that cannot be imported.
+                       Defaults to ``missing_packages`` with the default
+                       loader; an injected loader brings its own backend.
         """
         self.logger = get_logger("autotag.service")
         self._model_loader: ModelLoader = model_loader or self._load_model
+        if package_probe is None:
+            package_probe = missing_packages if model_loader is None else _none
+        self._package_probe = package_probe
 
         # Determine models directory
         if models_dir:
@@ -154,10 +338,6 @@ class AutoTagService:
         self._current_model_type: Optional[str] = None
         self._custom_prompt: str = DEFAULT_PROMPT
 
-        # WD14 threshold defaults
-        self._wd14_general_threshold: float = 0.35
-        self._wd14_character_threshold: float = 0.85
-
     @property
     def models_config(self) -> Dict[str, Dict[str, Any]]:
         """Get the models configuration dictionary."""
@@ -180,19 +360,13 @@ class AutoTagService:
 
     @property
     def wd14_general_threshold(self) -> float:
-        return self._wd14_general_threshold
-
-    @wd14_general_threshold.setter
-    def wd14_general_threshold(self, value: float):
-        self._wd14_general_threshold = max(0.0, min(1.0, value))
+        """The saved General-tag confidence (``autotag.defaults``)."""
+        return _autotag_config().GENERAL_THRESHOLD
 
     @property
     def wd14_character_threshold(self) -> float:
-        return self._wd14_character_threshold
-
-    @wd14_character_threshold.setter
-    def wd14_character_threshold(self, value: float):
-        self._wd14_character_threshold = max(0.0, min(1.0, value))
+        """The saved Character-tag confidence (``autotag.defaults``)."""
+        return _autotag_config().CHARACTER_THRESHOLD
 
     def get_models_status(self) -> Dict[str, Dict[str, Any]]:
         """Get availability status for all model types.
@@ -244,6 +418,9 @@ class AutoTagService:
                     # Get the actual path (local or cache)
                     model_status["model_path"] = str(self._get_hf_model_path())
 
+            model_status.update(
+                package_fields(model_type, self._package_probe(model_type))
+            )
             status[model_type] = model_status
 
         return status
@@ -370,6 +547,7 @@ class AutoTagService:
                     filename=filename,
                     local_dir=str(model_dir),
                     local_dir_use_symlinks=False,
+                    **_stop_at_exit(hf_hub_download),
                 )
 
         if progress_callback:
@@ -378,14 +556,9 @@ class AutoTagService:
 
     def _load_wd14_tagger(self, model_type: str, use_gpu: bool = True):
         """Load WD14 ONNX model and tag list."""
-        try:
-            import onnxruntime as ort
-        except ImportError:
-            raise RuntimeError(
-                "onnxruntime is required for WD14 models. "
-                "Install with: pip install onnxruntime (or onnxruntime-gpu for CUDA)"
-            )
-        import csv
+        # A missing onnxruntime is refused by load_model before this runs
+        # (#424); a ModuleNotFoundError here becomes the same refusal.
+        import onnxruntime as ort
 
         config = MODELS[model_type]
         model_dir = self.models_dir / config["subdir"]
@@ -402,12 +575,8 @@ class AutoTagService:
 
         session = ort.InferenceSession(str(model_path), providers=providers)
 
-        # Read tag list from CSV
-        tags_list = []
-        with open(tags_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                tags_list.append(row)
+        # Read tag list from CSV (the reader the Skipped tags preview shares)
+        tags_list = read_wd14_label_rows(tags_path)
 
         self.logger.info(
             f"WD14 model loaded ({len(tags_list)} tags, "
@@ -422,8 +591,8 @@ class AutoTagService:
         image: Image.Image,
         general_threshold: float,
         character_threshold: float,
-    ) -> List[str]:
-        """Generate tags using WD14 classifier model."""
+    ) -> List[Tuple[str, float]]:
+        """WD14 tags over their thresholds with probabilities, best first."""
         import numpy as np
 
         # Get model input dimensions
@@ -470,7 +639,7 @@ class AutoTagService:
 
         # Sort by confidence descending
         result_tags.sort(key=lambda x: x[1], reverse=True)
-        return [tag for tag, _ in result_tags]
+        return result_tags
 
     def download_model(
         self,
@@ -514,6 +683,13 @@ class AutoTagService:
             else:
                 return self._download_hf_model(progress_callback)
         except Exception as e:
+            if exit_signal.requested():
+                # ExitRequested between chunks, or the Xet session aborted
+                # by the exit hook (abort_hub_downloads).
+                self.logger.info(
+                    f"Model download stopped: ComfyUI is exiting ({model_type})"
+                )
+                return False
             self.logger.error(f"Download failed: {e}")
             if progress_callback:
                 progress_callback(f"Error: {str(e)}", 0)
@@ -543,6 +719,7 @@ class AutoTagService:
                 filename=config["filename"],
                 local_dir=str(gguf_dir),
                 local_dir_use_symlinks=False,
+                **_stop_at_exit(hf_hub_download),
             )
             self.logger.info("GGUF model downloaded")
 
@@ -560,6 +737,7 @@ class AutoTagService:
                 filename=config["mmproj_filename"],
                 local_dir=str(gguf_dir),
                 local_dir_use_symlinks=False,
+                **_stop_at_exit(hf_hub_download),
             )
             self.logger.info("mmproj downloaded")
 
@@ -586,6 +764,7 @@ class AutoTagService:
                 repo_id=config["repo"],
                 local_dir=str(model_dir),
                 local_dir_use_symlinks=False,
+                **_stop_at_exit(snapshot_download),
             )
             self.logger.info("HF model downloaded")
 
@@ -607,6 +786,7 @@ class AutoTagService:
         Raises:
             ValueError: If model_type is invalid
             RuntimeError: If model not downloaded or loading fails
+            MissingBackendPackages: If its backend packages cannot be imported
         """
         if model_type not in MODELS:
             raise ValueError(f"Invalid model type: {model_type}")
@@ -618,6 +798,11 @@ class AutoTagService:
         status = self.get_models_status()
         if not status[model_type]["downloaded"]:
             raise RuntimeError(f"Model {model_type} not downloaded")
+        missing = status[model_type].get("missing_packages") or []
+        if missing:
+            refusal = MissingBackendPackages(model_type, missing)
+            self.logger.warning(str(refusal))
+            raise refusal
 
         try:
             self._tagger = self._model_loader(model_type, use_gpu)
@@ -625,6 +810,17 @@ class AutoTagService:
             self.logger.info(f"Model {model_type} loaded successfully")
             return True
 
+        except ModuleNotFoundError as e:
+            # A package find_spec found but that does not import (a broken
+            # install), or a dependency of one: the same refusal, no traceback.
+            self._tagger = None
+            self._current_model_type = None
+            module = (e.name or "").split(".")[0] or str(e)
+            refusal = MissingBackendPackages(
+                model_type, [_PIP_NAMES.get(module, module)]
+            )
+            self.logger.warning(str(refusal))
+            raise refusal from None
         except Exception as e:
             self.logger.error(f"Failed to load model {model_type}: {e}")
             self._tagger = None
@@ -729,6 +925,24 @@ class AutoTagService:
 
             self.logger.info("Model unloaded, memory freed")
 
+    def wd14_device(self) -> str:
+        """``"gpu"`` when WD14 runs (or would run) on CUDA, else ``"cpu"``.
+
+        A loaded WD14 session answers from its own first provider; otherwise
+        ONNX Runtime's available providers say whether CUDA would be offered
+        (a session can still fall back to the processor). Loads no model.
+        """
+        tagger = self._tagger
+        if tagger is not None and tagger[0] == "wd14":
+            providers = tagger[1][0].get_providers()
+            return "gpu" if providers[:1] == ["CUDAExecutionProvider"] else "cpu"
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            return "cpu"
+        available = ort.get_available_providers()
+        return "gpu" if "CUDAExecutionProvider" in available else "cpu"
+
     def is_model_loaded(self) -> bool:
         """Check if a model is currently loaded."""
         return self._tagger is not None
@@ -760,6 +974,66 @@ class AutoTagService:
             RuntimeError: If no model is loaded
             FileNotFoundError: If image doesn't exist
         """
+        scored = self._scored_tags(
+            image_path, prompt, general_threshold, character_threshold
+        )
+        return [name for name, _ in scored]
+
+    def generate_tag_suggestions(
+        self,
+        image_path: str,
+        *,
+        limit: int,
+        prompt: Optional[str] = None,
+        general_threshold: Optional[float] = None,
+        character_threshold: Optional[float] = None,
+        skip: Any = None,
+    ) -> List[Tuple[str, Optional[float]]]:
+        """The top ``limit`` suggestions as ``(name, confidence)`` pairs.
+
+        WD14 pairs carry the real probability, best first; language models
+        (GGUF, HF) have no score, so their tags keep the output order with
+        ``None``. Names are distinct case-insensitively (first one wins).
+        A name Save would reject (over 50 characters, a control character
+        such as a newline, a comma) is skipped before the dedupe and the
+        ``limit`` count. A name ``skip`` matches (a ``SkipMatcher``, the
+        Skipped tags compiled for this request or job, #431) is dropped next,
+        so it uses up no slot. ``prompt`` is used for this call only;
+        ``custom_prompt`` is never changed.
+        """
+        if type(limit) is not int or not 1 <= limit <= MAX_SUGGESTION_LIMIT:
+            raise ValueError(
+                f"limit must be an integer from 1 to {MAX_SUGGESTION_LIMIT}"
+            )
+        scored = self._scored_tags(
+            image_path, prompt, general_threshold, character_threshold
+        )
+        suggestions: List[Tuple[str, Optional[float]]] = []
+        seen = set()
+        for raw, score in scored:
+            try:
+                name = validate_vocabulary_tag_name(raw)
+            except ValueError:
+                continue
+            if skip is not None and skip.matches(name):
+                continue
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            suggestions.append((name, score))
+            if len(suggestions) == limit:
+                break
+        return suggestions
+
+    def _scored_tags(
+        self,
+        image_path: str,
+        prompt: Optional[str],
+        general_threshold: Optional[float],
+        character_threshold: Optional[float],
+    ) -> List[Tuple[str, Optional[float]]]:
+        """Run the loaded model: WD14 ``(name, probability)``, LLM ``(name, None)``."""
         if self._tagger is None:
             raise RuntimeError("No model loaded. Call load_model() first.")
 
@@ -767,29 +1041,25 @@ class AutoTagService:
             raise FileNotFoundError(errno.ENOENT, "Image not found", str(image_path))
 
         use_prompt = prompt or self._custom_prompt
-
-        # Load image
-        image = Image.open(image_path)
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+        image = _load_rgb(image_path)
 
         # Generate based on model type
         model_type, tagger_obj = self._tagger
 
         if model_type == "gguf":
             raw_tags = self._generate_gguf(tagger_obj, image, use_prompt)
-            return self._parse_tags(raw_tags)
+            return [(tag, None) for tag in self._parse_tags(raw_tags)]
         elif model_type == "wd14":
             session, tags_list = tagger_obj
             gen_thresh = (
                 general_threshold
                 if general_threshold is not None
-                else self._wd14_general_threshold
+                else _autotag_config().GENERAL_THRESHOLD
             )
             char_thresh = (
                 character_threshold
                 if character_threshold is not None
-                else self._wd14_character_threshold
+                else _autotag_config().CHARACTER_THRESHOLD
             )
             return self._generate_wd14(
                 session, tags_list, image, gen_thresh, char_thresh
@@ -799,7 +1069,7 @@ class AutoTagService:
             raw_tags = self._generate_hf(
                 model, processor, device, compute_dtype, image, use_prompt
             )
-            return self._parse_tags(raw_tags)
+            return [(tag, None) for tag in self._parse_tags(raw_tags)]
 
     def _generate_gguf(self, model, image: Image.Image, prompt: str) -> str:
         """Generate tags using GGUF model."""

@@ -104,11 +104,14 @@ class ImageFavoriteOperations:
         """Mark one file as a favorite; repeating it is a no-op. Returns True."""
         from .models import utc_now_iso  # models imports this module's schema
 
+        from .image_removal_schema import clear_marks_of_keys
+
         with self.model.get_connection() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO image_favorites VALUES (?, ?, ?)",
                 (root_key, relative_path, utc_now_iso()),
             )
+            clear_marks_of_keys(conn, [(root_key, relative_path)])  # #480
         return True
 
     def clear_image_favorite(self, root_key: str, relative_path: str) -> bool:
@@ -137,3 +140,16 @@ class ImageFavoriteOperations:
             )
             found.update(path for (path,) in rows)
         return found
+
+    def get_root_favorites(self, root_key: str) -> set[str]:
+        """Every relative key favorited under *root_key* (a primary-key range).
+
+        The Favorites listing (``favorites=1``) intersects these with the
+        root's scan, so its size follows the root's favorites, not its files.
+        """
+        conn = self.model.get_connection()
+        rows = conn.execute(
+            "SELECT relative_path FROM image_favorites WHERE root_key=?",
+            (root_key,),
+        )
+        return {path for (path,) in rows}

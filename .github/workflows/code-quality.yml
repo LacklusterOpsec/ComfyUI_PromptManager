@@ -4,6 +4,7 @@ permissions:
   contents: read
 
 on:
+  merge_group:
   push:
     branches: [main]
   pull_request:
@@ -19,14 +20,17 @@ jobs:
   security:
     name: bandit (high severity)
     runs-on: ubuntu-latest
+    # ceil(1.5 x slowest of three green main runs) + 3, never under 5 (test.yml): runs 40257217665,
+    # 40254137380, 40240706583 took 23s / 16s / 23s -> 5 min.
+    timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.12
         uses: actions/setup-python@v7
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
       - name: Install bandit
         run: pip install bandit[toml]

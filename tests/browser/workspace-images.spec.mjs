@@ -1,20 +1,25 @@
 import { startCoverage, saveCoverage } from '../../tools/vendor/browser-coverage.mjs';
-import { test, expect } from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
-import { seedConcept, openConcept, openProduction } from './concept-inventory.mjs';
+import { test, expect } from './fixtures.mjs';
+import { seedConcept, openConcept, openProduction, startInGrid } from './concept-inventory.mjs';
 
 const workspace = '/prompt_manager/workspace#/images';
 const cards = page => page.locator('article[data-image-key]');
 // Grid pages only: the sidebar's Images count is its own `limit=1` read of the same listing.
 const imagePages = url => url.pathname === '/prompt_manager/images/output' && url.search !== '' && url.searchParams.get('limit') !== '1';
-const details = page => page.getByRole('region', { name: 'Image details', exact: true });
+const details = page => page.getByRole('complementary', { name: 'Selected image details', exact: true });
+// The concept panel names no source (D20); its cover is the selected file's own rooted URL, root 0 output, 1 input.
+const SOURCE_ROOTS = { output: 0, input: 1 };
+const expectPanelSource = (page, source) => expect(details(page).locator('img.detail-cover')).toHaveAttribute('src', new RegExp(`[?&]root=${SOURCE_ROOTS[source]}(&|$)`));
 // The concept toolbar, filter row and caption (#249 C2); Source, Folder, Media and Tags live in "Refine this view".
 const search = page => page.getByRole('searchbox', { name: 'Search workspace', exact: true });
 const sortBy = page => page.getByRole('combobox', { name: 'Sort results', exact: true });
 const caption = page => page.locator('.section-caption');
 const refineDialog = page => page.getByRole('dialog', { name: 'Refine this view', exact: true });
 const importDialog = page => page.getByRole('dialog', { name: 'Import & inspect', exact: true });
+// D44: the Filters button reads "Filters · N" while N Refine filters are active.
+const filtersButton = page => page.locator('#workspace-main search.toolbar').getByRole('button', { name: /^Filters(?: · \d+)?$/ });
 async function refine(page, values) {
-    await page.getByRole('button', { name: 'Filters', exact: true }).click();
+    await filtersButton(page).click();
     const dialog = refineDialog(page);
     for (const [label, value] of Object.entries(values)) {
         const control = dialog.getByLabel(label, { exact: true });
@@ -57,16 +62,15 @@ test('native Images keeps colliding filenames distinct and inspects the selected
     expect(new Set(originals).size).toBe(2);
     await cards(page).nth(1).getByRole('button', { name: 'Inspect same.png', exact: true }).click();
     await expect(details(page)).toContainText('same.png');
-    await expect(details(page)).toContainText('shared/same.png');
-    await expect(details(page)).toContainText(/input/i);
+    await expectPanelSource(page, 'input');
     await capture('after-images-source-collision-input-1600');
     await cards(page).first().getByRole('button', { name: 'Inspect same.png', exact: true }).click();
-    await expect(details(page)).toContainText(/output/i);
+    await expectPanelSource(page, 'output');
     await capture('after-images-source-collision-output-1600');
     await page.setViewportSize({width:390,height:844});
     for (const [index,source] of [[1,'input'],[0,'output']]) {
         await cards(page).nth(index).getByRole('button',{name:'Inspect same.png',exact:true}).click();
-        await expect(details(page)).toContainText(new RegExp(source,'i'));
+        await expectPanelSource(page, source);
         await details(page).scrollIntoViewIfNeeded();
         await capture(`after-images-source-collision-${source}-390`);
     }
@@ -92,17 +96,16 @@ test('image selection is shown on the selected card', async ({ page }) => {
     await expect(cards(page).locator('.image-card-actions [aria-pressed]')).toHaveCount(0);
 });
 
-test('closing details preview restores its trigger focus', async ({ page }) => {
+test('the side panel cover is the concept plain image, never a preview control', async ({ page }) => {
     await page.goto(workspace);
     await expect(cards(page)).toHaveCount(2);
-    const selected = cards(page).last().getByRole('button', { name: 'Inspect same.png', exact: true });
-    await selected.click();
-    const preview = details(page).getByRole('button', { name: 'Open full preview', exact: true });
-    await preview.click();
-    await expect(page.locator('dialog[open] .viewer-canvas img')).toBeVisible();
-    await page.keyboard.press('Escape');
+    await cards(page).last().getByRole('button', { name: 'Inspect same.png', exact: true }).click();
+    await expectPanelSource(page, 'input');
+    // D19/D20: the card image opens the viewer; the panel cover is decoration (`alt=""`) and not focusable.
+    await expect(details(page).getByRole('button', { name: 'Open full preview', exact: true })).toHaveCount(0);
+    await expect(details(page).locator('img.detail-cover')).toHaveAttribute('alt', '');
+    await details(page).locator('img.detail-cover').click();
     await expect(page.locator('dialog[open]')).toHaveCount(0);
-    await expect(preview).toBeFocused();
 });
 
 test('a short visible batch automatically continues until the sentinel is filled or exhausted', async ({ page, request }) => {
@@ -171,7 +174,9 @@ for (const embedded of [false, true]) {
             if (close !== 'parent abort') {
                 await expect(preview).toBeFocused();
                 await expect.poll(() => page.evaluate(() => window.continuationFixture.reads)).toEqual([null, 'next-0', 'next-1']);
-                await expect(caption(page)).toContainText(embedded ? '80 loaded' : '80 of 80');
+                // An embedded collection has no caption (D47); its loaded cards show the continuation instead.
+                if (embedded) { await expect(cards(page)).toHaveCount(80); await expect(caption(page)).toHaveCount(0); }
+                else await expect(caption(page)).toContainText('80 of 80');
             }
             await page.evaluate(() => window.continuationFixture.scope.dispose());
             await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -226,7 +231,7 @@ test('layout changes retain selection and use one collection in Grid, List and M
         await page.getByRole('button', { name: layout, exact: true }).click();
         await expect(page.getByRole('button', { name: layout, exact: true })).toHaveAttribute('aria-pressed', 'true');
         await expect(cards(page)).toHaveCount(2);
-        await expect(details(page)).toContainText(/input/i);
+        await expectPanelSource(page, 'input');
         const boxes = await cards(page).evaluateAll(elements => elements.map(element => {
             const box = element.getBoundingClientRect();
             return { x: box.x, y: box.y, right: box.right, bottom: box.bottom };
@@ -265,8 +270,9 @@ test('returning to Images restores the filtered stream, layout, selection and sc
     await expect(cards(page)).toHaveCount(80);
     await expect(details(page).getByRole('heading', { level: 2 })).toHaveText(selectedTitle);
     await expect.poll(async () => Math.abs((await page.evaluate(() => window.scrollY)) - previousScroll)).toBeLessThan(120);
-    // Checked last: closing the dialog focuses Filters, which scrolls the toolbar into view.
-    await page.getByRole('button', { name: 'Filters', exact: true }).click();
+    // Checked last: closing the dialog focuses Filters, which scrolls the toolbar into view. The restored Source
+    // still counts (D44).
+    await page.getByRole('button', { name: 'Filters · 1', exact: true }).click();
     await expect(refineDialog(page).getByLabel('Source', { exact: true })).toHaveValue('0');
     await page.keyboard.press('Escape');
     await expect(refineDialog(page)).toBeHidden();
@@ -392,18 +398,20 @@ test('preview uses actual Viewer.js and cleans up when closing or leaving Images
 test('real video media has a usable card and native playback cleans up on close and navigation', async ({ page, request }) => {
     await expect(await request.post('/__test__/reset', { data: { include_video: true } })).toBeOK();
     const media = await (await request.get('/prompt_manager/images/output?limit=40')).json();
-    expect(media.images.find(image => image.filename === 'clip.webm').thumbnail_url).toBeNull();
+    // #249: a video with no preview yet still lists its preview URL; the server makes the frame on first view.
+    expect(media.images.find(image => image.filename === 'clip.webm').thumbnail_url).toMatch(/\/thumbnails\/clip_thumb\.webp\?root=0/);
     await page.goto(workspace);
     await refine(page, { Media: 'video' });
     await expect(cards(page)).toHaveCount(1);
     const card = cards(page).first();
     await expect(card).toHaveAttribute('data-image-key', '0:clip.webm');
-    await expect(card.locator('img')).toHaveCount(0);
     await expect(card.getByRole('button', { name: 'Open clip.webm', exact: true })).toBeVisible();
-    // Legacy video art inside the concept card; D11 names the video's own extension.
-    await expect(card.locator('.media-art > .image-open > video')).toHaveCount(1);
+    // The card shows the preview frame, never the video itself; D11 names the video's own extension.
+    await expect(card.locator('video')).toHaveCount(0);
+    await expect(card.locator('.media-art > .image-open > img')).toHaveCount(1);
     await expect(card.locator('.media-info p')).toHaveText(/(?:^|· )WEBM$/);
-    expect(await card.locator('video').evaluate(node => node.getBoundingClientRect().height)).toBeGreaterThan(20);
+    await expect.poll(() => card.locator('img').evaluate(node => node.complete && node.naturalHeight > 0)).toBe(true);
+    expect(await card.locator('img').evaluate(node => node.getBoundingClientRect().height)).toBeGreaterThan(20);
     await card.getByRole('button', { name: 'Open clip.webm', exact: true }).click();
     const video = page.locator('dialog[open] video');
     await expect(video).toBeVisible();
@@ -455,6 +463,50 @@ test('collection viewer ignores delayed media callbacks and keeps inspection ret
     await expect(preview).toContainText('same.png');await expect(preview.getByRole('button',{name:'Retry prompt details',exact:true})).toHaveCount(0);
     expect(await page.evaluate(()=>window.latestCanvas===document.querySelector('.viewer-canvas img'))).toBe(true);
     await page.evaluate(()=>{location.hash='/overview';});await expect(page.locator('.viewer-container,#viewer-dialog')).toHaveCount(0);
+});
+
+test('collection viewer leaving an image Viewer.js has not built yet releases it at once',async({page})=>{
+    await page.goto(workspace);await expect(cards(page)).toHaveCount(2);
+    let release,held;const waiting=new Promise(resolve=>{held=resolve;});const pending=new Promise(resolve=>{release=resolve;});
+    await page.route('**/images/serve/shared/same.png?*',async route=>{
+        const url=new URL(route.request().url());
+        if(url.searchParams.get('root')==='0'&&url.searchParams.has('_pm_viewer')) {held();await pending;}
+        await route.continue().catch(()=>{});
+    });
+    await cards(page).first().getByRole('button',{name:'Open same.png',exact:true}).click();await waiting;
+    const preview=page.locator('dialog#viewer-dialog');
+    await page.evaluate(()=>{window.unbuiltImage=document.querySelector('#viewer-stage > img');});
+    await preview.getByRole('button',{name:'Next media',exact:true}).click();
+    await expect(preview.getByRole('button',{name:'Zoom in',exact:true})).toHaveAttribute('aria-disabled','false');
+    // The left image is off the stage. Viewer.js has not built it, so the viewer is destroyed and the src released at
+    // once: its late load must never build Viewer.js into an image without a parent (getComputedStyle(null)).
+    release();
+    await expect.poll(()=>page.evaluate(()=>[window.unbuiltImage.isConnected,window.unbuiltImage.hasAttribute('src'),!!window.unbuiltImage.viewer])).toEqual([false,false,false]);
+    await page.evaluate(()=>{location.hash='/overview';});await expect(page.locator('.viewer-container,#viewer-dialog')).toHaveCount(0);
+});
+
+test('collection viewer closed while its image finishes loading never builds Viewer.js afterwards',async({page})=>{
+    await page.goto(workspace);await expect(cards(page)).toHaveCount(2);
+    let held;const waiting=new Promise(resolve=>{held=resolve;});
+    // The image is held for the whole test: its late load is delivered below, at the moment Viewer.js cannot cancel.
+    await page.route('**/images/serve/shared/same.png?*',async route=>{
+        const url=new URL(route.request().url());
+        if(url.searchParams.get('root')==='0'&&url.searchParams.has('_pm_viewer')) {held();return;}
+        await route.continue().catch(()=>{});
+    });
+    await cards(page).first().getByRole('button',{name:'Open same.png',exact:true}).click();await waiting;
+    const preview=page.locator('dialog#viewer-dialog');
+    // Viewer.js's own cancel removes its image listeners only while `image.complete` is false. An image that has
+    // finished downloading but whose load event is still queued is already complete: close in that state, then deliver it.
+    await page.evaluate(()=>{window.finishingImage=document.querySelector('#viewer-stage > img');Object.defineProperty(window.finishingImage,'complete',{get:()=>true});});
+    await page.keyboard.press('Escape');await expect(preview).toHaveCount(0);
+    const after=await page.evaluate(async()=>{
+        const image=window.finishingImage;image.dispatchEvent(new Event('load'));
+        // Viewer.js builds an inline viewer in a zero-delay timeout after its image loads; this runs after it.
+        await new Promise(resolve=>setTimeout(resolve));
+        return {src:image.hasAttribute('src'),built:!!image.parentNode?.querySelector('.viewer-container')};
+    });
+    expect(after).toEqual({src:false,built:false});
 });
 
 test('collection viewer describes video transforms and releases native playback on navigation',async({page,request})=>{
@@ -517,10 +569,14 @@ test('source and folder discovery failure stays visible and Import Rescan restor
 async function staleSourceRecovery(page, request, roots) {
     await expect(await request.post('/__test__/reset', { data: { extra_images: 80 } })).toBeOK();
     await page.setViewportSize({ width: 1600, height: 1100 });
+    // #430: the page first asks the server where a stale file is now. These tests cover the manual Refresh, so the
+    // file is never found; workspace-stale-source.spec.mjs covers a renumbered file that is found again.
+    await page.route('**/prompt_manager/images/rescope', route => route.fulfill({ status: 409,
+        json: { success: false, code: 'source-changed', error: 'The source of this image changed or was removed.' } }));
     await page.goto(workspace);
     const source = refineDialog(page).getByLabel('Source', { exact: true });
     const folder = refineDialog(page).getByLabel('Folder', { exact: true });
-    const filters = page.getByRole('button', { name: 'Filters', exact: true });
+    const filters = filtersButton(page);
     await filters.click();await expect(folder.locator('option[value="bulk"]')).toHaveCount(1);await page.keyboard.press('Escape');
     await refine(page, { Source: '0', Folder: 'bulk' });
     const configured = page.waitForResponse(response => {
@@ -539,14 +595,15 @@ async function staleSourceRecovery(page, request, roots) {
     await expect(await request.post('/prompt_manager/settings', { data: { gallery_root_paths: roots } })).toBeOK();
     const selected = initial.images.at(-1), key = `${selected.root_index}:${selected.path}`;
     const stale = page.waitForResponse(response => response.url().includes('/images/inspect/') && response.status() === 409);
-    await page.locator(`article[data-image-key="${key}"] .image-card-actions button`).click();expect((await stale).status()).toBe(409);
+    await page.locator(`article[data-image-key="${key}"] .image-card-actions button:first-child`).click();expect((await stale).status()).toBe(409);
     await expect(details(page)).toContainText('The source changed. Refresh the image collection before inspecting this file.');
     await page.locator(`article[data-image-key="${key}"] .image-open`).click();
     const viewer = page.locator('dialog#viewer-dialog');await expect(viewer).toContainText('The source changed.');
     const pages = [], inspections = [], options = [], mutations = [];
     page.on('request', request => {
         const url = new URL(request.url());
-        if (url.pathname.endsWith('/images/output')) pages.push(url);
+        // limit=1 is a sidebar count read (Overview re-reads it on a visit, #547), not a page of images.
+        if (url.pathname.endsWith('/images/output') && url.searchParams.get('limit') !== '1') pages.push(url);
         if (url.pathname.includes('/images/inspect/')) inspections.push(url);
         if (request.method() !== 'GET') mutations.push(url.pathname);
     });
@@ -565,7 +622,9 @@ for (const [name, roots] of [['reordered', ['input', 'output']], ['removed', ['i
             expect(recovery.pages.map(url => url.search)).toEqual([]);expect(recovery.inspections).toEqual([]);
             await expect(page.locator('.filter-row span.chip')).toHaveText('All output folders');
             for (const name of ['Filter by category', 'Sort results']) await expect(page.getByRole('combobox', { name, exact: true })).toBeDisabled();
-            for (const name of ['Filters', 'Import']) await expect(page.getByRole('button', { name, exact: true })).toBeDisabled();
+            // D44: recovery clears Source and Folder; the Media filter stays and still counts.
+            await expect(recovery.filters).toHaveText('Filters · 1');await expect(recovery.filters).toBeDisabled();
+            await expect(page.getByRole('button', { name: 'Import', exact: true })).toBeDisabled();
             await expect(search(page)).toBeDisabled();
             await expect(page.getByRole('button', { name: 'Load more images', exact: true })).toBeDisabled();
             await page.getByRole('button', { name: 'Load more images', exact: true }).evaluate(node => node.click());await recovery.filters.evaluate(node => node.click());await sortBy(page).dispatchEvent('change');
@@ -611,7 +670,7 @@ test('mobile Images keeps filters, layouts and selected details within the viewp
     for (const layout of ['List', 'Masonry', 'Grid']) {
         await page.getByRole('button', { name: layout, exact: true }).click();
         await cards(page).last().getByRole('button', { name: 'Inspect same.png', exact: true }).click();
-        await expect(details(page)).toContainText(/input/i);
+        await expectPanelSource(page, 'input');
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     }
     await expect(search(page)).toBeVisible();
@@ -661,16 +720,45 @@ test('selected layout stays blue with readable text on hover in either theme', a
     }
 });
 
-test('refresh releases the previous inspector video source', async ({ page, request }) => {
+test('refresh releases the previous inspector cover source', async ({ page, request }) => {
     await expect(await request.post('/__test__/reset', { data: { include_video: true } })).toBeOK();
     await page.goto(workspace);
     const card = cards(page).filter({ hasText: 'clip.webm' });
     await card.getByRole('button', { name: 'Inspect clip.webm', exact: true }).click();
+    // #249: a video's cover is its preview frame, not the video.
+    const cover = details(page).locator('img.detail-cover');
+    await expect(cover).toHaveAttribute('src', /\/thumbnails\/clip_thumb\.webp\?/);
+    await expect(details(page).locator('video')).toHaveCount(0);
+    await cover.evaluate(element => { window.__oldInspectorCover = element; });
+    await rescan(page);
+    await expect.poll(() => page.evaluate(() => !window.__oldInspectorCover.isConnected)).toBe(true);
+    expect(await page.evaluate(() => window.__oldInspectorCover.getAttribute('src'))).toBeNull();
+});
+
+/** A listing that names no preview for its videos (the fallback a card and the cover keep for one). */
+async function videosWithoutPreview(page) {
+    await page.route(url => url.pathname === '/prompt_manager/images/output', async route => {
+        const response = await route.fetch();
+        const body = await response.json();
+        if (Array.isArray(body.images)) body.images = body.images.map(image => image.is_video ? { ...image, thumbnail_url: null } : image);
+        await route.fulfill({ response, json: body });
+    });
+}
+
+test('a video listed without a preview keeps its own element, released on refresh', async ({ page, request }) => {
+    await expect(await request.post('/__test__/reset', { data: { include_video: true } })).toBeOK();
+    await videosWithoutPreview(page);
+    await page.goto(workspace);
+    const card = cards(page).filter({ hasText: 'clip.webm' });
+    await expect(card.locator('.media-art > .image-open > video')).toHaveCount(1);
+    await expect(card.locator('img')).toHaveCount(0);
+    await card.getByRole('button', { name: 'Inspect clip.webm', exact: true }).click();
     await expect(details(page).locator('video')).toBeVisible();
     await details(page).locator('video').evaluate(element => { window.__oldInspectorVideo = element; });
+    await card.locator('video').evaluate(element => { window.__oldCardVideo = element; });
     await rescan(page);
-    await expect.poll(() => page.evaluate(() => !window.__oldInspectorVideo.isConnected)).toBe(true);
-    expect(await page.evaluate(() => window.__oldInspectorVideo.getAttribute('src'))).toBeNull();
+    await expect.poll(() => page.evaluate(() => !window.__oldInspectorVideo.isConnected && !window.__oldCardVideo.isConnected)).toBe(true);
+    expect(await page.evaluate(() => [window.__oldInspectorVideo.getAttribute('src'), window.__oldCardVideo.getAttribute('src')])).toEqual([null, null]);
 });
 
 test('Import Rescan rescans cached files and preserves the collection when rescan fails', async ({ page, request }) => {
@@ -727,6 +815,8 @@ test('leaving during Rescan cancels it without replacing the next workspace', as
 
 test('Images uses approved geometry while keeping real controls', async ({page,request}) => {
     await request.post('/__test__/reset',{data:{workspace_visual:true}});
+    // The approved Grid geometry (D157: the default layout is Masonry).
+    await startInGrid(page);
     await page.setViewportSize({width:1600,height:1100});
     await page.goto(workspace);
     await expect(cards(page)).toHaveCount(24);
@@ -747,10 +837,9 @@ test('Images uses approved geometry while keeping real controls', async ({page,r
     expect(geometry[0].mediaWidth/geometry[0].mediaHeight).toBeCloseTo(1.33,2);
     expect((await caption(page).boundingBox()).y).toBeLessThan(geometry[0].y);
     await expect(cards(page).first()).toHaveCSS('box-shadow',/ 0px 0px 0px 1px$/);
-    const cover=details(page).getByRole('button',{name:'Open full preview',exact:true});
-    await expect(cover).toHaveCSS('height','150px');
-    await expect(cover.locator('img')).toBeVisible();await expect(cover.locator('img')).toHaveCSS('height','150px');
-    expect(await cover.evaluate(node=>node===node.parentElement.firstElementChild&&node.tagName==='BUTTON')).toBe(true);
+    const cover=details(page).locator('img.detail-cover');
+    await expect(cover).toBeVisible();await expect(cover).toHaveCSS('height','150px');
+    expect(await cover.evaluate(node=>node===node.parentElement.firstElementChild&&node.tagName==='IMG')).toBe(true);
     await page.setViewportSize({width:390,height:844});
     await expect.poll(()=>cards(page).nth(1).evaluate(node=>node.offsetTop)).toBe(0);
     await expect.poll(()=>cards(page).nth(2).evaluate(node=>node.offsetTop)).toBeGreaterThan(0);
@@ -780,7 +869,12 @@ test('density changes and resize preserve identity focus and selection', async (
     await page.getByRole('button',{name:'Grid',exact:true}).click();
     for (const [width,columns] of [[951,3],[950,3],[700,2],[390,2]]) {
         await page.setViewportSize({width,height:844});
-        await expect.poll(()=>cards(page).nth(columns).evaluate(node=>node.offsetLeft)).toBe(0);
+        // 700px and 390px both lay out two columns, so a card at the row start alone is also true of the previous
+        // width's cards before WebKit runs the first frame after the resize; wait for the row to fit the new grid.
+        await expect.poll(()=>page.locator('.image-grid').evaluate((grid,columns)=>{
+            const row=[...grid.querySelectorAll(':scope > article[data-image-key]')];
+            return row[columns].offsetLeft===0&&row[columns-1].getBoundingClientRect().right<=grid.getBoundingClientRect().right+1;
+        },columns)).toBe(true);
         await first.getByRole('button',{name:/^Open /}).focus();await page.keyboard.press('ArrowDown');
         await expect(cards(page).nth(columns).getByRole('button',{name:/^Open /})).toBeFocused();
         expect(await page.evaluate(()=>document.documentElement.scrollWidth-document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
@@ -801,8 +895,11 @@ test('images toolbar and filter row match the concept controls', async ({ page, 
     await expect(page.getByRole('button', { name: 'Refresh', exact: true })).toHaveCount(0);
     await expect(page.getByRole('link', { name: 'Current gallery' })).toHaveCount(0);
     await expect(main.locator('h2', { hasText: /^All images$/ })).toHaveCount(0);
-    await expect(main.locator('search.toolbar > *')).toHaveCount(4);
-    await expect(sortBy(page).locator('option')).toHaveText(['Recently added', 'Name A–Z', 'Highest rated', 'Oldest first', 'Name Z–A']);
+    // app.js toolbar() a347–360: search, category, sort, Save view, Filters.
+    await expect(main.locator('search.toolbar > *')).toHaveCount(5);
+    await expect(main.locator('search.toolbar > button')).toHaveText(['Save view', 'Filters']);
+    // D153 (#447): no "Highest rated", even with a rated prompt in the library.
+    await expect(sortBy(page).locator('option')).toHaveText(['Recently added', 'Name A–Z', 'Oldest first', 'Name Z–A']);
     const row = main.locator('.filter-row');
     await expect(row.locator(':scope > *')).toHaveCount(5);
     await expect(row.locator(':scope > .segmented[role="group"][aria-label="Image layout"] > button')).toHaveText(['Grid', 'List', 'Masonry']);
@@ -821,8 +918,8 @@ test('images toolbar and filter row match the concept controls', async ({ page, 
     await search(page).fill('');
     await expect(cards(page)).toHaveCount(2);
     await expect(cards(page).first()).toHaveAttribute('data-image-key', '0:shared/same.png');
-    await sortBy(page).selectOption('rating');
-    await expect(cards(page).first()).toHaveAttribute('data-image-key', '1:shared/same.png');
+    await sortBy(page).selectOption('name-desc');
+    await expect(sortBy(page)).toHaveValue('name-desc');
     await sortBy(page).selectOption('newest');
     await page.getByRole('combobox', { name: 'Filter by category', exact: true }).selectOption('Landscapes');
     await expect(cards(page)).toHaveCount(1);
@@ -830,10 +927,13 @@ test('images toolbar and filter row match the concept controls', async ({ page, 
     await page.getByRole('combobox', { name: 'Filter by category', exact: true }).selectOption('');
     await expect(cards(page)).toHaveCount(2);
 
+    await expect(filtersButton(page)).toHaveText('Filters');
     await refine(page, { Source: '1', Folder: 'shared', Media: 'image' });
     await expect(cards(page)).toHaveCount(1);
     await expect(cards(page)).toHaveAttribute('data-image-key', '1:shared/same.png');
     await expect(row.locator(':scope > span.chip')).toHaveText(`${roots[1].label} · shared`);
+    // D44: Source, Folder and Media each count once; the toolbar category is not a Refine filter.
+    await expect(filtersButton(page)).toHaveText('Filters · 3');
     await refine(page, { Media: 'video' });
     await expect(cards(page)).toHaveCount(0);
     await refine(page, { Source: 'all', Folder: '', Media: 'all', Tags: 'cats' });
@@ -842,11 +942,13 @@ test('images toolbar and filter row match the concept controls', async ({ page, 
     await expect(row.locator(':scope > span.chip')).toHaveText('All output folders');
     await page.getByRole('combobox', { name: 'Filter by category', exact: true }).selectOption('Landscapes');
     await expect(cards(page)).toHaveCount(0);
-    await page.getByRole('button', { name: 'Filters', exact: true }).click();
+    await expect(filtersButton(page)).toHaveText('Filters · 1');
+    await page.getByRole('button', { name: 'Filters · 1', exact: true }).click();
     await expect(refineDialog(page).getByLabel('Tags', { exact: true })).toHaveValue('cats');
     await refineDialog(page).getByRole('button', { name: 'Clear filters', exact: true }).click();
     await expect(page.getByRole('combobox', { name: 'Filter by category', exact: true })).toHaveValue('');
     await expect(cards(page)).toHaveCount(2);
+    await expect(page.getByRole('button', { name: 'Filters', exact: true })).toBeFocused();
 
     const rescans = [];
     page.on('request', request => { if (request.url().includes('/prompt_manager/gallery/rescan')) rescans.push(request.method()); });
@@ -888,6 +990,10 @@ test('browser Back closes the open Images dialog and leaves the next page usable
 
 test('count line shows images and positive prompts', async ({ page, request }) => {
     await page.addInitScript(() => { window.IntersectionObserver = undefined; });
+    // D17's "Today" is the newest file's day: the page's clock stands at that file's mtime, so the fixture's day and
+    // the page's agree on either side of midnight.
+    const { images } = await (await request.get('/prompt_manager/images/output?mode=workspace&limit=40')).json();
+    await page.clock.setFixedTime(new Date(Math.max(...images.map(image => image.modified_time)) * 1000));
     await page.goto(workspace);
     await expect(cards(page)).toHaveCount(2);
     await expect(caption(page).locator('#result-count')).toHaveText('2 of 2 images · 2 positive prompts');
@@ -1014,8 +1120,7 @@ async function cardInventory(page, concept) {
         const walk = new Function(`return (${walkSource})()`)();
         return nodes.map(card => {
             const copy = card.cloneNode(true);
-            // D9: no tag button until image annotations. The D8 checkbox and the D7 star are compared.
-            if (concept) for (const node of copy.querySelectorAll('[aria-label^="Tag or auto-tag "]')) node.remove();
+            // Info then Tag (#249 C2 retired D9). The D8 checkbox and the D7 star are compared.
             const open = card.querySelector('.image-open'), img = open.querySelector('img');
             const star = card.querySelector('.image-overlays > button.star-button');
             const box = card.querySelector('.image-overlays > label > input');
@@ -1025,7 +1130,7 @@ async function cardInventory(page, concept) {
                 size: [img.getAttribute('width'), img.getAttribute('height')],
                 title: card.querySelector('.media-info h3').textContent, subtitle: card.querySelector('.media-info p').textContent,
                 ratio: card.style.getPropertyValue('--media-ratio').replace(/\s/g, ''),
-                inspect: card.querySelector('.image-card-actions > button').getAttribute('aria-label'),
+                actions: [...card.querySelectorAll('.image-card-actions > button')].map(button => button.getAttribute('aria-label')),
                 star: star && { text: star.textContent, pressed: star.getAttribute('aria-pressed'), label: star.getAttribute('aria-label') },
                 select: box && { type: box.type, checked: box.checked, label: box.getAttribute('aria-label') },
                 paths: walk(copy, `article.${[...card.classList].filter(value => value !== 'selected').sort().join('.')}`, []) };
@@ -1099,7 +1204,7 @@ test('image click opens the viewer and Info selects the panel', async ({ page })
     await expect(cards(page)).toHaveCount(2);
     // D19: the first load still selects the first image into the panel.
     await expect(cards(page).first()).toHaveClass(/selected/);
-    await expect(details(page)).toContainText(/output/i);
+    await expectPanelSource(page, 'output');
     const viewer = page.locator('dialog#viewer-dialog');
     const image = cards(page).nth(1).getByRole('button', { name: 'Open same.png', exact: true });
     await image.click();
@@ -1122,10 +1227,10 @@ test('image click opens the viewer and Info selects the panel', async ({ page })
     await expect(cards(page).nth(1)).toHaveClass(/selected/);
     await expect(cards(page).first()).not.toHaveClass(/selected/);
     await expect(info).not.toHaveAttribute('aria-pressed');
-    await expect(details(page)).toContainText(/input/i);
+    await expectPanelSource(page, 'input');
     await image.focus(); await page.keyboard.press('ArrowLeft');
     await expect(cards(page).first().getByRole('button', { name: 'Open same.png', exact: true })).toBeFocused();
-    await expect(details(page)).toContainText(/input/i);
+    await expectPanelSource(page, 'input');
 });
 
 test('grid columns follow concept breakpoints', async ({ page, request }) => {
@@ -1195,7 +1300,7 @@ async function zoomedGallery(page, request, { cssZoom }) {
     await page.keyboard.press('Tab');
     await expect(page.locator(`article[aria-posinset="${columns + 1}"] .image-overlays .star-button`)).toBeFocused();
     await page.keyboard.press('Tab');
-    await expect(page.locator(`article[aria-posinset="${columns + 1}"] .image-card-actions button`)).toBeFocused();
+    await expect(page.locator(`article[aria-posinset="${columns + 1}"] .image-card-actions button:first-child`)).toBeFocused();
     await page.evaluate(() => {
         const card = document.querySelector('article[aria-posinset="1"]');
         const grid = document.querySelector('.image-grid');
@@ -1271,6 +1376,61 @@ async function expectStar(button, favorite) {
     await expect(button).toHaveText(favorite ? '★' : '☆');
     await expect(button).toHaveAttribute('aria-pressed', String(favorite));
 }
+
+// #494: the Favorites count is re-read 300 ms after a star changes. A page that has begun to leave starts no count read
+// (WebKit fails it with "Fetch API cannot load … due to access control checks.", reported as a page error; queue run
+// 40934368716). A leave that is called off counts again on the next input.
+for (const leave of ['beforeunload', 'pagehide']) {
+    test(`a star changed just before ${leave} starts no Favorites count read while the page leaves`, async ({ page }) => {
+        await page.clock.install();
+        const countReads = [];
+        page.on('request', item => {
+            const url = new URL(item.url());
+            if (url.pathname === '/prompt_manager/images/output' && url.searchParams.get('favorites') === '1' && url.searchParams.get('limit') === '1') countReads.push(url.search);
+        });
+        await page.goto(workspace);
+        const card = page.locator('article[data-image-key="0:shared/same.png"]');
+        await expectStar(star(card, 'same.png'), false);
+        await expect.poll(() => countReads.length).toBe(1);
+        await star(card, 'same.png').click();
+        await expectStar(star(card, 'same.png'), true);
+        await expect(toast(page)).toHaveText('Added to favorites.');
+        await page.evaluate(type => window.dispatchEvent(new Event(type)), leave);
+        await page.clock.runFor(1000);
+        // A read made after the clock ran is listed, so the listener saw every count read.
+        await page.evaluate(() => fetch('/prompt_manager/images/output?mode=workspace&favorites=1&limit=1&probe=1'));
+        await expect.poll(() => countReads.length).toBe(2);
+        expect(countReads.at(-1)).toContain('probe=1');
+        if (leave === 'beforeunload') {
+            // The leave was called off (the page is still here): the next input counts again, once, and the badge shows it.
+            await page.keyboard.press('Shift');
+            await expect.poll(() => countReads.length).toBe(3);
+            expect(countReads.at(-1)).not.toContain('probe=1');
+            await expect(page.locator('nav [data-route="favorites"] .nav-count')).toHaveText('1');
+            await page.clock.runFor(1000);
+            expect(countReads).toHaveLength(3);
+        }
+    });
+}
+
+test('a count read in flight when the page starts to leave is dropped, then read again if the page stays (#494)', async ({ page }) => {
+    const held = [];
+    // The page's first Library count read is held at the server boundary while the page starts to leave.
+    await page.route('**/prompt_manager/library?limit=1', route => { held.push(route); });
+    await page.goto(workspace);
+    await expect.poll(() => held.length).toBe(1);
+    const failed = page.waitForEvent('requestfailed', item => item.url().includes('/prompt_manager/library?limit=1'));
+    await page.evaluate(() => window.dispatchEvent(new Event('beforeunload')));
+    await failed;
+    await page.unroute('**/prompt_manager/library?limit=1');
+    await held[0].continue().catch(() => {});
+    await expect(page.locator('nav [data-route="library"] .nav-count')).toHaveCount(0);
+    // The page stayed: the next input reads the dropped count again.
+    const reread = page.waitForRequest(item => item.url().includes('/prompt_manager/library?limit=1'));
+    await page.keyboard.press('Shift');
+    await reread;
+    await expect(page.locator('nav [data-route="library"] .nav-count')).toHaveText(/^\d+$/);
+});
 
 test('favorite persists across reload', async ({ page, request }) => {
     await expect(await request.post('/__test__/reset', { data: { include_video: true } })).toBeOK();
@@ -1473,7 +1633,50 @@ test('a star press leaves the continuation status, count and caption date untouc
     expect(await page.evaluate(() => window.__statusMutations)).toEqual([]);
 });
 
+// Opened before the source and folder discovery answered (a slow server), Refine lists them once it does.
+test('Refine opened before discovery settles lists the discovered sources and folders', async ({ page }) => {
+    let release, started;
+    const held = new Promise(resolve => { release = resolve; }), hit = new Promise(resolve => { started = resolve; });
+    await page.route('**/prompt_manager/gallery/subfolders?*', async route => { started(); await held; await route.continue(); }, { times: 1 });
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(2);
+    await hit;
+    await filtersButton(page).click();
+    const source = refineDialog(page).getByLabel('Source', { exact: true });
+    const folder = refineDialog(page).getByLabel('Folder', { exact: true });
+    const values = select => select.locator('option').evaluateAll(options => options.map(option => option.value));
+    expect(await values(source)).toEqual(['all']);
+    expect(await values(folder)).toEqual(['']);
+    release();
+    await expect.poll(() => values(source)).toEqual(['all', '0', '1']);
+    expect(await values(folder)).toEqual(['', 'shared']);
+    await expect(source).toHaveValue('all');
+    await source.selectOption('1');
+    await refineDialog(page).getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await expect(cards(page)).toHaveCount(1);
+    await expect(cards(page)).toHaveAttribute('data-image-key', '1:shared/same.png');
+});
+
 // #249 final review m1: as in the old field row, a Source offers only its own folders.
+test('a search reload keeps the Filters label node, so a click landing during the reload is not lost', async ({ page, request }) => {
+    // WebKit drops a click whose mousedown hit a text node that was replaced before mouseup; the reload reports the
+    // (unchanged) active count, so the label must keep its node.
+    await expect(await request.post('/__test__/reset', { data: { extra_images: 80 } })).toBeOK();
+    await page.goto(workspace);
+    const button = filtersButton(page);
+    await button.click();await expect(refineDialog(page).getByLabel('Folder', { exact: true }).locator('option[value="bulk"]')).toHaveCount(1);await page.keyboard.press('Escape');
+    await refine(page, { Source: '0', Folder: 'bulk' });
+    await expect(button).toHaveText('Filters · 2');
+    const label = await button.evaluateHandle(node => node.firstChild);
+    const reloaded = page.waitForResponse(response => {
+        const url = new URL(response.url());return imagePages(url) && url.searchParams.get('q') === 'png';
+    });
+    await search(page).fill('png');
+    await reloaded;
+    await expect(button).toHaveText('Filters · 2');
+    expect(await button.evaluate((node, text) => node.firstChild === text && text.isConnected, label)).toBe(true);
+});
+
 test('Refine offers only the chosen source folders', async ({ page, request }) => {
     await expect(await request.post('/__test__/add-nested-image')).toBeOK();
     await page.goto(workspace);
@@ -1495,8 +1698,8 @@ test('Refine offers only the chosen source folders', async ({ page, request }) =
     await refineDialog(page).getByRole('button', { name: 'Apply filters', exact: true }).click();
     await expect(cards(page)).toHaveCount(1);
     await expect(cards(page)).toHaveAttribute('data-image-key', '1:shared/same.png');
-    // Reopened on that Source, the dialog again lists only its folders.
-    await page.getByRole('button', { name: 'Filters', exact: true }).click();
+    // Reopened on that Source, the dialog again lists only its folders. Source and Folder count (D44).
+    await page.getByRole('button', { name: 'Filters · 2', exact: true }).click();
     expect(await values()).toEqual(['', 'shared']);
 });
 
@@ -1559,6 +1762,63 @@ test('unreachable sources and categories announce one error', async ({ page }) =
     await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
+// PR D-b Task 3 (D42): the shared toast keeps the concept's fixed bottom placement, so a discovery alert that a rescan
+// leaves visible must not stay under it. The window ends just below the alert, inside the toast's band, as on a short
+// window or a phone with its browser bars shown.
+const boxOf = locator => locator.evaluate(node => {
+    const { top, right, bottom, left } = node.getBoundingClientRect();
+    return { top, right, bottom, left };
+});
+const overlaps = (a, b) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+for (const width of [1600, 390]) {
+    test(`Rescan toast does not cover the discovery alert it leaves at ${width}px`, async ({ page }) => {
+        await page.setViewportSize({ width, height: 1100 });
+        await page.route('**/prompt_manager/library/options*', route => route.abort('failed'));
+        await page.goto(workspace);
+        await expect(cards(page)).toHaveCount(2);
+        const alert = page.getByRole('alert');
+        const failed = 'Categories could not be loaded. Rescan from Import to retry.';
+        await expect(alert).toHaveText(failed);
+        const toastInset = width > 700 ? 22 : 12;
+        await page.setViewportSize({ width, height: Math.ceil((await boxOf(alert)).bottom) + toastInset + 16 });
+        await rescan(page);
+        await expect(toast(page)).toHaveText(/^Rescan finished\. /);
+        await expect(alert).toHaveText(failed);
+        await expect.poll(async () => overlaps(await boxOf(alert), await boxOf(toast(page)))).toBe(false);
+        const [shown, placed] = [await boxOf(alert), await boxOf(toast(page))];
+        expect(shown.top).toBeGreaterThanOrEqual(0);
+        expect(shown.bottom).toBeLessThanOrEqual(placed.top);
+        // The concept's toast stays where the concept puts it: centred, its inset from the bottom.
+        const viewport = page.viewportSize();
+        expect(Math.round(viewport.height - placed.bottom)).toBe(toastInset);
+        expect(Math.abs((placed.left + placed.right) / 2 - viewport.width / 2)).toBeLessThan(1);
+    });
+}
+
+// Final review m3: D42 scrolls only when the alert meets the toast's band, never back up to one above the window.
+test('Rescan does not scroll back to a discovery alert above the window', async ({ page }) => {
+    await page.setViewportSize({ width: 1600, height: 1100 });
+    await page.route('**/prompt_manager/library/options*', route => route.abort('failed'));
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(2);
+    const alert = page.getByRole('alert');
+    await expect(alert).toHaveText('Categories could not be loaded. Rescan from Import to retry.');
+    await page.setViewportSize({ width: 1600, height: 260 });
+    // Import is at the top; the page is scrolled down to the last card while its dialog is open.
+    await page.getByRole('button', { name: 'Import', exact: true }).click();
+    await cards(page).last().evaluate(node => node.scrollIntoView({ block: 'end' }));
+    expect((await boxOf(alert)).bottom).toBeLessThan(0);
+    // The reload itself may move the page; what D42 must not do is scroll the alert back into view.
+    await alert.evaluate(node => {
+        window.alertScrolls = 0;
+        node.scrollIntoView = (...args) => { window.alertScrolls += 1; Element.prototype.scrollIntoView.apply(node, args); };
+    });
+    await importDialog(page).getByRole('button', { name: 'Rescan', exact: true }).click();
+    await expect(toast(page)).toHaveText(/^Rescan finished\. /);
+    await expect(alert).toBeAttached();
+    expect(await page.evaluate(() => window.alertScrolls)).toBe(0);
+});
+
 // #249 final review m8: D36's alphabetical categories hold whatever order the server sends.
 test('toolbar categories are alphabetical regardless of server order', async ({ page }) => {
     await page.route('**/prompt_manager/library/options*', route => route.fulfill({
@@ -1589,7 +1849,8 @@ test('card checkboxes select images into the concept bar and Clear empties it', 
     const selectedBefore = await cards(page).evaluateAll(nodes => nodes.map(node => node.classList.contains('selected')));
     await checkbox(first, 'same.png').check();
     await expect(bulkbar(page).locator('.bulkbar > strong')).toHaveText('1 selected');
-    await expect(barButtons(page)).toHaveText(['Set category', 'Export metadata', 'Clear']);
+    // D85: Add tags (the concept's) and Auto-tag selected lead the real actions.
+    await expect(barButtons(page)).toHaveText(['Add tags', 'Auto-tag selected', 'Set category', 'Add to collection', 'Export metadata', 'Delete…', 'Clear']);
     // Toggling neither opens the viewer, nor inspects, nor moves focus.
     await expect(page.locator('dialog[open]')).toHaveCount(0);
     await expect(checkbox(first, 'same.png')).toBeFocused();
@@ -1790,70 +2051,286 @@ test('Export metadata downloads nothing when no image can be read', async ({ pag
     await expect(bulkbar(page).locator('.bulkbar > strong')).toHaveText('2 selected');
 });
 
-// #249 D8 follow-up (image selection, Task 3): Set category sets the linked positives' category (app.js simpleInput).
+// #332 (D140, MC6, MC7): Set category writes each selected image's own category (PUT /prompt_manager/images/category);
+// "Use prompt category" removes it after a confirmation (DELETE). It never writes a prompt: Images no longer posts
+// /prompt_manager/bulk/category (#259's prompt action is retired from Images).
 const categoryButton = page => bulkbar(page).getByRole('button', { name: 'Set category', exact: true });
 const categoryDialog = page => page.getByRole('dialog', { name: 'Categorize selected images', exact: true });
-const categoryRoute = '**/prompt_manager/bulk/category';
-/** Unlink the input root's card by deleting its prompt; returns the output card's positive id. */
-async function unlinkInputCard(request) {
-    const { images } = await (await request.get('/prompt_manager/images/output?mode=workspace')).json();
-    const byKey = Object.fromEntries(images.map(image => [`${image.root_index}:${image.path}`, image]));
-    const [output, input] = [byKey['0:shared/same.png'], byKey['1:shared/same.png']];
-    expect([output.linked.status, input.linked.status]).toEqual(['linked', 'linked']);
-    await expect(await request.delete(`/prompt_manager/delete/${input.linked.positive_id}`)).toBeOK();
-    return output.linked.positive_id;
+const removeDialog = page => page.getByRole('dialog', { name: 'Use prompt category', exact: true });
+const categoryFilter = page => page.getByRole('combobox', { name: 'Filter by category', exact: true });
+const categoryRoute = '**/prompt_manager/images/category';
+const IMAGE_CATEGORY = '/prompt_manager/images/category';
+const cardOf = (page, key) => page.locator(`article[data-image-key="${key}"]`);
+const keyOf = image => `${image.root_index}:${image.path}`;
+const cardKeys = page => cards(page).evaluateAll(nodes => nodes.map(node => node.dataset.imageKey).sort());
+// The four outputs of "Cat portrait" (CUJ 1's batch); the input root's same.png is linked to "Dog landscape".
+const BATCH = ['0:bulk/0000.png', '0:bulk/0001.png', '0:bulk/0002.png', '0:shared/same.png'];
+/** Every category write the page sends, Images' own route and #259's prompt route alike. */
+function categoryWrites(page) {
+    const writes = [];
+    page.on('request', item => {
+        const path = new URL(item.url()).pathname;
+        if (item.method() === 'GET' || !['/prompt_manager/images/category', '/prompt_manager/bulk/category'].includes(path)) return;
+        writes.push({ method: item.method(), path, body: item.postDataJSON() });
+    });
+    return writes;
+}
+async function listedImages(request, query = '') {
+    const response = await request.get(`/prompt_manager/images/output?mode=workspace&limit=40${query}`);
+    await expect(response).toBeOK();
+    return (await response.json()).images;
+}
+async function targetsOf(request, keys) {
+    const images = await listedImages(request);
+    return keys.map(key => {
+        const image = images.find(item => keyOf(item) === key);
+        return { root_index: image.root_index, root_scope: image.root_scope, path: image.path };
+    });
+}
+async function putOwnCategory(request, keys, category) {
+    const response = await request.put(IMAGE_CATEGORY, { data: { items: await targetsOf(request, keys), category } });
+    await expect(response).toBeOK();
+}
+const filteredKeys = async (request, category) => (await listedImages(request, `&category=${encodeURIComponent(category)}`)).map(keyOf).sort();
+async function positiveOf(request, id) {
+    const response = await request.get(`/prompt_manager/library/${id}`);
+    await expect(response).toBeOK();
+    const { positive } = await response.json();
+    return { id: positive.id, text: positive.text, category: positive.category };
+}
+/** CUJ 1's Given: four images linked to the positive "Cat portrait", whose category is "Landscapes". */
+async function seedBatch(request) {
+    await expect(await request.post('/__test__/reset', { data: { extra_images: 3 } })).toBeOK();
+    const response = await request.post('/prompt_manager/save', { data: { text: 'Cat portrait', category: 'Landscapes' } });
+    await expect(response).toBeOK();
+    const id = (await response.json()).prompt_id;
+    expect(await filteredKeys(request, 'Landscapes')).toEqual(BATCH);
+    return id;
+}
+async function openSetCategory(page) {
+    await categoryButton(page).click();
+    await expect(categoryDialog(page)).toBeVisible();
+    return categoryDialog(page);
+}
+async function applyCategory(page, category) {
+    const dialog = await openSetCategory(page);
+    await dialog.getByLabel('Category', { exact: true }).fill(category);
+    await dialog.getByRole('button', { name: 'Apply', exact: true }).click();
+    await expect(dialog).toBeHidden();
 }
 
-test('Set category applies the category to the linked positives and the category filter then matches', async ({ page, request }) => {
-    const outputPositive = await unlinkInputCard(request);
+test('Set category overrides one image of a batch and never writes its prompt (#332 CUJ 1)', async ({ page, request }) => {
+    const positiveId = await seedBatch(request);
+    const before = await positiveOf(request, positiveId);
+    const writes = categoryWrites(page);
     await page.goto(workspace);
-    await checkBoth(page);
-    const opener = categoryButton(page);
-    await opener.click();
-    const dialog = categoryDialog(page);
-    await expect(dialog).toBeVisible();
-    // The concept's simpleInput: one field and Cancel / Apply (primary).
+    await expect(cards(page)).toHaveCount(5);
+    await checkbox(cardOf(page, '0:bulk/0001.png'), '0001.png').check();
+    const dialog = await openSetCategory(page);
+    // The concept's simpleInput plus "Use prompt category" between Cancel and Apply (primary).
     await expect(dialog.locator('#modal-body > .field > label[for="action-input"]')).toHaveText('Category');
     await expect(dialog.locator('#modal-body > .field > input#action-input')).toHaveValue('');
-    await expect(dialog.locator('#modal-body > .dialog-actions > button')).toHaveText(['Cancel', 'Apply']);
+    await expect(dialog.locator('#modal-body > .dialog-actions > button')).toHaveText(['Cancel', 'Use prompt category', 'Apply']);
     await expect(dialog.getByRole('button', { name: 'Apply', exact: true })).toHaveClass(/ca-primary/);
     await expect(dialog.getByLabel('Category', { exact: true })).toBeFocused();
+    await expect(dialog.getByLabel('Category', { exact: true })).toHaveAttribute('maxlength', '100');
     // An empty value applies nothing and keeps the dialog open.
-    const posts = [];
-    page.on('request', item => { if (item.method() === 'POST' && item.url().endsWith('/prompt_manager/bulk/category')) posts.push(item.postDataJSON()); });
     await dialog.getByRole('button', { name: 'Apply', exact: true }).click();
     await expect(dialog).toBeVisible();
-    await dialog.getByLabel('Category', { exact: true }).fill('  Landscapes ');
+    await dialog.getByLabel('Category', { exact: true }).fill('  Portraits ');
     const listings = [];
     page.on('request', item => { if (imagePages(new URL(item.url()))) listings.push(item.url()); });
     await dialog.getByRole('button', { name: 'Apply', exact: true }).click();
     await expect(dialog).toBeHidden();
-    await expect(toast(page)).toHaveText('Category set on 1 prompt. 1 selected image had no linked prompt and was skipped.');
-    expect(posts).toEqual([{ prompt_ids: [outputPositive], category: 'Landscapes' }]);
+    await expect(toast(page)).toHaveText('Category “Portraits” set on 1 image.');
+    expect(writes).toEqual([{ method: 'PUT', path: IMAGE_CATEGORY,
+        body: { items: await targetsOf(request, ['0:bulk/0001.png']), category: 'Portraits' } }]);
     // The listing and the category options reload; the reload clears the selection.
     await expect.poll(() => listings.length).toBeGreaterThan(0);
     await expect(bulkbar(page)).toBeEmpty();
-    await expect(page.locator('#workspace-main h1')).toBeFocused();
-    await expect(cards(page).getByRole('checkbox', { checked: true })).toHaveCount(0);
-    const filter = page.getByRole('combobox', { name: 'Filter by category', exact: true });
-    await expect(filter.locator('option')).toContainText(['Landscapes']);
-    await filter.selectOption('Landscapes');
+    await expect(categoryFilter(page).locator('option')).toHaveText(['All categories', 'Landscapes', 'Portraits']);
+    await categoryFilter(page).selectOption('Portraits');
     await expect(cards(page)).toHaveCount(1);
-    await expect(cards(page)).toHaveAttribute('data-image-key', '0:shared/same.png');
+    await expect(cards(page)).toHaveAttribute('data-image-key', '0:bulk/0001.png');
+    await categoryFilter(page).selectOption('Landscapes');
+    await expect(cards(page)).toHaveCount(3);
+    expect(await cardKeys(page)).toEqual(BATCH.filter(key => key !== '0:bulk/0001.png'));
+    // The prompt keeps its category: only the image carries "Portraits".
+    expect(await positiveOf(request, positiveId)).toEqual(before);
+    expect(before.category).toBe('Landscapes');
+    expect(writes.filter(write => write.path === '/prompt_manager/bulk/category')).toEqual([]);
 });
 
-test('Set category without a linked image posts nothing and opens no dialog', async ({ page, request }) => {
-    await unlinkInputCard(request);
+test('Set category categorizes unlinked images and lists the value in the toolbar and the suggestions (#332 CUJ 2)', async ({ page, request }) => {
+    // Unlink both images by deleting their prompts.
+    for (const image of await listedImages(request)) {
+        await expect(await request.delete(`/prompt_manager/delete/${image.linked.positive_id}`)).toBeOK();
+    }
+    expect((await listedImages(request)).filter(image => image.linked.status === 'linked')).toEqual([]);
+    const writes = categoryWrites(page);
     await page.goto(workspace);
+    await checkBoth(page);
+    await applyCategory(page, 'Scans');
+    await expect(toast(page)).toHaveText('Category “Scans” set on 2 images.');
+    expect(writes).toEqual([{ method: 'PUT', path: IMAGE_CATEGORY,
+        body: { items: await targetsOf(request, ['0:shared/same.png', '1:shared/same.png']), category: 'Scans' } }]);
+    await expect(categoryFilter(page).locator('option')).toHaveText(['All categories', 'Scans']);
+    await categoryFilter(page).selectOption('Scans');
     await expect(cards(page)).toHaveCount(2);
-    let posted = 0;
-    await page.route(categoryRoute, route => { posted += 1; return route.continue(); });
-    await checkbox(cards(page).last(), 'same.png').check();
-    await categoryButton(page).click();
-    await expect(toast(page)).toHaveText('None of the selected images has a linked prompt.');
+    expect(await cardKeys(page)).toEqual(['0:shared/same.png', '1:shared/same.png']);
+    // The field suggests the toolbar's categories through its own datalist.
+    await checkbox(cards(page).first(), 'same.png').check();
+    const dialog = await openSetCategory(page);
+    await expect(dialog.getByLabel('Category', { exact: true })).toHaveAttribute('list', 'workspace-input-suggestions');
+    expect(await dialog.locator('datalist#workspace-input-suggestions option').evaluateAll(nodes => nodes.map(node => node.value))).toEqual(['Scans']);
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
     await expect(page.locator('dialog[open]')).toHaveCount(0);
-    expect(posted).toBe(0);
-    await expect(bulkbar(page).locator('.bulkbar > strong')).toHaveText('1 selected');
+    expect(writes).toHaveLength(1);
+});
+
+test('Use prompt category removes the own category only after Remove in its confirmation (#332 CUJ 3)', async ({ page, request }) => {
+    const positiveId = await seedBatch(request);
+    await putOwnCategory(request, ['0:bulk/0001.png'], 'Portraits');
+    const writes = categoryWrites(page);
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(5);
+    await expect(categoryFilter(page).locator('option')).toHaveText(['All categories', 'Landscapes', 'Portraits']);
+    await checkbox(cardOf(page, '0:bulk/0001.png'), '0001.png').check();
+    // Cancel in the confirmation sends nothing and keeps the selection.
+    await (await openSetCategory(page)).getByRole('button', { name: 'Use prompt category', exact: true }).click();
+    await expect(categoryDialog(page)).toHaveCount(0);
+    const confirm = removeDialog(page);
+    await expect(confirm).toBeVisible();
+    await expect(confirm.locator('p').first()).toHaveText("Remove the image category from the 1 selected image? Each one then shows its prompt's category, or none if it has no linked prompt. This cannot be undone.");
+    await expect(confirm.locator('.dialog-actions > button')).toHaveText(['Cancel', 'Remove']);
+    await expect(confirm.getByRole('button', { name: 'Remove', exact: true })).toHaveClass(/danger/);
+    await expect(confirm.getByRole('button', { name: 'Cancel', exact: true })).toBeFocused();
+    await confirm.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    await expect(selectedCount(page)).toHaveText('1 selected');
+    expect(writes).toEqual([]);
+    expect(await filteredKeys(request, 'Portraits')).toEqual(['0:bulk/0001.png']);
+    // Remove sends exactly one DELETE naming the selected image.
+    await (await openSetCategory(page)).getByRole('button', { name: 'Use prompt category', exact: true }).click();
+    await removeDialog(page).getByRole('button', { name: 'Remove', exact: true }).click();
+    await expect(toast(page)).toHaveText('Removed the image category from 1 image.');
+    expect(writes).toEqual([{ method: 'DELETE', path: IMAGE_CATEGORY, body: { items: await targetsOf(request, ['0:bulk/0001.png']) } }]);
+    await expect(bulkbar(page)).toBeEmpty();
+    // The image shows its prompt's category again: "Landscapes" lists all four, and "Portraits" is gone.
+    await expect(categoryFilter(page).locator('option')).toHaveText(['All categories', 'Landscapes']);
+    await categoryFilter(page).selectOption('Landscapes');
+    await expect(cards(page)).toHaveCount(4);
+    expect(await cardKeys(page)).toEqual(BATCH);
+    expect((await positiveOf(request, positiveId)).category).toBe('Landscapes');
+});
+
+test('a saved view filtered by a category lists an image categorized after it was saved (#332 CUJ 8)', async ({ page, request }) => {
+    await seedBatch(request);
+    await putOwnCategory(request, ['0:bulk/0001.png'], 'Portraits');
+    await page.goto(workspace);
+    await categoryFilter(page).selectOption('Portraits');
+    await expect(cards(page)).toHaveCount(1);
+    await page.locator('#workspace-main search.toolbar').getByRole('button', { name: 'Save view', exact: true }).click();
+    const save = page.getByRole('dialog', { name: 'Save this view', exact: true });
+    await save.getByRole('textbox', { name: 'View name', exact: true }).fill('Portraits');
+    await save.getByRole('button', { name: 'Save', exact: true }).click();
+    await expect(toast(page)).toHaveText('Saved view added to the sidebar.');
+    // Another image gets "Portraits" through Set category.
+    await categoryFilter(page).selectOption('');
+    await expect(cards(page)).toHaveCount(5);
+    await checkbox(cardOf(page, '0:bulk/0002.png'), '0002.png').check();
+    await applyCategory(page, 'Portraits');
+    await expect(toast(page)).toHaveText('Category “Portraits” set on 1 image.');
+    // Reopening the view lists both.
+    await page.getByRole('navigation', { name: 'Saved views', exact: true }).getByRole('link', { name: 'Portraits', exact: true }).click();
+    await expect(page.locator('#workspace-main h1')).toHaveText('Portraits');
+    await expect(categoryFilter(page)).toHaveValue('Portraits');
+    await expect(cards(page)).toHaveCount(2);
+    expect(await cardKeys(page)).toEqual(['0:bulk/0001.png', '0:bulk/0002.png']);
+});
+
+test('at 390px in light theme the Set category dialog and the category chip fit (#332 CUJ 10)', async ({ page, request }) => {
+    const LONG = 'Portraits taken on a phone at the end of a long walk through the old harbour at dusk';
+    await page.addInitScript(() => { try { localStorage.setItem('pm_workspace_theme', 'light'); } catch { /* the default theme */ } });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await seedBatch(request);
+    await putOwnCategory(request, ['0:bulk/0001.png'], LONG);
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(5);
+    await expect(page.locator('html')).toHaveCSS('color-scheme', 'light');
+    const card = cardOf(page, '0:bulk/0001.png');
+    // The chip wraps inside the side panel; its origin never splits.
+    await card.getByRole('button', { name: 'Inspect 0001.png', exact: true }).click();
+    const chip = details(page).locator('span.chip', { has: page.locator('span.chip-source') });
+    await expect(chip).toHaveText(`Image category: ${LONG} · this image`);
+    const fit = await chip.evaluate(node => {
+        const panel = node.closest('aside, [role="complementary"]').getBoundingClientRect(), box = node.getBoundingClientRect();
+        const source = node.querySelector('.chip-source');
+        const line = parseFloat(getComputedStyle(source).lineHeight) || source.getBoundingClientRect().height;
+        return { inside: box.left >= panel.left - 0.5 && box.right <= panel.right + 0.5, sourceLines: source.getClientRects().length,
+            wrapped: box.height > line * 1.5, pageScroll: document.documentElement.scrollWidth - window.innerWidth };
+    });
+    expect(fit).toEqual({ inside: true, sourceLines: 1, wrapped: true, pageScroll: 0 });
+    // The dialog fits the width with no horizontal scroll, and its three buttons wrap without overlap.
+    await checkbox(card, '0001.png').check();
+    const dialog = await openSetCategory(page);
+    const geometry = await dialog.evaluate(node => {
+        const box = node.getBoundingClientRect();
+        const buttons = [...node.querySelectorAll('.dialog-actions > button')].map(button => button.getBoundingClientRect())
+            .map(({ left, right, top, bottom }) => ({ left, right, top, bottom }));
+        const overlaps = buttons.some((a, i) => buttons.some((b, j) => j > i && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom));
+        const scrollers = [node, ...node.querySelectorAll('*')].filter(item => item.scrollWidth > item.clientWidth + 1 && getComputedStyle(item).overflowX !== 'visible');
+        return { fits: box.left >= 0 && box.right <= window.innerWidth, scrollers: scrollers.length, count: buttons.length, overlaps,
+            inside: buttons.every(b => b.left >= box.left && b.right <= box.right), pageScroll: document.documentElement.scrollWidth - window.innerWidth };
+    });
+    expect(geometry).toEqual({ fits: true, scrollers: 0, count: 3, overlaps: false, inside: true, pageScroll: 0 });
+});
+
+test('Set category of more than 500 images says so before any dialog or request (#332)', async ({ page, request }) => {
+    await page.route(url => url.pathname === '/prompt_manager/images/output' && url.searchParams.get('limit') !== '1', async route => {
+        const response = await route.fetch();
+        const body = await response.json();
+        await route.fulfill({ response, json: { ...body, total: 501 } });
+    });
+    await bulkReset(page, request);
+    await cardAt(page, 0).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('ControlOrMeta+a');
+    await bulkbar(page).getByRole('button', { name: 'Select all 501 matching', exact: true }).click();
+    await expect(selectedCount(page)).toHaveText('All 501 matching selected');
+    const writes = categoryWrites(page);
+    await categoryButton(page).click();
+    await expect(toast(page)).toHaveText('Select at most 500 images.');
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    expect(writes).toEqual([]);
+    await expect(selectedCount(page)).toHaveText('All 501 matching selected');
+});
+
+test('a changed source says so and reloads the listing (#332)', async ({ page }) => {
+    await page.goto(workspace);
+    await checkBoth(page);
+    await page.route(categoryRoute, route => route.fulfill({ status: 409,
+        json: { success: false, code: 'source-changed', error: 'The output sources changed. Refresh the images and try again.' } }));
+    const reloaded = page.waitForRequest(item => imagePages(new URL(item.url())));
+    await applyCategory(page, 'Landscapes');
+    await expect(toast(page)).toHaveText('The sources changed. Refresh the images and try again.');
+    await reloaded;
+    await expect(cards(page)).toHaveCount(2);
+    // The reload hides the bar with Set category in it: focus moves to the page heading, as after a success.
+    await expect(page.locator('#workspace-main h1')).toBeFocused();
+});
+
+test('a recipe-linked image is listed under its recipe\'s category (#332 D142)', async ({ page, request }) => {
+    await expect(await request.post('/__test__/reset', { data: { native_library: true } })).toBeOK();
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(3);
+    await expect(categoryFilter(page).locator('option')).toHaveText(['All categories', 'Animals', 'Experiments', 'Portraits']);
+    // The output same.png is linked to recipe "Portrait variant 1" (Portraits), the input copy to variant 2 (Experiments);
+    // only the image without a recipe shows its positive's "Animals".
+    for (const [category, keys] of [['Portraits', ['0:shared/same.png']], ['Experiments', ['1:shared/same.png']], ['Animals', ['0:legacy-unassigned.png']]]) {
+        await categoryFilter(page).selectOption(category);
+        await expect(cards(page)).toHaveCount(keys.length);
+        expect(await cardKeys(page)).toEqual(keys);
+    }
 });
 
 test('Set category reports a failure, keeps the selection and ignores a second press while it runs', async ({ page }) => {
@@ -1861,9 +2338,7 @@ test('Set category reports a failure, keeps the selection and ignores a second p
     await checkBoth(page);
     const held = [];
     await page.route(categoryRoute, route => { held.push(route); });
-    await categoryButton(page).click();
-    await categoryDialog(page).getByLabel('Category', { exact: true }).fill('Landscapes');
-    await categoryDialog(page).getByRole('button', { name: 'Apply', exact: true }).click();
+    await applyCategory(page, 'Landscapes');
     await expect.poll(() => held.length).toBe(1);
     await expect(categoryButton(page)).toHaveAttribute('aria-disabled', 'true');
     // Playwright waits on an aria-disabled control, so the second press is a dispatched click.
@@ -1900,14 +2375,12 @@ test('leaving Images during Set category finishes the write, and the return relo
     await checkBoth(page);
     const held = [];
     await page.route(categoryRoute, route => { held.push(route); });
-    await categoryButton(page).click();
-    await categoryDialog(page).getByLabel('Category', { exact: true }).fill('Landscapes');
-    await categoryDialog(page).getByRole('button', { name: 'Apply', exact: true }).click();
+    await applyCategory(page, 'Landscapes');
     await expect.poll(() => held.length).toBe(1);
     await page.evaluate(() => { window.location.hash = '/overview'; });
     await expect(page.locator('#workspace-main h1')).toHaveText('Overview');
     // The write is not aborted with the page: the server still receives and answers it.
-    const answered = page.waitForResponse(response => response.url().endsWith('/prompt_manager/bulk/category'));
+    const answered = page.waitForResponse(response => new URL(response.url()).pathname === IMAGE_CATEGORY);
     await held[0].continue();
     expect((await answered).ok()).toBe(true);
     await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 150)));
@@ -1918,27 +2391,321 @@ test('leaving Images during Set category finishes the write, and the return relo
     await expect(cards(page)).toHaveCount(2);
     await expect(bulkbar(page)).toBeEmpty();
     await expect(cards(page).getByRole('checkbox', { checked: true })).toHaveCount(0);
-    await expect(page.getByRole('combobox', { name: 'Filter by category', exact: true }).locator('option')).toContainText(['Landscapes']);
+    await expect(categoryFilter(page).locator('option')).toContainText(['Landscapes']);
 });
 
-test('Set category limits the field to the server length, shows the server count, and a rejection keeps the selection', async ({ page }) => {
+test('Set category shows the server counts and coded refusals, and a rejection keeps the selection', async ({ page }) => {
     await page.goto(workspace);
     await checkBoth(page);
     const answers = [
         { status: 400, json: { success: false, error: 'Category cannot exceed 100 characters' } },
-        { status: 200, json: { success: true, updated_count: 0 } },
+        { status: 404, json: { success: false, code: 'files-not-found', error: 'None of the images could be found.' } },
+        { status: 200, json: { success: true, category: 'Landscapes', updated: 1, unchanged: 0, not_found: 1 } },
     ];
     await page.route(categoryRoute, route => route.fulfill(answers.shift()));
-    for (const expected of ['Category could not be set. Try again.', 'Category set on 0 prompts.']) {
-        await categoryButton(page).click();
-        const field = categoryDialog(page).getByLabel('Category', { exact: true });
-        await expect(field).toHaveAttribute('maxlength', '100');
-        await field.fill('Landscapes');
-        await categoryDialog(page).getByRole('button', { name: 'Apply', exact: true }).click();
+    for (const expected of ['Category could not be set. Try again.',
+        'None of the selected images could be found. Refresh the images and try again.',
+        'Category “Landscapes” set on 1 image. 1 could not be found.']) {
+        const dialog = await openSetCategory(page);
+        await expect(dialog.getByLabel('Category', { exact: true })).toHaveAttribute('maxlength', '100');
+        await dialog.getByLabel('Category', { exact: true }).fill('Landscapes');
+        await dialog.getByRole('button', { name: 'Apply', exact: true }).click();
         await expect(toast(page)).toHaveText(expected);
         if (answers.length) await expect(bulkbar(page).locator('.bulkbar > strong')).toHaveText('2 selected');
     }
     // The success reload clears the selection.
     await expect(bulkbar(page)).toBeEmpty();
     expect(answers).toHaveLength(0);
+});
+
+// Activity-1 Task 3 (D55): Import → "Scan for metadata" → Review scan opens the concept's "Review metadata scan".
+const scanReview = page => page.getByRole('dialog', { name: 'Review metadata scan', exact: true });
+async function openScanReview(page) {
+    await page.getByRole('button', { name: 'Import', exact: true }).click();
+    const row = importDialog(page).locator('.operation').filter({ has: page.getByRole('heading', { name: 'Scan for metadata', exact: true }) });
+    await row.getByRole('button', { name: 'Review scan', exact: true }).click();
+    await expect(scanReview(page)).toBeVisible();
+}
+
+test('scan for metadata opens the review dialog from Import', async ({ page, request }) => {
+    await expect(await request.post('/__test__/jobs/restart')).toBeOK();
+    await page.setViewportSize({ width: 1600, height: 1100 });
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(2);
+    // Rescan stays the quick refresh; the metadata scan is its own row under it.
+    await page.getByRole('button', { name: 'Import', exact: true }).click();
+    await expect(importDialog(page).locator('.operation h3')).toHaveText(['Inspect a local image', 'Scan an output folder', 'Scan for metadata']);
+    await expect(importDialog(page).locator('.operation').nth(2).locator('p')).toHaveText('Discover and enrich existing files using the configured sources.');
+    await page.keyboard.press('Escape');
+    await openScanReview(page);
+    const dialog = scanReview(page);
+    await expect(dialog.locator('dl.meta-grid > div > dt')).toHaveText(['Sources', 'Scope']);
+    await expect(dialog.locator('dl.meta-grid > div > dd')).toHaveText(['2 output folders', 'New and unresolved files']);
+    await expect(dialog.locator('#modal-body > p.small')).toHaveText('Enrich positive / negative associations, reuse canonical text and report unchanged files. Do not inflate run counts or recreate existing thumbnails.');
+    await expect(dialog.locator('.notice h3')).toHaveText('Back up the database first (recommended)');
+    await expect(dialog.locator('.dialog-actions button')).toHaveText(['Cancel', 'Start scan']);
+    await expect(dialog.getByRole('button', { name: 'Start scan', exact: true })).toHaveClass(/ca-primary/);
+
+    // Back up now downloads the existing backup, toasts, and keeps the dialog open for the scan.
+    const download = page.waitForEvent('download');
+    await dialog.getByRole('button', { name: 'Back up now', exact: true }).click();
+    expect((await download).suggestedFilename()).toMatch(/^prompts_backup_\d{8}_\d{6}\.db$/);
+    await expect(toast(page)).toHaveText('Database backup downloaded.');
+    await expect(dialog).toBeVisible();
+    // A failed backup says so and downloads nothing.
+    await page.route('**/prompt_manager/backup', route => route.fulfill({ status: 500, json: { success: false, error: 'disk full' } }));
+    await dialog.getByRole('button', { name: 'Back up now', exact: true }).click();
+    await expect(toast(page)).toHaveText('The database could not be backed up. Try again.');
+
+    // Cancel closes it and starts nothing.
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await expect(scanReview(page)).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Import', exact: true })).toBeFocused();
+    // No scan started: the one job is the backup's finished registry hold
+    // (#249 S8: a backup download holds a guarded slot while it streams).
+    await expect.poll(async () => (await (await request.get('/prompt_manager/jobs')).json()).jobs
+        .map(job => [job.kind, job.state])).toEqual([['backup', 'finished']]);
+});
+
+// #392 (D135): file-manager selection beyond the concept's checkbox.
+const selectedCount = page => bulkbar(page).locator('.bulkbar > strong');
+const cardAt = (page, index) => page.locator(`article[data-image-key][data-index="${index}"]`);
+const boxAt = (page, index) => cardAt(page, index).getByRole('checkbox', { name: /^Select / });
+const checkedIndexes = page => page.locator('article[data-image-key]').evaluateAll(nodes => nodes
+    .filter(node => node.querySelector('.image-overlays input[type="checkbox"]').checked)
+    .map(node => Number(node.dataset.index)).sort((a, b) => a - b));
+const range = (from, to) => Array.from({ length: to - from + 1 }, (_, index) => from + index);
+async function bulkReset(page, request) {
+    await page.addInitScript(() => { window.IntersectionObserver = undefined; });
+    await expect(await request.post('/__test__/reset', { data: { extra_images: 200 } })).toBeOK();
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(40);
+}
+/** A touch press on `locator` the way a finger makes one: pointerdown, (held), pointerup. */
+const touchDown = locator => locator.evaluate(node => {
+    const { left, top } = node.getBoundingClientRect();
+    node.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, isPrimary: true, pointerType: 'touch', clientX: left + 5, clientY: top + 5 }));
+});
+const touchUpAndClick = locator => locator.evaluate(node => {
+    node.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, isPrimary: true, pointerType: 'touch' }));
+    // A tap's click counts one press (`detail` 1); a keyboard click (and `HTMLElement.click()`) counts none.
+    node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }));
+});
+async function touchTap(locator) {
+    await touchDown(locator);
+    await touchUpAndClick(locator);
+}
+
+test('Shift+click selects a range across an appended batch in Grid, List and Masonry', async ({ page, request }) => {
+    await bulkReset(page, request);
+    await page.getByRole('button', { name: 'Load more images', exact: true }).click();
+    await expect(caption(page)).toContainText('80 of 202 images');
+    for (const mode of ['Grid', 'List', 'Masonry']) {
+        await page.getByRole('group', { name: 'Image layout', exact: true }).getByRole('button', { name: mode, exact: true }).click();
+        // The anchor is the last image toggled on its own (List hides the concept's checkbox: the card carries it).
+        await cardAt(page, 3).locator('.media-info h3').click({ modifiers: ['ControlOrMeta'] });
+        await expect(selectedCount(page)).toHaveText('1 selected');
+        // The range runs into the second batch (index 40 on), and backwards from the same anchor.
+        await cardAt(page, 45).locator('.media-info h3').click({ modifiers: ['Shift'] });
+        await expect(selectedCount(page)).toHaveText('43 selected');
+        expect(await checkedIndexes(page)).toEqual(range(3, 45));
+        await cardAt(page, 0).locator('.media-info h3').click({ modifiers: ['Shift'] });
+        await expect(selectedCount(page)).toHaveText('46 selected');
+        expect(await checkedIndexes(page)).toEqual(range(0, 45));
+        await expect(page.locator('dialog[open]')).toHaveCount(0);
+        if (mode !== 'List') {
+            // A Shift+click on a checkbox gives its range the box's new state: here, unchecked.
+            await boxAt(page, 3).uncheck();
+            await boxAt(page, 10).click({ modifiers: ['Shift'] });
+            await expect(boxAt(page, 10)).not.toBeChecked();
+            await expect(selectedCount(page)).toHaveText('38 selected');
+            expect(await checkedIndexes(page)).toEqual([0, 1, 2, ...range(11, 45)]);
+        }
+        await bulkbar(page).getByRole('button', { name: 'Clear', exact: true }).click();
+        await expect(bulkbar(page)).toBeEmpty();
+    }
+});
+
+test('Ctrl/Cmd+click toggles a card without opening it, and a plain click still opens the viewer', async ({ page }) => {
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(2);
+    const first = cards(page).first();
+    const inspectorBefore = await details(page).innerText();
+    await first.getByRole('button', { name: 'Open same.png', exact: true }).click({ modifiers: ['ControlOrMeta'] });
+    await expect(selectedCount(page)).toHaveText('1 selected');
+    await expect(checkbox(first, 'same.png')).toBeChecked();
+    await cards(page).last().getByRole('button', { name: 'Inspect same.png', exact: true }).click({ modifiers: ['ControlOrMeta'] });
+    await expect(selectedCount(page)).toHaveText('2 selected');
+    await star(first, 'same.png').click({ modifiers: ['ControlOrMeta'] });
+    await expect(selectedCount(page)).toHaveText('1 selected');
+    await expect(star(first, 'same.png')).toHaveAttribute('aria-pressed', 'false');
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    expect(await details(page).innerText()).toBe(inspectorBefore);
+    // A plain click keeps its meaning: the image opens the viewer.
+    await first.getByRole('button', { name: 'Open same.png', exact: true }).click();
+    await expect(page.locator('#viewer-dialog[open]')).toHaveCount(1);
+    await expect(selectedCount(page)).toHaveText('1 selected');
+});
+
+test('Ctrl/Cmd+A, Select all N matching and Add tags tag every matching image on the server', async ({ page, request }) => {
+    await bulkReset(page, request);
+    // Ctrl/Cmd+A in the search box stays the field's own.
+    await search(page).focus();
+    await page.keyboard.press('ControlOrMeta+a');
+    await expect(bulkbar(page)).toBeEmpty();
+    await cardAt(page, 0).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('ControlOrMeta+a');
+    await expect(selectedCount(page)).toHaveText('40 selected');
+    const offer = bulkbar(page).getByRole('button', { name: 'Select all 202 matching', exact: true });
+    await expect(offer).toBeVisible();
+    await expect(bulkbar(page).locator('.bulkbar > *').nth(1)).toHaveText('Select all 202 matching');
+    await offer.click();
+    await expect(selectedCount(page)).toHaveText('All 202 matching selected');
+    await expect(offer).toHaveCount(0);
+    await expect(bulkbar(page).getByRole('button', { name: 'Export metadata', exact: true })).toHaveAttribute('aria-disabled', 'true');
+    // A later batch arrives checked.
+    await page.getByRole('button', { name: 'Load more images', exact: true }).click();
+    await expect(caption(page)).toContainText('80 of 202 images');
+    await expect(boxAt(page, 70)).toBeChecked();
+    await expect(selectedCount(page)).toHaveText('All 202 matching selected');
+    // Unchecking one image leaves "all matching": the other loaded images stay selected.
+    await boxAt(page, 0).uncheck();
+    await expect(selectedCount(page)).toHaveText('79 selected');
+    await expect(bulkbar(page).getByRole('button', { name: 'Export metadata', exact: true })).not.toHaveAttribute('aria-disabled', 'true');
+    await cardAt(page, 1).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('ControlOrMeta+a');
+    await bulkbar(page).getByRole('button', { name: 'Select all 202 matching', exact: true }).click();
+    await expect(selectedCount(page)).toHaveText('All 202 matching selected');
+    // Add tags sends the listing filter, not 202 identities, and the server tags every match.
+    await bulkbar(page).getByRole('button', { name: 'Add tags', exact: true }).click();
+    const dialog = page.getByRole('dialog', { name: 'Tag selected images', exact: true });
+    await dialog.getByRole('textbox', { name: 'Tags, separated by commas', exact: true }).fill('picked392');
+    const started = page.waitForRequest(item => item.method() === 'POST' && new URL(item.url()).pathname === '/prompt_manager/jobs/image-tags');
+    await dialog.getByRole('button', { name: 'Apply', exact: true }).click();
+    expect((await started).postDataJSON()).toEqual({ mode: 'add', filter: { sort: 'newest' }, tags: ['picked392'] });
+    await expect.poll(async () => (await (await request.get('/prompt_manager/images/output?mode=workspace&limit=1&tags=picked392')).json()).total,
+        { timeout: 20000 }).toBe(202);
+    await expect(selectedCount(page)).toHaveText('All 202 matching selected');
+    // Escape in the grid clears the selection.
+    await cardAt(page, 2).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('Escape');
+    await expect(bulkbar(page)).toBeEmpty();
+    await expect(boxAt(page, 2)).not.toBeChecked();
+});
+
+test('Shift+arrow keys extend the selection from the focused card, and Escape in the bar clears it', async ({ page, request }) => {
+    await bulkReset(page, request);
+    await cardAt(page, 0).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('Shift+ArrowRight');
+    await page.keyboard.press('Shift+ArrowRight');
+    await expect(cardAt(page, 2).getByRole('button', { name: /^Open / })).toBeFocused();
+    await expect(selectedCount(page)).toHaveText('3 selected');
+    expect(await checkedIndexes(page)).toEqual([0, 1, 2]);
+    // A plain arrow moves without selecting; Shift+End reaches the last loaded card from the same anchor.
+    await page.keyboard.press('ArrowRight');
+    await expect(selectedCount(page)).toHaveText('3 selected');
+    await page.keyboard.press('Shift+End');
+    await expect(selectedCount(page)).toHaveText('40 selected');
+    await bulkbar(page).getByRole('button', { name: 'Clear', exact: true }).focus();
+    await page.keyboard.press('Escape');
+    await expect(bulkbar(page)).toBeEmpty();
+    await expect(page.locator('#workspace-main h1')).toBeFocused();
+});
+
+test('a touch long-press starts selection mode, taps then toggle, and an empty selection ends it', async ({ page }, testInfo) => {
+    await page.goto(workspace);
+    await expect(cards(page)).toHaveCount(2);
+    const [first, second] = [cards(page).first(), cards(page).last()];
+    const open = card => card.getByRole('button', { name: 'Open same.png', exact: true });
+    await touchDown(open(first));
+    // The context menu of a held press belongs to the long press.
+    expect(await open(first).evaluate(node => !node.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })))).toBe(true);
+    // Held: the long press selects the card once its delay passed.
+    await expect(selectedCount(page)).toHaveText('1 selected');
+    await touchUpAndClick(open(first));
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    await expect(checkbox(first, 'same.png')).toBeChecked();
+    // Taps now toggle instead of opening.
+    if (testInfo.project.name === 'touch') await open(second).tap();
+    else await touchTap(open(second));
+    await expect(selectedCount(page)).toHaveText('2 selected');
+    // A keyboard Enter keeps its meaning in touch selection mode: the image opens.
+    await open(first).focus();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#viewer-dialog[open]')).toHaveCount(1);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#viewer-dialog[open]')).toHaveCount(0);
+    await expect(selectedCount(page)).toHaveText('2 selected');
+    await touchTap(open(first));
+    await touchTap(open(second));
+    await expect(bulkbar(page)).toBeEmpty();
+    await expect(page.locator('dialog[open]')).toHaveCount(0);
+    // The selection is empty, so touch selection mode ended: a tap opens the image again.
+    await touchTap(open(first));
+    await expect(page.locator('#viewer-dialog[open]')).toHaveCount(1);
+});
+
+test('all matching sets the category through the listing filter and survives a return visit as the loaded images', async ({ page, request }) => {
+    await bulkReset(page, request);
+    await cardAt(page, 0).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('ControlOrMeta+a');
+    await bulkbar(page).getByRole('button', { name: 'Select all 202 matching', exact: true }).click();
+    // The offer left with its press: focus moves to the bar's first action.
+    await expect(bulkbar(page).getByRole('button', { name: 'Add tags', exact: true })).toBeFocused();
+    await cardAt(page, 0).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('ControlOrMeta+a');
+    await expect(selectedCount(page)).toHaveText('All 202 matching selected');
+    // Export metadata waits for loaded images: a press does nothing.
+    const exportButton = bulkbar(page).getByRole('button', { name: 'Export metadata', exact: true });
+    await expect(exportButton).toHaveAttribute('title', 'Export metadata reads each image in the browser, so it works on loaded images only.');
+    // No match listed any more (a stubbed answer): the not-found sentence, and the selection stays.
+    await page.route(categoryRoute, route => route.fulfill({ status: 404, json: { success: false, code: 'files-not-found', error: 'None of the images could be found.' } }), { times: 1 });
+    await applyCategory(page, 'Bulk392');
+    await expect(toast(page)).toHaveText('None of the selected images could be found. Refresh the images and try again.');
+    await expect(selectedCount(page)).toHaveText('All 202 matching selected');
+    // The real write: one PUT with the listing filter sets every matching image's own category; no prompt changes.
+    const writes = categoryWrites(page);
+    await applyCategory(page, 'Bulk392');
+    await expect(toast(page)).toHaveText('Category “Bulk392” set on 202 images.');
+    expect(writes).toEqual([{ method: 'PUT', path: IMAGE_CATEGORY, body: { filter: { sort: 'newest' }, category: 'Bulk392' } }]);
+    await expect(bulkbar(page)).toBeEmpty();
+    const filtered = await (await request.get('/prompt_manager/images/output?mode=workspace&limit=1&category=Bulk392')).json();
+    expect(filtered.total).toBe(202);
+    expect((await (await request.get('/prompt_manager/library/options')).json()).categories).not.toContain('Bulk392');
+    // A return visit keeps "all matching" as the loaded images, and the offer shows again.
+    await cardAt(page, 0).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('ControlOrMeta+a');
+    await bulkbar(page).getByRole('button', { name: 'Select all 202 matching', exact: true }).click();
+    await page.evaluate(() => { window.location.hash = '/overview'; });
+    await expect(page.locator('#workspace-main h1')).toHaveText('Overview');
+    await page.evaluate(() => { window.location.hash = '/images'; });
+    await expect(selectedCount(page)).toHaveText('40 selected');
+    await expect(bulkbar(page).getByRole('button', { name: 'Select all 202 matching', exact: true })).toBeVisible();
+    // Escape in the bar with nothing selected does nothing; with a selection it clears.
+    await bulkbar(page).getByRole('button', { name: 'Clear', exact: true }).focus();
+    await page.keyboard.press('Escape');
+    await expect(bulkbar(page)).toBeEmpty();
+});
+
+test('all matching over 10,000 images says so before any dialog or request', async ({ page, request }) => {
+    await page.route(url => url.pathname === '/prompt_manager/images/output' && url.searchParams.get('limit') !== '1', async route => {
+        const response = await route.fetch();
+        const body = await response.json();
+        await route.fulfill({ response, json: { ...body, total: 20002 } });
+    });
+    await bulkReset(page, request);
+    await cardAt(page, 0).getByRole('button', { name: /^Open / }).focus();
+    await page.keyboard.press('ControlOrMeta+a');
+    await bulkbar(page).getByRole('button', { name: 'Select all 20,002 matching', exact: true }).click();
+    await expect(selectedCount(page)).toHaveText('All 20,002 matching selected');
+    let posted = 0;
+    page.on('request', item => { if (item.method() !== 'GET') posted += 1; });
+    // Set category names at most 500 images (#332); the tagging jobs take up to 10,000.
+    for (const [action, sentence] of [['Set category', 'Select at most 500 images.'], ['Add tags', 'Narrow the view to at most 10,000 images.'],
+        ['Auto-tag selected', 'Narrow the view to at most 10,000 images.']]) {
+        await bulkbar(page).getByRole('button', { name: action, exact: true }).click();
+        await expect(toast(page)).toHaveText(sentence);
+        await expect(page.locator('dialog[open]')).toHaveCount(0);
+    }
+    expect(posted).toBe(0);
 });

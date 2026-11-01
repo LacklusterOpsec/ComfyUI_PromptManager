@@ -1,8 +1,11 @@
 """Native library endpoints use bounded cursors and rooted media identities."""
 
 import json
+import os
 import unittest
 from unittest.mock import patch
+
+from utils.hashing import generate_prompt_hash
 
 try:
     from test_api_images import ImageAPITestCase, make_png
@@ -57,6 +60,32 @@ class TestLibraryAPI(ImageAPITestCase):
             self.assertEqual(response.status, 400)
             self.assertNotIn(str(self.comfy_dir), json.dumps(result))
 
+    async def test_untagged_tag_mode_lists_parents_without_tags(self):
+        self._save_prompt("plain one")
+        self._save_prompt("plain two")
+        self._save_prompt("tagged", tags=["t"])
+        self.api.db.save_prompt_pair("pair tagged", "noise", tags=["p"])
+        _, first = await self.get(limit=1, tag_mode="untagged")
+        self.assertEqual(first["total"], 2)
+        self.assertEqual(first["tag_mode"], "untagged")
+        _, second = await self.get(
+            limit=1, tag_mode="untagged", cursor=first["next_cursor"]
+        )
+        self.assertEqual(
+            sorted([first["items"][0]["text"], second["items"][0]["text"]]),
+            ["plain one", "plain two"],
+        )
+        _, default = await self.get(tag_mode="all")
+        self.assertEqual(default["total"], 4)
+        for params in (
+            {"tag_mode": "untagged", "tag": "t"},
+            {"tag_mode": "sql"},
+            {"cursor": first["next_cursor"]},
+        ):
+            response, result = await self.get(limit=1, **params)
+            self.assertEqual(response.status, 400, params)
+            self.assertEqual(result["success"], False)
+
     async def test_outside_missing_and_unsupported_media_do_not_leak_or_scan(self):
         positive = self._save_prompt("Cat")
         outside = make_png(self.comfy_dir / "outside.png")
@@ -93,6 +122,72 @@ class TestLibraryAPI(ImageAPITestCase):
                 "categories": ["Legacy", "Pair-only"],
             },
         )
+
+    async def test_folder_filter_lists_and_matches_prompts_by_output_folder(self):
+        deep = self._save_prompt("deep")
+        top = self._save_prompt("top")
+        other = self._save_prompt("other")
+        self._save_prompt("no images")
+        for prompt, parts in ((deep, ("a", "b")), (top, ("a",)), (other, ("ab",))):
+            path = make_png(self.output_dir.joinpath(*parts, f"{prompt}.png"))
+            self.api.db.link_image_to_prompt(prompt, str(path))
+        response, options = await self.get("/options", include="folders")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(options["folders"], ["a", "a/b", "ab"])
+        _, plain = await self.get("/options")
+        self.assertNotIn("folders", plain)
+        _, first = await self.get(folder="a", limit=1)
+        self.assertEqual((first["total"], first["folder"]), (2, "a"))
+        # Outer slashes are dropped (a backslash separates only on Windows).
+        outer = "\\a\\" if os.name == "nt" else "/a/"
+        _, second = await self.get(folder=outer, limit=1, cursor=first["next_cursor"])
+        self.assertEqual(
+            sorted([first["items"][0]["text"], second["items"][0]["text"]]),
+            ["deep", "top"],
+        )
+        _, all_rows = await self.get()
+        self.assertEqual((all_rows["total"], all_rows["folder"]), (4, ""))
+        for params in (
+            {"folder": "a/../ab"},
+            *([{"folder": "C:/x"}] if os.name == "nt" else []),
+            {"folder": "b", "cursor": first["next_cursor"]},
+            {"cursor": first["next_cursor"]},
+        ):
+            response, result = await self.get(limit=1, **params)
+            self.assertEqual(response.status, 400, params)
+            self.assertEqual(result["success"], False)
+        response, _ = await self.get("/options", include="tags")
+        self.assertEqual(response.status, 400)
+
+    @unittest.skipIf(os.name == "nt", "a backslash is a separator on Windows")
+    async def test_a_posix_folder_name_with_a_backslash_filters_its_prompts(self):
+        prompt = self._save_prompt("klein")
+        name = "Metadata\\Klein_4b Wildcard Run"
+        path = make_png(self.output_dir / name / "x.png")
+        self.api.db.link_image_to_prompt(prompt, str(path))
+        _, options = await self.get("/options", include="folders")
+        self.assertIn(name, options["folders"])
+        _, result = await self.get(folder=name)
+        self.assertEqual((result["total"], result["folder"]), (1, name))
+
+    async def test_any_tag_mode_is_sent_through_and_echoed(self):
+        self._save_prompt("a only", tags=["a"])
+        self._save_prompt("b only", tags=["b"])
+        self._save_prompt("neither")
+        _, result = await self.get(tag=["a", "b"], tag_mode="any")
+        self.assertEqual(result["tag_mode"], "any")
+        self.assertEqual(
+            sorted(i["text"] for i in result["items"]), ["a only", "b only"]
+        )
+        _, both = await self.get(tag=["a", "b"])
+        self.assertEqual((both["total"], both["tag_mode"]), (0, "all"))
+        _, first = await self.get(tag=["a", "b"], tag_mode="any", limit=1)
+        response, _ = await self.get(
+            tag=["a", "b"], limit=1, cursor=first["next_cursor"]
+        )
+        self.assertEqual(response.status, 400)
+        response, _ = await self.get(tag_mode="or")
+        self.assertEqual(response.status, 400)
 
     async def test_variant_cursor_is_positive_scoped_and_required_limits_are_bounded(
         self,
@@ -375,11 +470,54 @@ class TestLibraryAPI(ImageAPITestCase):
             result["image"],
             {"root_index": 0, "path": relative, "filename": "猫 % #.png"},
         )
-        self.assertEqual(result["library"]["metadata_scope"], "pair")
+        # D39: the recipe has no category or tags, so both fall back.
+        self.assertEqual(result["library"]["category_scope"], "positive")
+        self.assertEqual(result["library"]["tags_scope"], "positive")
         self.assertEqual(result["library"]["pair_id"], pair)
         self.assertEqual(result["library"]["positive_id"], positive)
         # D10/D20: the linked positive's title; "Pair title" names the variant.
         self.assertEqual(result["library"]["title"], "Positive title")
+
+    async def test_library_gallery_reports_favorites_with_one_lookup_per_page(self):
+        # The Library-embedded media cards carry the Images star (#249 PR E):
+        # favorites come from the store keyed by root and relative path.
+        pair = self.api.db.save_prompt_pair("Cat", "Noise")
+        positive = self.api.db.get_prompt_pair(pair)["positive_prompt_id"]
+        for index in range(5):
+            path = make_png(self.output_dir / "sub" / f"{index}.png")
+            image = self.api.db.link_image_to_prompt(positive, str(path))
+            self.api.db.link_image_to_pair(pair, image, {"source": "fixture"})
+        response = await self.client.put(
+            "/prompt_manager/images/favorite",
+            json={"root_index": 0, "path": "sub/3.png"},
+        )
+        self.assertEqual(response.status, 200)
+        lookups = []
+        original = self.api.db.get_image_favorites
+
+        def counted(root_key, paths):
+            lookups.append(list(paths))
+            return original(root_key, paths)
+
+        with patch.object(self.api.db, "get_image_favorites", side_effect=counted):
+            _, gallery = await self.get(f"/{positive}/images", pair_id=pair)
+        stars = {image["path"]: image["favorite"] for image in gallery["images"]}
+        self.assertEqual(stars, {f"sub/{index}.png": index == 3 for index in range(5)})
+        # One batched read per page, never one per card.
+        self.assertEqual([len(paths) for paths in lookups], [5])
+        # Shelf previews show no star and read no favorites.
+        lookups.clear()
+        with patch.object(self.api.db, "get_image_favorites", side_effect=counted):
+            _, listing = await self.get()
+        self.assertEqual(lookups, [])
+        self.assertNotIn("favorite", listing["items"][0]["previews"][0])
+        response = await self.client.delete(
+            "/prompt_manager/images/favorite",
+            json={"root_index": 0, "path": "sub/3.png"},
+        )
+        self.assertEqual(response.status, 200)
+        _, gallery = await self.get(f"/{positive}/images", pair_id=pair)
+        self.assertFalse(any(image["favorite"] for image in gallery["images"]))
 
     async def test_epoch_scoped_all_library_cursors(self):
         from database.execution_history_schema import rotate_history_epoch
@@ -933,6 +1071,186 @@ class TestLibraryAPI(ImageAPITestCase):
         self.assertEqual(response.status, 400)
         self.assertEqual(result["error"], "Invalid positive prompt ID")
         self.assertNotIn("literal", json.dumps(result))
+
+
+class TestLibraryLoraMedia(ImageAPITestCase):
+    """#355 (G6): media a LoRA import linked outside the output folders shows
+    on the Library page and opens in the inspector while the integration is on."""
+
+    async def setUpAsync(self):
+        await super().setUpAsync()
+        import tempfile
+        from pathlib import Path
+
+        self._lora_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._lora_tmp.cleanup)
+        self.lora_dir = Path(self._lora_tmp.name).resolve() / "sidecars"
+        self.lora_dir.mkdir()
+        self.lora_on = True
+        self.api._lora_image_dirs = lambda: [self.lora_dir] if self.lora_on else []
+
+    async def get(self, path="", **params):
+        response = await self.client.get(
+            "/prompt_manager/library" + path, params=params
+        )
+        return response, await response.json()
+
+    def _imported(self):
+        """A LoRA prompt linked like the import links it: the cover first."""
+        still = make_png(self.lora_dir / "abc" / "cover.png")
+        video = self.lora_dir / "abc" / "clip.mp4"
+        video.write_bytes(b"video")
+        self.api.db.replace_category_prompts(
+            "lora-manager",
+            [
+                {
+                    "name": "neon",
+                    "text": "neon street",
+                    "hash": generate_prompt_hash("neon street"),
+                    "tags": ["lora-manager"],
+                    "images": [str(still), str(video)],
+                }
+            ],
+        )
+        positive = self.api.db.search_prompts(category="lora-manager")[0]["id"]
+        ids = {
+            os.path.basename(row["image_path"]): row["id"]
+            for row in self.api.db.get_prompt_images(positive)
+        }
+        return positive, ids
+
+    async def test_list_previews_show_linked_lora_media_cover_first(self):
+        positive, _ids = self._imported()
+        response, result = await self.get()
+        self.assertEqual(response.status, 200, result)
+        item = next(i for i in result["items"] if i["id"] == positive)
+        previews = item["previews"]
+        self.assertEqual([p["filename"] for p in previews], ["cover.png", "clip.mp4"])
+        # The media keeps the rooted identity every workspace view checks; no
+        # preview is made inside LoraManager's folders, so the card loads the
+        # original and a video shows its label.
+        self.assertEqual({p["root_index"] for p in previews}, {1})
+        self.assertTrue(
+            all(
+                p["url"].startswith("/prompt_manager/images/serve/abc/")
+                for p in previews
+            )
+        )
+        self.assertEqual([p["thumbnail_url"] for p in previews], [None, None])
+        self.assertEqual([p["is_video"] for p in previews], [False, True])
+        self.assertEqual([p["linked_only"] for p in previews], [True, True])
+        self.assertNotIn(str(self.lora_dir), json.dumps(result))
+        file = await self.client.get(previews[0]["url"])
+        self.assertEqual(file.status, 200)
+        await file.read()
+        self.assertFalse((self.lora_dir / "thumbnails").exists())
+
+    async def test_detail_and_images_page_list_lora_media(self):
+        positive, _ids = self._imported()
+        make_png(self.output_dir / "out.png")
+        _, detail = await self.get(f"/{positive}")
+        self.assertEqual(
+            [p["filename"] for p in detail["positive"]["previews"]],
+            ["cover.png", "clip.mp4"],
+        )
+        _, page = await self.get(f"/{positive}/images")
+        self.assertEqual(
+            [i["filename"] for i in page["images"]], ["cover.png", "clip.mp4"]
+        )
+        # No favorite star: favorites belong to output listings.
+        self.assertNotIn("favorite", page["images"][0])
+        self.assertTrue(page["images"][0]["linked_only"])
+
+    async def test_inspector_reads_lora_media_by_its_root(self):
+        positive, _ids = self._imported()
+        _, page = await self.get(f"/{positive}/images")
+        image = page["images"][0]
+        response = await self.client.get(
+            "/prompt_manager/images/inspect/" + image["path"],
+            params={
+                "root": str(image["root_index"]),
+                "root_scope": image["root_scope"],
+            },
+        )
+        self.assertEqual(response.status, 200, await response.text())
+
+    async def test_the_inspector_reads_only_linked_files_under_a_lora_root(self):
+        # Security review: a LoRA root exposes only the files the import linked.
+        self._imported()
+        make_png(self.lora_dir / "abc" / "unlinked.png")
+        scope = self.api._gallery_root_scope(self.lora_dir, 1)
+        for name, status in (("unlinked.png", 403), ("cover.png", 200)):
+            with self.subTest(name=name):
+                response = await self.client.get(
+                    "/prompt_manager/images/inspect/abc/" + name,
+                    params={"root": "1", "root_scope": scope},
+                )
+                self.assertEqual(response.status, status, await response.text())
+
+    async def test_only_recorded_lora_media_is_served_by_path(self):
+        self._imported()
+        make_png(self.lora_dir / "abc" / "unlinked.png")
+        served = await self.client.get(
+            "/prompt_manager/images/serve/abc/cover.png", params={"root": "1"}
+        )
+        self.assertEqual(served.status, 200)
+        await served.read()
+        unlinked = await self.client.get(
+            "/prompt_manager/images/serve/abc/unlinked.png", params={"root": "1"}
+        )
+        self.assertEqual(unlinked.status, 403)
+        preview = await self.client.get(
+            "/prompt_manager/images/serve/thumbnails/abc/cover_thumb.webp",
+            params={"root": "1"},
+        )
+        self.assertEqual(preview.status, 403)
+        self.assertFalse((self.lora_dir / "thumbnails").exists())
+        # Without a root, only the output folders are searched.
+        unrooted = await self.client.get("/prompt_manager/images/serve/abc/cover.png")
+        self.assertEqual(unrooted.status, 404)
+
+    async def test_a_download_recorded_through_a_symlinked_cache_is_served(self):
+        from pathlib import Path
+
+        real = self.lora_dir.parent / "real-cache"
+        real.mkdir()
+        link = self.lora_dir.parent / "cache-link"
+        try:
+            os.symlink(real, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are not available here")
+        self.api._lora_image_dirs = lambda: [link]
+        image = make_png(real / "neon" / "a1b2.jpg")
+        stored = str(link / "neon" / "a1b2.jpg")
+        positive = self._save_prompt("downloaded")
+        self.api.db.link_image_to_prompt(positive, stored)
+        _, page = await self.get(f"/{positive}/images")
+        self.assertEqual([i["filename"] for i in page["images"]], [image.name])
+        served = await self.client.get(page["images"][0]["url"])
+        self.assertEqual(served.status, 200)
+        await served.read()
+        self.assertTrue(Path(stored).is_file())
+
+    async def test_a_malformed_root_is_refused_not_an_error(self):
+        response = await self.client.get(
+            "/prompt_manager/images/serve/abc/cover.png", params={"root": "\u00b2"}
+        )
+        self.assertEqual(response.status, 403)
+
+    async def test_lora_media_is_hidden_while_the_integration_is_off(self):
+        positive, _ids = self._imported()
+        self.lora_on = False
+        _, result = await self.get()
+        item = next(i for i in result["items"] if i["id"] == positive)
+        self.assertEqual(item["previews"], [])
+        response = await self.client.get(
+            "/prompt_manager/images/inspect/abc/cover.png", params={"root": "1"}
+        )
+        self.assertEqual(response.status, 400)
+        served = await self.client.get(
+            "/prompt_manager/images/serve/abc/cover.png", params={"root": "1"}
+        )
+        self.assertEqual(served.status, 403)
 
 
 class TestNameCursorBudget(unittest.TestCase):

@@ -18,8 +18,9 @@ Typical usage:
 The system automatically:
 - Detects new image files in monitored directories
 - Extracts ComfyUI workflow metadata from PNG chunks
-- Links images to active prompts using the prompt tracker
-- Handles fallback linking when no active prompt is available
+- Links images to tracked prompts only when the image's own graph proves the
+  tracked entry belongs to its run (``utils.run_keys``)
+- Leaves an image unlinked when nothing certain identifies its prompt (#342)
 - Provides status information and monitoring control
 """
 
@@ -27,26 +28,134 @@ import os
 import queue
 import time
 import threading
-from typing import Optional, Dict, Any, Tuple
+from collections import OrderedDict
+from typing import Callable, Optional, Dict, Any, List, Tuple
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+from .file_prompt import HISTORY, NOT_SAVED, NOT_SAVED_WIRED
+from .foreign_runs import (
+    ANCHORED_SOURCES,
+    CERTAIN,
+    NOT_SAVED_KINDS,
+    ForeignRecheck,
+    decide_foreign,
+    history_lookup,
+    save_foreign_runs,
+    store_foreign,
+)
 from .hashing import generate_prompt_hash
+from .media_folders import in_skipped_folder
 from .metadata_extractor import ComfyUIMetadataExtractor
+from .parallel import note_refusal, refused_at_shutdown
 from .logging_config import get_logger
-from .prompt_graph import resolve_text, run_prompt_nodes
+from .prompt_graph import (
+    metadata_opted_out,
+    resolve_text,
+    run_prompt_nodes,
+    save_setting,
+    side_opted_out,
+)
 from .prompt_pair_resolver import resolve_prompt_pair
+from .run_keys import image_run_keys
+from .usage_tracking import survive_switch
 
 try:
     from ..database.pair_ingestion import ingest_resolved_pair
+    from ..database.run_attribution import (
+        host_output_directory,
+        in_output_folder,
+        stored_run_prompt,
+        subscribe_outputs_sealed,
+    )
 except ImportError:
     from database.pair_ingestion import ingest_resolved_pair
+    from database.run_attribution import (
+        host_output_directory,
+        in_output_folder,
+        stored_run_prompt,
+        subscribe_outputs_sealed,
+    )
 
 # Upper bound on images waiting to be processed (a burst beyond this is skipped)
 MAX_PENDING_IMAGES = 1000
 # A file counts as fully written once its size is unchanged across two reads
 SETTLE_INTERVAL_SECONDS = 0.1
 SETTLE_ATTEMPTS = 20
+# Keyless images (no embedded API graph) left unlinked wait for their run's
+# recorded outputs for one history-only re-check (#342): at most this many,
+# each for at most this long.
+MAX_AWAITING_HISTORY = 1000
+AWAIT_HISTORY_SECONDS = 3600
+# ``schedule`` snapshot meaning "history-only re-check" (not a new image)
+HISTORY_ONLY = object()
+# How long a stop waits for the image worker, and for the watchdog observer
+# after its stop (#302). Every wait before the image in hand is interrupted
+# at once, so a bound is reached only while one image is still being linked.
+WORKER_JOIN_SECONDS = 5.0
+OBSERVER_JOIN_SECONDS = 5.0
+
+
+def _start_daemon_observer(observer) -> None:
+    """``observer.start()`` on a short-lived daemon thread (#561).
+
+    A thread is a daemon when the thread that creates it is one. watchdog
+    7 on Windows starts a plain ``threading.Thread`` per watch inside
+    ``start()``; created from ComfyUI's main thread it is not a daemon, and
+    the interpreter waits for every such thread before it runs any
+    ``atexit`` callback, so the teardown that would stop it never runs.
+    Started from here, every thread the observer creates is a daemon.
+    Waits for the start without a limit (start-up, not exit); re-raises
+    what ``start()`` raised.
+    """
+    raised: List[BaseException] = []
+
+    def start() -> None:
+        try:
+            observer.start()
+        # BaseException on purpose: a KeyboardInterrupt or SystemExit raised
+        # by start() is not lost on this thread; _start_daemon_observer
+        # re-raises it on the caller's thread below.
+        except BaseException as e:
+            raised.append(e)
+
+    starter = threading.Thread(
+        target=start, name="PromptManagerObserverStart", daemon=True
+    )
+    starter.start()
+    starter.join()
+    if raised:
+        raise raised[0]
+
+
+class _ObserverStop:
+    """One ``observer.stop()`` running on a daemon thread (#561).
+
+    watchdog's ``stop()`` joins its emitters (and, in 7.x on Windows, their
+    reader threads) without a limit. Run here, a stop that never returns
+    holds neither the caller past its deadline nor the interpreter's exit.
+    """
+
+    def __init__(self, observer) -> None:
+        self.error: Optional[Exception] = None
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(observer,),
+            name="PromptManagerObserverStop",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self, observer) -> None:
+        try:
+            observer.stop()
+        except Exception as e:  # reported by the stop that waits for it
+            self.error = e
+
+    def wait(self, timeout: float) -> bool:
+        """True once ``stop()`` has returned or raised."""
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
 
 
 class ImageGenerationHandler(FileSystemEventHandler):
@@ -75,6 +184,18 @@ class ImageGenerationHandler(FileSystemEventHandler):
         self.prompt_tracker = prompt_tracker
         self.metadata_extractor = ComfyUIMetadataExtractor()
         self.logger = get_logger("prompt_manager.image_monitor")
+        # The Needs review pass for ambiguous outputs (the API's
+        # ``record_review_file``, wired at start-up): a linked output is
+        # never queued and its pending items leave the queue. None: no pass.
+        self.review_recorder: Optional[Callable[[str], str]] = None
+        # Queues a settled output's preview (the API's
+        # ``queue_capture_thumbnail``, wired at start-up; #249). It only
+        # queues: the preview is written on its own worker. None: no queue.
+        self.thumbnail_queue: Optional[Callable[[str], str]] = None
+        # Told about every settled output, with its resolved path (the API's
+        # ``notify_output_settled``, wired at start-up; #348): the Images
+        # listing walks that root again. None: nobody is told.
+        self.output_listener: Optional[Callable[[str], None]] = None
 
         # Read from GalleryConfig if available, otherwise use defaults
         try:
@@ -88,6 +209,10 @@ class ImageGenerationHandler(FileSystemEventHandler):
 
         # Settle check: the file size must be unchanged across two reads
         self.settle_interval = SETTLE_INTERVAL_SECONDS
+        # The folders this handler is scheduled on (#501): the folder skip only
+        # tests the folders below them, so a source named like a trash folder
+        # is still watched.
+        self.watched_roots = ()
         self.settle_attempts = SETTLE_ATTEMPTS
 
         # Images scheduled but not yet processed: path -> (prompt snapshot, due time).
@@ -100,6 +225,24 @@ class ImageGenerationHandler(FileSystemEventHandler):
         self._work: "queue.Queue[Optional[str]]" = queue.Queue()
         self._stop = threading.Event()
         self._worker: Optional[threading.Thread] = None
+        # Keyless unlinked images awaiting their run's recorded outputs:
+        # normalized path -> (path, monotonic deadline), oldest first.
+        self._awaiting: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+        # Sealed re-checks ``schedule`` refused (the path still pending, or the
+        # pending set full): retried each time a pending image finishes.
+        self._history_due: "OrderedDict[str, None]" = OrderedDict()
+        # The same two sets for foreign outputs (#247), apart so a large
+        # foreign run never evicts a waiting keyless file; the due set keeps
+        # each file's sealed output reference.
+        self._awaiting_foreign: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+        self._foreign_due: "OrderedDict[str, dict]" = OrderedDict()
+        self._awaiting_lock = threading.Lock()
+        self._sealed_subscribed = False
+        # Set by ``close``: no new work, no new worker, ever (#302).
+        self._closed = False
+        # Workers a stop signalled that had not ended yet: every later stop
+        # waits for them again, so it never reports True too early.
+        self._finishing: List[threading.Thread] = []
 
     def on_created(self, event):
         """Handle filesystem creation events.
@@ -114,18 +257,24 @@ class ImageGenerationHandler(FileSystemEventHandler):
         Args:
             event: FileSystemEvent object containing event details
         """
+        # Closed: return before any log or tracker lock, so watchdog's
+        # ``observer.stop()`` never waits on this dispatch.
+        if self._closed:
+            return
         if event.is_directory or not self.is_image_file(event.src_path):
             return
         self.logger.info(f"New image detected: {event.src_path}")
-        # Snapshot prompt context NOW before the delay — in batch workflows
-        # the tracker advances to the next prompt before images are processed.
-        prompt_snapshot = self.prompt_tracker.get_current_prompt()
-        if prompt_snapshot:
-            self.logger.debug(
-                f"Snapshot prompt {prompt_snapshot.get('id', '?')} for "
-                f"{os.path.basename(event.src_path)}"
-            )
-        self.schedule(event.src_path, prompt_snapshot)
+        # Snapshot the tracked runs NOW, before the delay: a later run may
+        # execute the same node again before this image is processed.
+        self.schedule(event.src_path, self._keyed_snapshot())
+
+    def _keyed_snapshot(self):
+        """The tracker's latest entry per run key, or None when unavailable."""
+        try:
+            return self.prompt_tracker.keyed_snapshot()
+        except Exception as error:
+            self.logger.warning(f"Could not snapshot tracked prompts: {error}")
+            return None
 
     def schedule(self, image_path: str, prompt_snapshot=None) -> bool:
         """Queue an image for processing on the worker thread, once per path.
@@ -135,9 +284,13 @@ class ImageGenerationHandler(FileSystemEventHandler):
         and once its size has stopped changing.
 
         Returns:
-            False when the path is already pending or the pending set is full
+            False when the path is already pending, the pending set is full,
+            the handler is closed or the interpreter is exiting (its worker
+            cannot start)
         """
         with self._pending_lock:
+            if self._closed:
+                return False
             if image_path in self._pending:
                 self.logger.debug(f"Already pending, not rescheduled: {image_path}")
                 return False
@@ -149,7 +302,15 @@ class ImageGenerationHandler(FileSystemEventHandler):
                 return False
             due = time.monotonic() + self.processing_delay
             self._pending[image_path] = (prompt_snapshot, due)
-            self._ensure_worker()
+            try:
+                self._ensure_worker()
+            except RuntimeError as error:
+                # No worker will ever take it: never leave it pending (#375).
+                self._pending.pop(image_path, None)
+                if not refused_at_shutdown(error):
+                    raise
+                note_refusal(self.logger, "The image worker")
+                return False
             self._work.put(image_path)
         return True
 
@@ -158,21 +319,64 @@ class ImageGenerationHandler(FileSystemEventHandler):
         with self._pending_lock:
             return len(self._pending)
 
-    def shutdown(self) -> None:
-        """Stop the worker thread and drop every image still waiting.
+    def shutdown(self, timeout: float = WORKER_JOIN_SECONDS) -> bool:
+        """Stop the worker thread, drop every image still waiting, and wait
+        for the worker within ``timeout`` seconds.
 
-        The worker wakes from any delay or settle wait, finishes nothing more
-        and exits; the next ``schedule`` starts a fresh worker with its own
-        queue. Safe to call repeatedly and before anything was scheduled.
+        The worker wakes from any delay or settle wait, finishes at most the
+        image in hand and exits; the next ``schedule`` starts a fresh worker
+        with its own queue (use ``close`` for a final stop). Safe to call
+        repeatedly and before anything was scheduled.
+
+        Returns:
+            True when no worker is left running. False when the worker is
+            still finishing its image after ``timeout`` (a warning is
+            logged), or when called on the worker itself (it only signals).
         """
+        with self._awaiting_lock:
+            self._awaiting.clear()
+            self._history_due.clear()
+            self._awaiting_foreign.clear()
+            self._foreign_due.clear()
         with self._pending_lock:
             self._pending.clear()
             worker, self._worker = self._worker, None
             work, self._work = self._work, queue.Queue()
             stop, self._stop = self._stop, threading.Event()
+            if worker is not None:
+                self._finishing.append(worker)
+            finishing = [w for w in self._finishing if w.is_alive()]
+            self._finishing = finishing
         stop.set()
         if worker is not None and worker.is_alive():
             work.put(None)  # sentinel: wake a worker idle on an empty queue
+        if threading.current_thread() in finishing:
+            self.logger.debug("shutdown called on the image worker itself")
+            return False
+        deadline = time.monotonic() + timeout
+        for thread in finishing:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        with self._pending_lock:
+            self._finishing = [w for w in self._finishing if w.is_alive()]
+            still_running = bool(self._finishing)
+        if still_running:
+            self.logger.warning(
+                f"image worker still running after {timeout} s; "
+                "it stops after the image in hand"
+            )
+            return False
+        return True
+
+    def close(self, timeout: float = WORKER_JOIN_SECONDS) -> bool:
+        """Final stop: ``shutdown`` and refuse every later ``schedule``.
+
+        After ``close`` no worker starts again, not even from a sealed run's
+        history re-check on the history writer's thread. Returns what
+        ``shutdown`` returns.
+        """
+        with self._pending_lock:
+            self._closed = True
+        return self.shutdown(timeout)
 
     def _ensure_worker(self) -> None:
         """Start the single daemon worker thread if it isn't running.
@@ -215,10 +419,54 @@ class ImageGenerationHandler(FileSystemEventHandler):
                         f"Image never settled or vanished, skipping: {image_path}"
                     )
                 return
-            self.process_new_image(image_path, prompt_snapshot=prompt_snapshot)
+            try:
+                self.process_new_image(image_path, prompt_snapshot=prompt_snapshot)
+                self._queue_thumbnail(image_path)
+            finally:
+                # Linked or not, even if linking raised: the file exists.
+                self._report_output(image_path)
         finally:
             with self._pending_lock:
                 self._pending.pop(image_path, None)
+            self._drain_history_due()
+
+    def _queue_thumbnail(self, image_path: str) -> None:
+        """Queue a settled output's preview, best effort (linked or not).
+
+        A failure is logged, never raised: the preview is then made on its
+        first view.
+        """
+        queue_preview = getattr(self, "thumbnail_queue", None)
+        if queue_preview is None:
+            return
+        try:
+            outcome = queue_preview(image_path)
+        except Exception:
+            self.logger.warning(
+                f"Preview of {os.path.basename(image_path)} could not be queued",
+                exc_info=True,
+            )
+            return
+        self.logger.debug(f"Preview {outcome}: {os.path.basename(image_path)}")
+
+    def _report_output(self, image_path: str) -> None:
+        """Tell the output listener a settled output exists, best effort.
+
+        The path is resolved here, on the worker thread, so the listener's
+        event loop does no file I/O. A failure is logged, never raised: the
+        output is then listed by the listing's 30 s refresh.
+        """
+        listener = getattr(self, "output_listener", None)
+        if listener is None:
+            return
+        try:
+            listener(os.path.realpath(image_path))
+        except Exception:
+            self.logger.warning(
+                f"{os.path.basename(image_path)} could not be reported to the "
+                "Images listing",
+                exc_info=True,
+            )
 
     def wait_until_settled(self, image_path: str, stop=None) -> bool:
         """True once the file's size is non-zero and unchanged across two reads.
@@ -247,13 +495,31 @@ class ImageGenerationHandler(FileSystemEventHandler):
 
         Returns:
             True if the file has a supported image extension and is not
-            inside a thumbnails directory, False otherwise
+            inside a thumbnails or trash folder, False otherwise
         """
-        # Skip files in thumbnails directory - those are derivatives, not
-        # generated images
-        if "/thumbnails/" in filepath or "\\thumbnails\\" in filepath:
+        # Previews are derivatives, and a trash folder inside an output
+        # folder holds thrown-away files (#501): neither is a new output.
+        if in_skipped_folder(self._folders_below_root(filepath)):
             return False
         return filepath.lower().endswith(self.supported_extensions)
+
+    def _folders_below_root(self, filepath: str) -> list:
+        """The folder names of *filepath* below the longest watched root.
+
+        Without a watched root holding it (a handler used on its own), every
+        folder of the path counts.
+        """
+        text = os.path.abspath(filepath)
+        holding = [
+            root
+            for root in getattr(self, "watched_roots", ())
+            if os.path.normcase(text).startswith(
+                os.path.normcase(os.path.join(root, ""))
+            )
+        ]
+        if holding:
+            text = text[len(os.path.join(max(holding, key=len), "")) :]
+        return text.replace("\\", "/").split("/")[:-1]
 
     def process_new_image(self, image_path: str, prompt_snapshot=None):
         """Process a newly created image file for gallery integration.
@@ -261,15 +527,23 @@ class ImageGenerationHandler(FileSystemEventHandler):
         This method handles the complete processing pipeline for a new image:
         1. Verifies the file still exists
         2. Extracts ComfyUI metadata from the image
-        3. Tries to identify the correct prompt via metadata-based lookup
-        4. Falls back to the prompt snapshot captured at event time
-        5. Links the image to the appropriate prompt in the database
+        3. Identifies the prompt from the image's metadata, else from a tracked
+           run the image's graph proves (``_find_prompt_from_run``)
+        4. Links the image to that prompt, or leaves it unlinked when nothing
+           certain identifies it (logged at info; #342)
 
         Args:
             image_path: Full path to the newly created image file
-            prompt_snapshot: Prompt context captured at file-creation time (optional)
+            prompt_snapshot: The tracker's keyed snapshot taken when the image
+                appeared (``PromptTracker.keyed_snapshot``); None reads it now
         """
         try:
+            if prompt_snapshot is HISTORY_ONLY:
+                self._recheck_history(image_path)
+                return
+            if isinstance(prompt_snapshot, ForeignRecheck):
+                self._recheck_foreign(image_path, prompt_snapshot.reference)
+                return
             self.logger.info(f"Processing image: {image_path}")
 
             if not os.path.exists(image_path):
@@ -288,55 +562,30 @@ class ImageGenerationHandler(FileSystemEventHandler):
             # that produced this image, independent of node caching and of any
             # negative-prompt PromptManager nodes in the workflow.
             state, current_prompt = self._find_prompt_from_metadata(metadata)
+            if state == "opted_out":
+                self._log_not_saved(image_path)
+                return
             if state == "foreign":
-                # Another workflow saved this image: it belongs to no prompt of
-                # ours, and must not consume a batch queue entry.
-                self.logger.info(
-                    f"No PromptManager prompt in workflow, skipping image: {image_path}"
-                )
+                # Another workflow saved this image: never a batch queue entry
+                # of ours; its own graph may name its prompt (#247).
+                self._ingest_foreign(image_path, metadata)
                 return
             if current_prompt:
                 self.logger.info(
                     f"Metadata match: prompt {current_prompt['id']} for "
                     f"{os.path.basename(image_path)}"
                 )
-
-            # Strategy 2: Pop from batch queue. Batch items (text supplied by
-            # PromptSearchList) share one graph, so metadata can't tell them apart;
-            # they are queued in encoding order and images save in the same order.
-            if not current_prompt:
-                current_prompt = self.prompt_tracker.pop_next_prompt()
-                if current_prompt:
-                    self.logger.info(
-                        f"Queue match: prompt {current_prompt['id']} for "
-                        f"{os.path.basename(image_path)}"
-                    )
-
-            # Strategy 3: Use snapshot captured at file-creation time
-            if not current_prompt and prompt_snapshot:
-                current_prompt = prompt_snapshot
-                self.logger.info(
-                    f"Snapshot match: prompt {current_prompt.get('id', 'unknown')}"
+            else:
+                current_prompt = self._find_prompt_from_run(
+                    image_path, metadata, prompt_snapshot
                 )
-
-            # Strategy 4: Check live prompt tracker
             if not current_prompt:
-                current_prompt = self.prompt_tracker.get_current_prompt()
-                if current_prompt:
-                    self.logger.info(
-                        f"Live tracker match: prompt {current_prompt['id']}"
-                    )
-
-            # Strategy 5: Fallback to most recent prompt in DB
-            if not current_prompt:
-                current_prompt = self._get_fallback_prompt()
-                if current_prompt:
-                    self.logger.debug(f"Fallback match: prompt {current_prompt['id']}")
-                else:
-                    self.logger.warning(
-                        f"No prompt context available, skipping image: {image_path}"
-                    )
-                    return
+                # Nothing certain: never guess from recency or a stale entry (#342)
+                self.logger.info(
+                    "No certain prompt for "
+                    f"{os.path.basename(image_path)}; left unlinked"
+                )
+                return
 
             # Extend timeout if we have an active execution
             if current_prompt.get("execution_id"):
@@ -364,6 +613,351 @@ class ImageGenerationHandler(FileSystemEventHandler):
 
             self.logger.error(traceback.format_exc())
 
+    def _find_prompt_from_run(
+        self, image_path: str, metadata, prompt_snapshot=None
+    ) -> Optional[Dict[str, Any]]:
+        """The prompt a tracked run proves for an image whose metadata can't say.
+
+        Only an entry registered under the run key of the image's own positive
+        node counts (``utils.run_keys``): never the newest prompt in the
+        database and never an entry of another graph (#342).
+
+        The snapshot taken when the image appeared names the key's latest run.
+
+        1. Batch queue: the oldest queued entry of that key from that run.
+           Batch items (text from PromptSearchList) share one key and are
+           linked in order; an empty item's placeholder leaves its image
+           unlinked; entries queued by later runs stay for their own images.
+        2. The snapshot's entry itself, when its run is known and registered
+           exactly one entry for the key (a batch's latest item says nothing
+           about the other images). This covers a cached node that did not
+           run again.
+        3. Recorded execution history: the run that wrote this file names one
+           stored prompt (``database.run_attribution``).
+        """
+        keys = image_run_keys(metadata)
+        name = os.path.basename(image_path)
+        if not keys:
+            # No tracked run can be proven: history now, and once more after
+            # the run's outputs are recorded (``_on_outputs_sealed``). A file
+            # outside ComfyUI's output folder can never be attributed, so it
+            # does not take a waiting slot.
+            if not in_output_folder(image_path, host_output_directory()):
+                return None
+            self._await_history(image_path)
+            prompt_id = self._history_prompt(image_path)
+            if prompt_id is None:
+                return None
+            self._stop_awaiting(image_path)
+            self.logger.info(f"History match: prompt {prompt_id} for {name}")
+            return {"id": prompt_id, "from_history": True}
+        if len(keys) == 1:
+            (key,) = keys.values()
+            if prompt_snapshot is None:
+                prompt_snapshot = self._keyed_snapshot()
+            # No entry of the key when the image appeared: no tracked run made it
+            entry = (prompt_snapshot or {}).get(key)
+            if entry is not None:
+                context, run_id, count = entry
+                queued = self.prompt_tracker.pop_for_key(key, run_id)
+                if queued is not None:
+                    if queued.get("placeholder"):
+                        self.logger.info(f"Queue entry for {name} has no prompt text")
+                        return None
+                    self.logger.info(f"Queue match: prompt {queued['id']} for {name}")
+                    return queued
+                if context.get("placeholder"):
+                    # Same rule as a popped placeholder: that run had no prompt
+                    self.logger.info(f"Latest run for {name} had no prompt text")
+                    return None
+                if run_id and count == 1:
+                    self.logger.info(f"Run match: prompt {context['id']} for {name}")
+                    return context
+        else:
+            self.logger.debug(f"{len(keys)} positive prompt nodes for {name}")
+        prompt_id = self._history_prompt(image_path)
+        if prompt_id is None:
+            return None
+        self.logger.info(f"History match: prompt {prompt_id} for {name}")
+        return {"id": prompt_id, "from_history": True}
+
+    @staticmethod
+    def _awaiting_key(image_path: str) -> str:
+        """One spelling for a waiting file, through symlinks and junctions."""
+        try:
+            resolved = os.path.realpath(image_path)
+        except (OSError, ValueError):
+            resolved = os.path.abspath(image_path)
+        return os.path.normcase(resolved)
+
+    def _prune_awaiting(self, store=None) -> List[Tuple[str, bool]]:
+        """Drop expired and surplus entries of ``store`` (the keyless set by
+        default; ``_awaiting_lock`` held). Returns the dropped foreign files
+        as ``(path, evicted)`` for ``_log_dropped`` after the lock."""
+        store = self._awaiting if store is None else store
+        now = time.monotonic()
+        expired = [k for k, (_p, due) in store.items() if due <= now]
+        dropped = [(store.pop(key)[0], False) for key in expired]
+        while len(store) > MAX_AWAITING_HISTORY:
+            dropped.append((store.popitem(last=False)[1][0], True))
+        return dropped if store is self._awaiting_foreign else []
+
+    def _log_dropped(self, dropped: List[Tuple[str, bool]]) -> None:
+        """Log foreign files that stopped waiting (outside ``_awaiting_lock``)."""
+        for image_path, evicted in dropped:
+            name = os.path.basename(image_path)
+            if evicted:
+                self.logger.info(
+                    f"Too many files wait for their run; {name} left unlinked"
+                )
+            else:
+                self.logger.info(f"No recorded run for {name}; left unlinked")
+
+    def _await_history(self, image_path: str, store=None) -> None:
+        """Re-check ``image_path`` once, history only, when its run is sealed.
+
+        ``store`` is the waiting set (``_awaiting_foreign`` for a foreign
+        output). A closed handler re-checks nothing.
+        """
+        if self._closed:
+            return
+        if not self._sealed_subscribed:
+            subscribe_outputs_sealed(self._on_outputs_sealed)
+            self._sealed_subscribed = True
+        store = self._awaiting if store is None else store
+        key = self._awaiting_key(image_path)
+        with self._awaiting_lock:
+            store.pop(key, None)
+            store[key] = (image_path, time.monotonic() + AWAIT_HISTORY_SECONDS)
+            dropped = self._prune_awaiting(store)
+        self._log_dropped(dropped)
+
+    def _await_foreign(self, image_path: str) -> None:
+        self._await_history(image_path, self._awaiting_foreign)
+
+    def _stop_awaiting(self, image_path: str, store=None) -> None:
+        store = self._awaiting if store is None else store
+        with self._awaiting_lock:
+            store.pop(self._awaiting_key(image_path), None)
+
+    def awaiting_history(self) -> List[str]:
+        """Normalized paths still waiting for their run's recorded outputs."""
+        with self._awaiting_lock:
+            self._prune_awaiting()
+            return list(self._awaiting)
+
+    def awaiting_foreign(self) -> List[str]:
+        """Normalized paths of foreign outputs waiting for their run (#247)."""
+        with self._awaiting_lock:
+            dropped = self._prune_awaiting(self._awaiting_foreign)
+            waiting = list(self._awaiting_foreign)
+        self._log_dropped(dropped)
+        return waiting
+
+    def _on_outputs_sealed(self, run_id: str, references: List[dict]) -> None:
+        """A run's outputs were recorded: re-check its waiting images once.
+
+        Called on the history writer's thread, so it only schedules the work.
+        """
+        root = host_output_directory()
+        if not root:
+            return
+        due = []
+        with self._awaiting_lock:
+            self._prune_awaiting()
+            dropped = self._prune_awaiting(self._awaiting_foreign)
+            for reference in references:
+                if reference.get("folder_type") != "output":
+                    continue
+                key = self._awaiting_key(
+                    os.path.join(
+                        root, reference.get("subfolder", ""), reference["filename"]
+                    )
+                )
+                waiting = self._awaiting.pop(key, None)
+                if waiting is not None:
+                    due.append((waiting[0], None))
+                waiting = self._awaiting_foreign.pop(key, None)
+                if waiting is not None:
+                    due.append((waiting[0], dict(reference)))
+        self._log_dropped(dropped)
+        for image_path, reference in due:
+            self._schedule_recheck(image_path, reference)
+
+    @staticmethod
+    def _recheck_snapshot(reference):
+        return HISTORY_ONLY if reference is None else ForeignRecheck(reference)
+
+    def _schedule_recheck(self, image_path: str, reference=None) -> None:
+        """Schedule the history-only re-check (with the sealed ``reference``:
+        a foreign output's), or keep it due for later.
+
+        A closed handler drops it.
+        """
+        if self._closed:
+            return
+        if self.schedule(image_path, self._recheck_snapshot(reference)):
+            return
+        with self._awaiting_lock:
+            # ``close`` sets the flag before ``shutdown`` clears this set, so
+            # a close that raced the refusal above is seen here.
+            if self._closed:
+                return
+            due = self._history_due if reference is None else self._foreign_due
+            due.pop(image_path, None)
+            due[image_path] = reference
+            evicted = []
+            while len(due) > MAX_AWAITING_HISTORY:
+                evicted.append(due.popitem(last=False)[0])
+        if reference is not None:
+            self._log_dropped([(path, True) for path in evicted])
+
+    def _drain_history_due(self) -> None:
+        """Schedule due re-checks now that a pending slot or path is free."""
+        with self._awaiting_lock:
+            due = [(self._history_due, p, None) for p in self._history_due]
+            due += [(self._foreign_due, *item) for item in self._foreign_due.items()]
+        for store, image_path, reference in due:
+            if self.schedule(image_path, self._recheck_snapshot(reference)):
+                with self._awaiting_lock:
+                    # A newer seal may have replaced it meanwhile: keep that one
+                    if image_path in store and store[image_path] is reference:
+                        del store[image_path]
+
+    def _recheck_history(self, image_path: str) -> None:
+        """The one history-only re-check of a keyless image (#342)."""
+        name = os.path.basename(image_path)
+        if not os.path.exists(image_path):
+            return
+        prompt_id = self._history_prompt(image_path)
+        if prompt_id is None:
+            self.logger.info(
+                f"No certain prompt for {name} after its run ended; left unlinked"
+            )
+            return
+        self.logger.info(f"History match after its run ended: {prompt_id} for {name}")
+        try:
+            metadata = self.metadata_extractor.extract_metadata(image_path)
+        except Exception:
+            metadata = None
+        self.link_image_to_prompt(
+            image_path,
+            {"id": prompt_id, "from_history": True},
+            metadata or {"file_info": self.get_basic_file_info(image_path)},
+        )
+
+    def _ingest_foreign(self, image_path: str, metadata) -> None:
+        """A foreign output at settle: store its certain prompt, or wait for
+        its run's recorded outputs when only history can decide (#247)."""
+        name = os.path.basename(image_path)
+        if not save_foreign_runs():
+            self.logger.info(
+                f"No PromptManager prompt in workflow, skipping image: {image_path}"
+            )
+            return
+        in_output = in_output_folder(image_path, host_output_directory())
+        decision = decide_foreign(
+            image_path, metadata, in_output=in_output, lookup=None
+        )
+        if decision.kind == HISTORY:
+            decision = self._settle_lookup(image_path, metadata)
+            if decision is None:
+                self.logger.debug(f"{name} waits for its run to end")
+                return
+            self._stop_awaiting(image_path, self._awaiting_foreign)
+        if decision.kind in NOT_SAVED_KINDS:
+            self._log_not_saved(image_path, decision.kind)
+        elif decision.kind in CERTAIN:
+            self._store_foreign(image_path, decision)
+        else:
+            self.logger.info(f"No certain prompt for {name}; left unlinked")
+
+    def _log_not_saved(self, image_path: str, kind: str = NOT_SAVED) -> None:
+        """The log line of a file whose run's prompt does not save (#90)."""
+        if kind == NOT_SAVED_WIRED:
+            reason = "is wired from a node the image cannot show"
+        else:
+            reason = "is off"
+        self.logger.info(
+            f"Save to library {reason} for this run's prompt, skipping image: "
+            f"{image_path}"
+        )
+
+    def _settle_lookup(self, image_path: str, metadata):
+        """The settle-time history lookup of a file only history can decide.
+
+        Registered first, so a run sealed before this lookup is not missed.
+        Returns None to keep waiting: no record yet, and the answer is not
+        the inspector's or the recorded saver's (the legacy floor waits for
+        the re-check). With a record, any decision ends the wait. A
+        ``not_saved`` here is the undecided step's (an early one never asks
+        history, so it never reaches this lookup): a recorded saver may still
+        resolve another branch, so without a record it waits too (#90).
+        """
+        self._await_foreign(image_path)
+        found = []
+        lookup = history_lookup(self.db_manager, image_path)
+
+        def recorded():
+            found.append(lookup())
+            return found[-1]
+
+        decision = decide_foreign(image_path, metadata, in_output=True, lookup=recorded)
+        if any(record is not None for record in found):
+            return decision
+        if decision.kind in CERTAIN and decision.source in ANCHORED_SOURCES:
+            return decision
+        return None
+
+    def _recheck_foreign(self, image_path: str, reference) -> None:
+        """The one re-check of a foreign output after its run ended (#247)."""
+        name = os.path.basename(image_path)
+        if not os.path.exists(image_path):
+            return
+        if not save_foreign_runs():
+            self.logger.info(f"Saving prompts from other workflows is off: {name}")
+            return
+        try:
+            metadata = self.metadata_extractor.extract_metadata(image_path)
+        except Exception as error:
+            self.logger.warning(f"Metadata of {name} could not be read: {error}")
+            return
+        lookup = history_lookup(self.db_manager, image_path, reference)
+        decision = decide_foreign(image_path, metadata, in_output=True, lookup=lookup)
+        if decision.kind in NOT_SAVED_KINDS:
+            self._log_not_saved(image_path, decision.kind)
+            return
+        if decision.kind in CERTAIN:
+            self._store_foreign(image_path, decision)
+            return
+        self.logger.info(
+            f"No certain prompt for {name} after its run ended; left unlinked"
+        )
+
+    def _store_foreign(self, image_path: str, decision) -> None:
+        name = os.path.basename(image_path)
+        if not save_foreign_runs():  # switched off while this file was decided
+            self.logger.info(f"Saving prompts from other workflows is off: {name}")
+            return
+        try:
+            status, prompt_id = store_foreign(self.db_manager, image_path, decision)
+        except Exception as error:
+            self.logger.error(f"Failed to store the prompt of {name}: {error}")
+            return
+        self.logger.info(
+            f"Foreign run: {status} prompt {prompt_id} for {name} ({decision.source})"
+        )
+
+    def _history_prompt(self, image_path: str) -> Optional[int]:
+        """The stored prompt recorded history attributes to this file, if one."""
+        try:
+            return stored_run_prompt(
+                self.db_manager, image_path, host_output_directory()
+            )
+        except Exception as error:
+            self.logger.warning(f"History attribution failed: {error}")
+            return None
+
     def _find_prompt_from_metadata(self, metadata) -> Tuple[str, Optional[Dict]]:
         """Identify the prompt that produced an image from its embedded metadata.
 
@@ -378,16 +972,27 @@ class ImageGenerationHandler(FileSystemEventHandler):
             ``("linked", prompt)`` with a context dict holding 'id' and 'text';
             ``("foreign", None)`` when the workflow has no positive PromptManager
             node, so the image belongs to no prompt of ours;
+            ``("opted_out", None)`` when a PromptManager node that would be the
+            run's prompt has its ``save_to_library`` switch off (#90): the image
+            is linked to no prompt, by no fallback;
             ``("unknown", None)`` when metadata can't decide (missing, a batch
             item whose text came from another node, or a lookup failure) and the
             caller's queue and tracker fallbacks apply.
         """
         if not metadata:
             return "unknown", None
+        if metadata_opted_out(metadata):
+            return "opted_out", None
+        graph = metadata.get("prompt")
+        if isinstance(graph, dict) and any(
+            save_setting(graph, node_id) is None for node_id in run_prompt_nodes(graph)
+        ):
+            # A switch wired from a node the graph cannot read: only the node's
+            # own run (it saw the real value) can link the image (#90)
+            return "unknown", None
 
         prompt_text = None
         resolution = resolve_prompt_pair(metadata)
-        graph = metadata.get("prompt")
         if resolution["state"] == "resolved" and isinstance(graph, dict):
             positive = resolution["positive"]
             path = positive["provenance"].get("path", [])
@@ -505,42 +1110,13 @@ class ImageGenerationHandler(FileSystemEventHandler):
                 with Image.open(image_path) as img:
                     file_info["dimensions"] = list(img.size)
                     file_info["format"] = img.format
-            except Exception:
-                pass
+            except Exception as error:
+                self.logger.debug(f"No dimensions for {image_path}: {error}")
 
             return file_info
         except Exception as e:
             self.logger.error(f"Error getting file info: {e}")
             return {}
-
-    def _get_fallback_prompt(self) -> Optional[Dict[str, Any]]:
-        """Get the most recent prompt from database as fallback.
-
-        When no active prompt is available from the tracker, this method attempts
-        to find the most recently created prompt in the database to use as a fallback
-        for image linking.
-
-        Returns:
-            Dictionary containing prompt information with 'fallback' flag set to True,
-            or None if no recent prompt is available
-        """
-        try:
-            recent = self.db_manager.get_recent_prompts(limit=1)
-            # Paginated dict ({"prompts": [...]}) or a plain list
-            recent_prompts = (
-                recent.get("prompts") if isinstance(recent, dict) else recent
-            )
-            if recent_prompts:
-                prompt = recent_prompts[0]
-                return {
-                    "id": prompt["id"],
-                    "text": prompt["text"],
-                    "timestamp": prompt.get("created_at"),
-                    "fallback": True,
-                }
-        except Exception as e:
-            self.logger.error(f"Error getting fallback prompt: {e}")
-        return None
 
     def link_image_to_prompt(
         self, image_path: str, prompt_context: Dict, metadata: Dict
@@ -557,28 +1133,74 @@ class ImageGenerationHandler(FileSystemEventHandler):
             metadata: Extracted metadata from the image file (workflow, parameters,
                 etc.)
         """
+        if metadata_opted_out(metadata):
+            # Reached from a run or history: the file's own graph says no (#90)
+            self.logger.info(
+                f"Save to library is off for {os.path.basename(image_path)}; "
+                "left unlinked"
+            )
+            return
         try:
             resolution = resolve_prompt_pair(metadata)
-            if resolution["state"] == "resolved":
-                positive = resolution["positive"]
-                expected = self.db_manager.get_prompt_by_hash(
-                    generate_prompt_hash(positive.get("storage_text", positive["text"]))
-                )
-                if expected and expected["id"] == prompt_context["id"]:
-                    ingest_resolved_pair(
-                        self.db_manager, image_path, metadata, resolution
+            graph = metadata.get("prompt") if isinstance(metadata, dict) else None
+            # An opted-out negative is never stored: link the positive alone
+            pair_allowed = not side_opted_out(graph, resolution.get("negative"))
+
+            def link():
+                # One write; run again on the moved library when a Move
+                # library switched while it waited (#249 S6b).
+                if resolution["state"] == "resolved" and pair_allowed:
+                    positive = resolution["positive"]
+                    expected = self.db_manager.get_prompt_by_hash(
+                        generate_prompt_hash(
+                            positive.get("storage_text", positive["text"])
+                        )
                     )
-                    return
-            image_id = self.db_manager.link_image_to_prompt(
-                prompt_id=prompt_context["id"], image_path=image_path, metadata=metadata
-            )
-            fallback_note = " (fallback)" if prompt_context.get("fallback") else ""
-            self.logger.debug(
-                f"Successfully linked image {image_id} to prompt "
-                f"{prompt_context['id']}{fallback_note}"
-            )
+                    if expected and expected["id"] == prompt_context["id"]:
+                        ingest_resolved_pair(
+                            self.db_manager, image_path, metadata, resolution
+                        )
+                        return None
+                # The raising form: a failed write reaches survive_switch.
+                return self.db_manager.link_image_to_prompt_or_raise(
+                    prompt_id=prompt_context["id"],
+                    image_path=image_path,
+                    metadata=metadata,
+                )
+
+            image_id = survive_switch(self.db_manager, link)
+            if image_id is None:
+                return
+            if image_id:  # 0: nothing new was linked (logged by the database)
+                self.logger.debug(
+                    f"Successfully linked image {image_id} to prompt "
+                    f"{prompt_context['id']}"
+                )
         except Exception as e:
             self.logger.error(f"Failed to link image to prompt: {e}")
+            return
+        if resolution["state"] == "ambiguous":
+            self._record_review(image_path)
+
+    def _record_review(self, image_path: str) -> None:
+        """The Needs review pass for an ambiguous output, best effort.
+
+        The output is linked by now, so it is never queued; a pending item
+        an earlier scan left for its path leaves the queue. The link above
+        stays whatever happens here: a failure is logged, never raised.
+        """
+        recorder = getattr(self, "review_recorder", None)
+        if recorder is None:
+            return
+        try:
+            outcome = recorder(image_path)
+        except Exception:
+            self.logger.warning(
+                f"{os.path.basename(image_path)} could not be added to Needs review",
+                exc_info=True,
+            )
+            return
+        self.logger.debug(f"Needs review {outcome}: {os.path.basename(image_path)}")
 
 
 class ImageMonitor:
@@ -607,7 +1229,41 @@ class ImageMonitor:
         self.observer = None
         self.handler = None
         self.monitored_directories = []
+        # (observer, handler) pairs a stop left running: the next stop waits
+        # for them again instead of reporting True.
+        self._unfinished: List[Tuple[Any, Any]] = []
+        # Observer stops still running on their thread, by observer: a later
+        # stop waits for the same call instead of starting another (#561).
+        self._observer_stops: Dict[Any, _ObserverStop] = {}
         self.logger = get_logger("prompt_manager.image_monitor")
+        self.review_recorder: Optional[Callable[[str], str]] = None
+        self.thumbnail_queue: Optional[Callable[[str], str]] = None
+        self.output_listener: Optional[Callable[[str], None]] = None
+
+    def set_output_listener(self, listener: Optional[Callable[[str], None]]) -> None:
+        """Report every settled output's resolved path to ``listener`` (None
+        stops it), on the running handler and every later one (#348)."""
+        self.output_listener = listener
+        if self.handler is not None:
+            self.handler.output_listener = listener
+
+    def set_thumbnail_queue(
+        self, queue_preview: Optional[Callable[[str], str]]
+    ) -> None:
+        """Queue every settled output's preview through ``queue_preview``
+        (None stops it), on the running handler and every later one."""
+        self.thumbnail_queue = queue_preview
+        if self.handler is not None:
+            self.handler.thumbnail_queue = queue_preview
+
+    def set_review_recorder(self, recorder: Optional[Callable[[str], str]]) -> None:
+        """Record ambiguous outputs through ``recorder`` (None stops recording).
+
+        Applies to the running handler and to every handler started later.
+        """
+        self.review_recorder = recorder
+        if self.handler is not None:
+            self.handler.review_recorder = recorder
 
     def start_monitoring(self, output_directories: Optional[list] = None):
         """
@@ -665,6 +1321,10 @@ class ImageMonitor:
         # Only a started observer becomes self.observer, so a failed start never
         # leaves the monitor stuck "already running" with nothing to stop.
         handler = ImageGenerationHandler(self.db_manager, self.prompt_tracker)
+        handler.review_recorder = self.review_recorder
+        handler.thumbnail_queue = self.thumbnail_queue
+        handler.output_listener = self.output_listener
+        handler.watched_roots = tuple(os.path.abspath(d) for d in valid_directories)
         observer = Observer()
         scheduled = []
         for output_dir in valid_directories:
@@ -678,7 +1338,7 @@ class ImageMonitor:
             self.logger.warning("No directory could be watched")
             return
         try:
-            observer.start()
+            _start_daemon_observer(observer)
         except Exception as e:
             self.logger.error(f"Image monitoring could not start: {e}")
             return
@@ -703,29 +1363,87 @@ class ImageMonitor:
         """Whether a filesystem observer is running."""
         return self.observer is not None
 
-    def stop_monitoring(self):
-        """Stop the image monitoring system.
+    def stop_monitoring(self, timeout: float = OBSERVER_JOIN_SECONDS) -> bool:
+        """Stop the image monitoring system within one ``timeout`` deadline.
 
-        Cleanly shuts down the filesystem watcher and clears all monitoring state.
-        This method should be called before program exit to ensure proper cleanup.
-        Safe to call when monitoring never started.
+        Closes the handler first (its worker is joined and its dispatch
+        returns at once), then stops the watchdog observer and joins it. The
+        worker and the observer share the one deadline: the observer's stop
+        and join get what the worker left, possibly 0 s. watchdog's
+        ``observer.stop()`` joins its emitters without a limit, so it runs on
+        a daemon thread and is waited for only until the deadline (#561). A
+        part an earlier call left running is waited for again. Safe to call
+        when monitoring never started and more than once.
+
+        Returns:
+            True when every worker and observer it stopped has ended.
         """
+        deadline = time.monotonic() + timeout
         observer, self.observer = self.observer, None
         handler, self.handler = self.handler, None
         self.monitored_directories = []
-        if observer is None:
-            return
+        pairs, self._unfinished = self._unfinished, []
+        if observer is not None:
+            pairs.append((observer, handler))
+        if not pairs:
+            return True
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        for pair_observer, pair_handler in pairs:
+            handler_ok = self._close_handler(pair_handler, remaining())
+            observer_ok = self._stop_observer(pair_observer, remaining())
+            if not (handler_ok and observer_ok):
+                self._unfinished.append(
+                    (
+                        None if observer_ok else pair_observer,
+                        None if handler_ok else pair_handler,
+                    )
+                )
+        self.logger.debug("Image monitoring stopped")
+        return not self._unfinished
+
+    def _close_handler(self, handler, timeout: float) -> bool:
+        if handler is None:
+            return True
         try:
-            observer.stop()
-            observer.join()
+            return handler.close(timeout)
+        except Exception as e:
+            self.logger.warning(f"Error while stopping the image worker: {e}")
+            return False
+
+    def _stop_observer(self, observer, timeout: float) -> bool:
+        """``observer.stop()`` on its own daemon thread, then a join, both
+        within ``timeout`` seconds; a stop or join still running then is
+        logged with the time it got. A stop still running from an earlier
+        call is waited for, never started again."""
+        if observer is None:
+            return True
+        deadline = time.monotonic() + timeout
+        stop = self._observer_stops.get(observer)
+        if stop is None:
+            stop = self._observer_stops[observer] = _ObserverStop(observer)
+        if not stop.wait(timeout):
+            self.logger.warning(
+                f"watchdog observer still running after {timeout:.1f} s"
+            )
+            return False
+        del self._observer_stops[observer]
+        if stop.error is not None:
+            self.logger.warning(f"Error while stopping image monitoring: {stop.error}")
+            return False
+        try:
+            observer.join(max(0.0, deadline - time.monotonic()))
         except Exception as e:
             self.logger.warning(f"Error while stopping image monitoring: {e}")
-        if handler is not None:
-            try:
-                handler.shutdown()
-            except Exception as e:
-                self.logger.warning(f"Error while stopping the image worker: {e}")
-        self.logger.debug("Image monitoring stopped")
+            return False
+        if observer.is_alive():
+            self.logger.warning(
+                f"watchdog observer still running after {timeout:.1f} s"
+            )
+            return False
+        return True
 
     def detect_comfyui_output_dirs(self) -> list:
         """Auto-detect ComfyUI output directories.
@@ -785,8 +1503,8 @@ class ImageMonitor:
         if self.observer is not None:
             try:
                 observer_alive = self.observer.is_alive()
-            except Exception:
-                pass
+            except Exception as error:
+                self.logger.debug(f"Could not read the observer state: {error}")
         return {
             "running": self.observer is not None,
             "monitored_directories": self.monitored_directories,

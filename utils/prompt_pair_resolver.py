@@ -6,7 +6,9 @@ contains effective ``text``, deduplicated-recipe ``storage_text`` and
 ``provenance``; ComfyUI provenance records the exact output
 slot and complete followed link path. States distinguish a resolved pair (an
 explicit empty negative is valid), absent data, unsupported/unresolved data and
-ambiguous sampler selection. Unknown conditioning semantics are never flattened.
+ambiguous sampler selection. Listed composites are never flattened; in the
+inspection profile, nodes the semantics table does not name pass their text
+through (#381, ``_GraphResolver.passed``).
 
 Future nodes can register declarative ``OutputAdapter`` entries by
 ``(class_type, output_slot)``. This does not prescribe a future paired-node schema.
@@ -17,8 +19,9 @@ ComfyUI, database or configuration dependencies; its only file read is the
 inspection profile's node semantics table (``utils.inspection_semantics``).
 
 Two ``ResolverProfile`` values exist. ``DEFAULT_PROFILE`` (ingestion: scan, live
-monitor, admin import) keeps the historical behavior exactly, including the
-500-node gate, and only adds ``reason_code: None``. ``INSPECTION_PROFILE`` bounds
+monitor, admin import) keeps the historical behavior, including the 500-node
+gate, and only adds ``reason_code: None``; both profiles resolve several sampler
+branches that share one exact pair to that pair (#249). ``INSPECTION_PROFILE`` bounds
 work instead of graph size: a per-candidate visit allowance, a total visit budget
 shared by every candidate and attribution walk, a node ceiling backstop, and
 bounds on built provenance and text. It also names why a result is not resolved
@@ -37,6 +40,19 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from .pair_execution import ExecutionEvidenceError, read_pair_execution
 
 _LOGGER = logging.getLogger("prompt_manager.prompt_pair_resolver")
+
+# The ingestion resolver's version, recorded in pair-link provenance and on
+# Needs review items. Bump it when a change would resolve the same metadata
+# otherwise; a pending item stays applicable while its chosen candidate is
+# still offered by the captured bytes.
+RESOLVER_VERSION = 1
+# The inspection profile's own version, folded into the version of Needs
+# review items recorded from that profile (with the profile's budgets and
+# the semantics table). Bump it when a change would make the inspection
+# profile resolve the same metadata otherwise, even if ingestion is unchanged.
+# 2: unknown nodes pass through generically (#381); unknown classes are not in
+# the table's class projection, so only this number can move those items.
+INSPECTION_RESOLVER_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -101,6 +117,15 @@ _HISTORICAL_ADAPTERS = {
 for _name in ("PromptManagerPositive", "PromptManagerDetailer"):
     _HISTORICAL_ADAPTERS[(_name, 0)] = _COMMA
     _HISTORICAL_ADAPTERS[(_name, 1)] = replace(_COMMA, kind="string")
+# This repository's own node classes, current and historical: their text is the
+# prompt whatever unknown nodes sit between them and the sampler (#381).
+_OWN_CLASSES = frozenset(
+    name
+    for name, _ in list(_DEFAULT_ADAPTERS) + list(_HISTORICAL_ADAPTERS)
+    if name.startswith("PromptManager")
+)
+# Nodes with these exact names are traced by code, not by the table.
+_CODED_CLASSES = frozenset({"Reroute", "StringConcatenate", "Text Concatenate"})
 
 
 @dataclass(frozen=True)
@@ -185,9 +210,34 @@ _ZEROED_SOURCE = "zeroed-conditioning"
 _MAX_BRANCH_CANDIDATES = 32
 # Statically undecidable text (a search, a list output): never pick an item.
 _RUNTIME_REASON = "Text is decided at run time"
+# Different texts reach one sampler through unknown nodes (#381): one candidate
+# per text, never a refusal.
+SEVERAL_SOURCES_REASON = "Several prompts reach the sampler"
+SELECTOR_BRANCHES_REASON = "Selector branches have different prompts"
+# Failures that bound the work: never skipped by a pass-through walk.
+_LIMIT_CODES = frozenset({"work-limit", "depth-limit", "text-limit"})
+_PASSED_UNVERIFIABLE = "Text passed through an unknown node is not verifiable"
+# Inputs that make an unknown node a conditioning transform, not a generator.
+_CONDITIONING_INPUTS = ("conditioning", "positive", "negative")
+# The first item of a pass-through divergence's 3-tuple choice key.
+_PASS_THROUGH = "pass-through"
 # Uncoded outcomes the inspector explains by their exact reason.
 EMPTY_POSITIVE_REASON = "Positive prompt is empty"
+# Several sampler branches, every one resolved to the same pair (#249).
+IDENTICAL_BRANCHES_REASON = "Every sampler branch uses the same prompt pair"
 MULTISTAGE_UNATTRIBUTED_REASON = "Multistage sampler ancestry is ambiguous"
+# A later stage's positive combines the earlier stages' shared prompt with more
+# conditioning (a style trigger): that shared pair is the run's prompt (floor).
+ADDED_CONDITIONING_REASON = "A later stage adds conditioning to the base prompt"
+# Maintainer option A (2026-10-23): a PromptManager prepend or append fed
+# directly by a run-time node (LoRA trigger words) is left out, never guessed;
+# the text is the node's own, labelled by this source and reason (D125). A side
+# is labelled when any node on its traced path left a part out.
+RUNTIME_PARTS_SOURCE = "runtime-parts-omitted"
+RUNTIME_PARTS_REASON = "Text added at run time, such as trigger words, is not included"
+# The added-conditioning floor's positive (D126), and both labels at once.
+ADDED_CONDITIONING_SOURCE = "added-conditioning"
+RUNTIME_AND_ADDED_SOURCE = "runtime-parts-omitted-and-added-conditioning"
 _INCOMPATIBLE_SLOT = "Output slot has an incompatible type"
 # Before 3.2.3 a save patch overwrote every PromptManager node's saved ``text``
 # with the last-run node's prompt (comfy-metadata.js ``createContext``).
@@ -215,17 +265,23 @@ class _Unresolved(Exception):
 
 
 class _Diverging(Exception):
-    """A runtime selector whose branches trace to different texts.
+    """A runtime choice whose options trace to different texts.
 
     Raised from inside tracing; ``_GraphResolver.branches`` resolves the sampler
-    again once per choice, so each candidate is internally consistent.
+    again once per choice, so each candidate is internally consistent. A
+    selector's choices are ``(True, False)``; an unknown node passing several
+    texts through (#381) has one choice per distinct text, ``0..n-1``.
     """
 
-    def __init__(self, key: Tuple[str, int]) -> None:
+    def __init__(self, key: tuple, choices: tuple, sources: bool = False) -> None:
         super().__init__(key)
-        # The condition output (node ID, slot): one runtime value, so every
-        # selector it drives is forced together.
+        # A selector's condition output (node ID, slot): one runtime value, so
+        # every selector it drives is forced together. A pass-through key is
+        # ``(_PASS_THROUGH, node ID, slot)``.
         self.key = key
+        self.choices = choices
+        # Raised by an unknown node passing several texts (the outcome's reason).
+        self.sources = sources
 
 
 def _node_ref(node_id: str, class_type: Any) -> dict:
@@ -307,13 +363,49 @@ def _role_text(side: Any) -> Optional[str]:
     return side["text"] if isinstance(side, dict) else None
 
 
+def _left_out(side: Any) -> tuple:
+    """What a side's text leaves out: the PromptManager nodes that omitted a
+    run-time part, and the composite whose added conditioning is not included.
+
+    Empty for a complete text, so a partial prompt never equals a complete one.
+    """
+    provenance = side.get("provenance") if isinstance(side, dict) else None
+    if not isinstance(provenance, dict):
+        return ()
+    return (
+        tuple(provenance.get("omitted_parts", ())),
+        provenance.get("added_by"),
+    )
+
+
 def _outcome_key(result: Dict[str, Any]) -> tuple:
-    """What a reader sees of a result: state and the two role texts."""
+    """What a reader sees of a result: state, the two role texts, and what
+    each text leaves out."""
     return (
         result["state"],
         _role_text(result["positive"]),
         _role_text(result["negative"]),
+        _left_out(result["positive"]),
+        _left_out(result["negative"]),
     )
+
+
+def _reroute_value(inputs: dict) -> Any:
+    """A Reroute's one input (``value``, ``input`` or ``in``), else ``None``."""
+    keys = [key for key in ("value", "input", "in") if key in inputs]
+    return inputs[keys[0]] if len(keys) == 1 else None
+
+
+def _parts_reason(*sides: dict) -> str:
+    """The run-time parts reason when a side left out a PromptManager part."""
+    if any(side["provenance"]["text_source"] == RUNTIME_PARTS_SOURCE for side in sides):
+        return RUNTIME_PARTS_REASON
+    return ""
+
+
+def _combined_positive(result: Dict[str, Any]) -> bool:
+    """Whether a stage failed only because its positive combines texts."""
+    return result["reason_code"] == "composite" and result["positive"] is None
 
 
 def _legacy_result(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -371,6 +463,8 @@ class _GraphResolver:
         self.active: set = set()
         self.metadata = metadata or {}
         self.text_sources: dict = {}
+        # PromptManager outputs that left out a run-time part (option A).
+        self.omitting: set = set()
         # Forced runtime selector choices (inspection); a result traced through
         # one is "tainted" and never memoized, since it depends on the choice.
         self.choices: dict = {}
@@ -383,6 +477,8 @@ class _GraphResolver:
         self.latent_charged: set = set()
         # ``semantics`` (inspection) names the samplers and guiders it follows.
         self.semantics = semantics
+        # Nesting depth of execution-record checks (``passed``).
+        self.verifying = 0
         if semantics is None:
             self.sampler_classes = self.stage_classes = _SAMPLERS
         else:
@@ -393,6 +489,19 @@ class _GraphResolver:
             )
             # Any listed sampler upstream in latent ancestry is an earlier stage.
             self.stage_classes = frozenset(semantics.samplers)
+            # Classes the resolver knows something about: an unlisted output of
+            # one stays ``unsupported-node``; any other class passes through.
+            facts = semantics.facts
+            self.described = (
+                semantics.all_classes
+                | {name for name, _ in semantics.lineage}
+                | {name for name, _ in self.adapters}
+                | _CODED_CLASSES
+                | frozenset(facts["configuration_outputs"])
+                | frozenset(facts["model_outputs"])
+                | frozenset(facts["model_passthroughs"])
+                | frozenset(facts["scalar_outputs"])
+            )
 
     def node(self, node_id: str) -> Tuple[str, dict]:
         if self.legacy:
@@ -493,7 +602,9 @@ class _GraphResolver:
                     self.inherit_source(node_id, slot, [path])
             elif (name, slot) in self.adapters:
                 adapter = self.adapters[(name, slot)]
-                if not isinstance(adapter, OutputAdapter) or adapter.kind != kind:
+                if not isinstance(adapter, OutputAdapter) or (
+                    kind != "any" and adapter.kind != kind
+                ):
                     raise _Unresolved(_INCOMPATIBLE_SLOT, "malformed")
                 evidence = (
                     self.execution_record(node_id, inputs)
@@ -520,11 +631,12 @@ class _GraphResolver:
                     if adapter.compose or adapter.storage_input:
                         storage_text = text
                     if adapter.compose:
-                        before, before_path, _ = self.text(
-                            inputs.get("prepend_text", ""), "string", depth + 1
+                        omitted: list = []
+                        before, before_path = self.part(
+                            inputs.get("prepend_text", ""), depth, omitted
                         )
-                        after, after_path, _ = self.text(
-                            inputs.get("append_text", ""), "string", depth + 1
+                        after, after_path = self.part(
+                            inputs.get("append_text", ""), depth, omitted
                         )
                         self.scan(
                             len(before)
@@ -543,10 +655,12 @@ class _GraphResolver:
                             )
                         )
                         path = before_path + path + after_path
+                        if omitted:
+                            self.omitting.add((node_id, slot))
             elif (
                 name in ("StringConcatenate", "Text Concatenate")
                 and slot == 0
-                and kind == "string"
+                and kind in ("string", "any")
             ):
                 if name == "StringConcatenate":
                     keys = ["string_a", "string_b"]
@@ -585,6 +699,10 @@ class _GraphResolver:
                 text, path, storage_text = self.semantic(
                     node_id, name, slot, kind, inputs, depth
                 )
+            elif self.semantics is not None and name not in self.described:
+                text, path, storage_text = self.passed(
+                    node_id, slot, kind, inputs, depth
+                )
             else:
                 raise self.unsupported(
                     "Unsupported node semantics or output slot", node_id
@@ -611,6 +729,30 @@ class _GraphResolver:
             self.deepest = max(outer_deepest, self.deepest)
             self.tainted = outer_tainted or self.tainted
             self.active.discard(key)
+
+    def part(self, value: Any, depth: int, omitted: list) -> Tuple[str, list]:
+        """A PromptManager prepend or append: traced, or left out when run time.
+
+        Only with the semantics table (inspection), and only when the input is
+        a link to a node the table lists as ``runtime`` (such as LoraManager's
+        TriggerWord Toggle), which raises ``runtime-value`` at itself: that part
+        is not in the file, so it is left out and recorded in ``omitted``.
+        Anything else, including a run-time source further upstream or another
+        ``runtime-value`` node (a JoinStringMulti list), keeps its failure.
+        """
+        try:
+            text, path, _ = self.text(value, "string", depth + 1)
+        except _Unresolved as error:
+            if (
+                self.semantics is None
+                or error.code != "runtime-value"
+                or not _link(value)
+                or self.node(str(value[0]))[0] not in self.semantics.runtime
+            ):
+                raise
+            omitted.append(str(value[0]))
+            return "", []
+        return text, path
 
     def historical(
         self, adapter: OutputAdapter, inputs: dict, depth: int
@@ -656,7 +798,7 @@ class _GraphResolver:
             return True
         if slot == 0 and name in semantics.selectors:
             return True
-        return kind == "conditioning" and (
+        return kind in ("conditioning", "any") and (
             (name, slot) in semantics.conditioning
             or (slot == 0 and name in semantics.composites)
         )
@@ -678,11 +820,13 @@ class _GraphResolver:
         ):
             listed = table.get((name, slot))
             if listed is not None:
-                if kind != expected:
+                if kind not in (expected, "any"):
                     raise _Unresolved(_INCOMPATIBLE_SLOT, "malformed")
                 return build(node_id, listed, inputs, depth)
         entry = (
-            semantics.conditioning.get((name, slot)) if kind == "conditioning" else None
+            semantics.conditioning.get((name, slot))
+            if kind in ("conditioning", "any")
+            else None
         )
         if entry is not None and entry["strategy"] == "zeroed":
             # The upstream text is discarded, so it is not traced.
@@ -734,8 +878,119 @@ class _GraphResolver:
             for label in ("true", "false")
         ]
         if parts[0][0] != parts[1][0]:
-            raise _Diverging((str(condition[0]), condition[1]))
+            raise _Diverging((str(condition[0]), condition[1]), (True, False))
         return self.merged(node_id, 0, parts)
+
+    def passed(
+        self, node_id: str, slot: int, kind: str, inputs: dict, depth: int
+    ) -> Tuple[str, list, str]:
+        """``read_through``, except while checking an execution record.
+
+        A pair node's recorded text is what ran. While its inputs are checked
+        against the record (``execution_record``), any outcome of a walk through
+        an unknown node but running out of visits only means "cannot be read
+        statically" (``unsupported-node``, unverifiable), as before #381.
+        """
+        if not self.verifying:
+            return self.read_through(node_id, slot, kind, inputs, depth)
+        try:
+            return self.read_through(node_id, slot, kind, inputs, depth)
+        except _Diverging:
+            raise self.unsupported(_PASSED_UNVERIFIABLE, node_id) from None
+        except _Unresolved as error:
+            if error.code == "work-limit":
+                raise
+            raise self.unsupported(_PASSED_UNVERIFIABLE, node_id) from None
+
+    def read_through(
+        self, node_id: str, slot: int, kind: str, inputs: dict, depth: int
+    ) -> Tuple[str, list, str]:
+        """An output no rule describes passes its text through (#381).
+
+        A string output (kind ``string``) of a node with a seed input
+        (``seed``, ``noise_seed``, ``sampling_mode.seed``) and no linked
+        conditioning input is generated at run time (a language model, a
+        wildcard or random line): ``runtime-value``, never its inputs. With a
+        linked conditioning input it is a conditioning transform (noise). A
+        ``text`` input is the text (the legacy encoder rule). Otherwise the
+        followed inputs (``pass_inputs``) are traced with kind ``any``: an
+        unknown node may turn a string into conditioning. A followed input that
+        finds no text (``unsupported-node``) adds nothing; limits and runtime
+        choices propagate; any other failure blocks, unless a PromptManager
+        node was reached: this repository's own nodes are authoritative, so
+        only their texts count then. One distinct text is the result; several
+        are a runtime choice with one candidate per text, in input order.
+        """
+        if (
+            kind == "string"
+            and any(name.endswith("seed") for name in inputs)
+            and not any(_link(inputs.get(name)) for name in _CONDITIONING_INPUTS)
+        ):
+            raise self.named(_RUNTIME_REASON, "runtime-value", node_id)
+        if "text" in inputs:
+            traced = self.text(inputs["text"], "string", depth + 1)
+            self.inherit_source(node_id, slot, [traced[1]])
+            return traced
+        found: list = []
+        blocking: Optional[_Unresolved] = None
+        for value in self.pass_inputs(slot, inputs):
+            try:
+                found.append(self.text(value, "any", depth + 1))
+            except _Unresolved as error:
+                if error.code in _LIMIT_CODES:
+                    raise
+                if error.code != "unsupported-node" and blocking is None:
+                    blocking = error
+        owned = [traced for traced in found if self.owned(traced[1])]
+        if owned:
+            found = owned
+        elif blocking is not None:
+            raise blocking
+        if not found:
+            raise self.unsupported("Unsupported node semantics or output slot", node_id)
+        texts = list(dict.fromkeys(traced[0] for traced in found))
+        if len(texts) == 1:
+            return self.merged(node_id, slot, found)
+        if len(texts) > _MAX_BRANCH_CANDIDATES:
+            raise _Unresolved("Too many selector branches", "work-limit")
+        key = (_PASS_THROUGH, node_id, slot)
+        if key not in self.choices:
+            raise _Diverging(key, tuple(range(len(texts))), sources=True)
+        self.tainted = True
+        chosen = texts[self.choices[key]]
+        return self.merged(node_id, slot, [t for t in found if t[0] == chosen])
+
+    def pass_inputs(self, slot: int, inputs: dict) -> list:
+        """The linked inputs an unknown node's output is read through.
+
+        Output slot 0 of a node with a ``positive`` or ``negative`` input reads
+        only ``positive`` (slot 1, ``negative``), nothing when that one is not
+        linked: the paired-conditioning convention, which the legacy parser
+        followed by role. A linked ``conditioning`` is read alone (the
+        legacy order). Otherwise every linked input but the core type inputs
+        (``pass_through.skip_inputs``: model, clip, image, ...) is read.
+        """
+        if slot in (0, 1) and ("positive" in inputs or "negative" in inputs):
+            value = inputs.get(("positive", "negative")[slot])
+            return [value] if _link(value) else []
+        if _link(inputs.get("conditioning")):
+            return [inputs["conditioning"]]
+        skipped = self.semantics.pass_through["skip_inputs"]
+        return [
+            value
+            for name, value in inputs.items()
+            if _link(value) and name not in skipped
+        ]
+
+    def through_unknown(self, path: list) -> bool:
+        """Whether a followed path passes through a node no rule describes."""
+        self.scan(len(path))
+        return any(self.node(step["node_id"])[0] not in self.described for step in path)
+
+    def owned(self, path: list) -> bool:
+        """Whether a followed path passes through one of this repository's nodes."""
+        self.scan(len(path))
+        return any(self.node(step["node_id"])[0] in _OWN_CLASSES for step in path)
 
     def merged(self, node_id: str, slot: int, parts: list) -> Tuple[str, list, str]:
         """One text reached through several followed paths (deduplicated)."""
@@ -930,8 +1185,9 @@ class _GraphResolver:
         if record is None:
             return None
         for name in ("text", "negative_text", "prepend_text", "append_text"):
+            self.verifying += 1
             try:
-                expected = self.text(inputs.get(name, ""), "string")[0]
+                expected, followed, _ = self.text(inputs.get(name, ""), "string")
             except _Unresolved as error:
                 if self.unverifiable(error):
                     value = inputs.get(name)
@@ -952,6 +1208,11 @@ class _GraphResolver:
                             raise
                     continue
                 raise
+            finally:
+                self.verifying -= 1
+            if self.semantics is not None and self.through_unknown(followed):
+                # A text passed through an unknown node may be transformed there.
+                continue
             if name in ("prepend_text", "append_text"):
                 expected = expected.strip()
             if expected != record[name]:
@@ -982,6 +1243,15 @@ class _GraphResolver:
         if guider_id is not None:
             # The conditioning path starts below the guider the sampler reads.
             provenance["guider_id"] = guider_id
+        omitted: list = []
+        for step in path:
+            if (step["node_id"], step["output_slot"]) in self.omitting:
+                if step["node_id"] not in omitted:
+                    omitted.append(step["node_id"])
+        if omitted:
+            # Through encoders, concatenations and chained PromptManagers (D125).
+            provenance["text_source"] = RUNTIME_PARTS_SOURCE
+            provenance["omitted_parts"] = omitted
         return {"text": text, "storage_text": storage_text, "provenance": provenance}
 
     def guider(self, value: Any) -> Tuple[str, dict, Mapping, str, int]:
@@ -1058,19 +1328,18 @@ class _GraphResolver:
                 reason_code="depth-limit",
             )
         own = self.sides(sampler_id)
-        if own["state"] == "unresolved":
-            return own
-        name, inputs = self.node(sampler_id)
-        entry = self.semantics.samplers.get(name)
-        if entry is None or entry["strategy"] != _DETAILER:
+        # An unresolved stage is final, unless its positive combines texts: it
+        # may then add conditioning to its earlier stages' prompt (the floor).
+        combined = own["state"] == "unresolved" and _combined_positive(own)
+        if own["state"] == "unresolved" and not combined:
             return own
         try:
-            upstream = self.upstream_stages(
-                sampler_id, inputs.get(entry["image_stage"])
-            )
+            upstream = self.earlier_stages(sampler_id)
             if any(node_id in later for node_id in upstream):
                 raise _Unresolved("Cyclic sampler stage ancestry", "malformed")
         except _Unresolved as error:
+            if combined:
+                return own
             return _result(
                 "unresolved",
                 sampler_id=sampler_id,
@@ -1083,6 +1352,10 @@ class _GraphResolver:
         later = later | {sampler_id}
         stages = [self.stage(node_id, later) for node_id in upstream]
         blocked = next((item for item in stages if item["state"] == "unresolved"), None)
+        if combined:
+            if blocked is not None:
+                return own
+            return self.added_conditioning(sampler_id, stages) or own
         if blocked is not None:
             # A stage that cannot be read cannot be compared: never pick one.
             return _result(
@@ -1104,6 +1377,128 @@ class _GraphResolver:
             candidates=flat,
             reason_code="multistage-differs",
         )
+
+    def earlier_stages(self, sampler_id: str) -> list:
+        """The stages a sampler continues: a detailer's image ancestry, or the
+        one sampler its latent descends from through listed lineage nodes.
+
+        The latent walk already ran in ``sides`` (its outcome is cached); a
+        sampler without a latent input, or whose walk found no earlier sampler,
+        has none.
+        """
+        name, inputs = self.node(sampler_id)
+        entry = self.semantics.samplers[name]
+        if entry["strategy"] == _DETAILER:
+            return self.upstream_stages(sampler_id, inputs.get(entry["image_stage"]))
+        walked = self.latent_walks.get(sampler_id)
+        if walked is None or walked[2] is None:
+            return []
+        return [walked[2]]
+
+    def lineage_predecessor(self, value: Any) -> Optional[str]:
+        """The sampler whose output a latent input continues, or ``None``.
+
+        Follows only the table's ``lineage`` outputs (decode, image filter,
+        upscale, scale, encode) and Reroutes, from the input back to a listed
+        sampler's output slot 0. Any other node ends the lineage: its output is
+        not known to continue one image or latent. At most ``max_depth`` hops;
+        each node is read through ``node`` (one scan charge per node).
+        """
+        seen: set = set()
+        while _link(value) and len(seen) < self.max_depth:
+            node_id, slot = str(value[0]), value[1]
+            if node_id in seen:
+                return None
+            seen.add(node_id)
+            name, inputs = self.node(node_id)
+            if name in self.stage_classes:
+                return node_id if slot == 0 else None
+            if name == "Reroute" and slot == 0:
+                value = _reroute_value(inputs)
+                continue
+            entry = self.semantics.lineage.get((name, slot))
+            if entry is None:
+                return None
+            value = inputs.get(entry["input"])
+        return None
+
+    def added_conditioning(self, sampler_id: str, stages: list) -> Optional[dict]:
+        """The earlier stages' shared pair when this stage only adds to it.
+
+        This stage's positive reaches (through Reroutes and conditioning
+        pass-throughs) an ``additive`` composite, one of whose parts is exactly
+        the earlier stages' positive text, and its negative is exactly theirs:
+        every stage is conditioned on that prompt, the last one with more. Any
+        other shape, or a part that cannot be traced, is ``None``.
+        """
+        flat: list = []
+        for item in stages:
+            flat.extend(item["candidates"] if item["state"] == "ambiguous" else [item])
+        base = flat[0]
+        if base["state"] != "resolved" or len({_outcome_key(i) for i in flat}) != 1:
+            return None
+        name, inputs = self.node(sampler_id)
+        entry = self.semantics.samplers[name]
+        if entry["strategy"] == "custom-advanced":
+            return None
+        conditioning = entry["conditioning"]
+        try:
+            found = self.composite_of(inputs.get(conditioning["positive"]))
+            if found is None:
+                return None
+            parts, depth, composite = found
+            texts = [self.text(part, "conditioning", depth)[0] for part in parts]
+            if base["positive"]["text"] not in texts:
+                return None
+            if conditioning["negative"] not in inputs:
+                return None
+            negative = self.side(inputs[conditioning["negative"]], sampler_id)
+        except _Unresolved:
+            return None
+        if negative["text"] != base["negative"]["text"]:
+            return None
+        # D126: the positive does not include what the later stage added.
+        provenance = dict(base["positive"]["provenance"])
+        provenance["text_source"] = (
+            RUNTIME_AND_ADDED_SOURCE
+            if provenance["text_source"] == RUNTIME_PARTS_SOURCE
+            else ADDED_CONDITIONING_SOURCE
+        )
+        provenance["added_by"] = composite
+        positive = {**base["positive"], "provenance": provenance}
+        return _result(
+            "resolved",
+            positive,
+            base["negative"],
+            base["sampler_id"],
+            ADDED_CONDITIONING_REASON,
+        )
+
+    def composite_of(self, value: Any) -> Optional[Tuple[list, int]]:
+        """An ``additive`` composite a conditioning input reaches, or ``None``.
+
+        Reroutes and conditioning pass-throughs (FluxGuidance and the like) are
+        followed; returns the composite's part values, the depth reached and
+        its node ID. ``text`` follows a composite only at output slot 0, so a
+        stage whose positive failed as ``composite`` reached it there.
+        """
+        depth = 0
+        while _link(value) and depth < self.max_depth:
+            node_id, slot = str(value[0]), value[1]
+            name, inputs = self.node(node_id)
+            depth += 1
+            if name == "Reroute" and slot == 0:
+                value = _reroute_value(inputs)
+                continue
+            forward = self.semantics.conditioning.get((name, slot))
+            if forward is not None and forward["strategy"] == "passthrough":
+                value = inputs.get(forward["input"])
+                continue
+            composite = self.semantics.composites.get(name)
+            if composite is None or composite.get("additive") is not True:
+                return None
+            return [inputs.get(part) for part in composite["inputs"]], depth, node_id
+        return None
 
     @staticmethod
     def walk_from(value: list) -> Tuple[deque, set]:
@@ -1137,6 +1532,142 @@ class _GraphResolver:
             _link(inputs.get(key)) for key in stage_inputs["with_model"]
         )
 
+    def same_conditioning(self, first: str, second: str) -> bool:
+        """Whether two listed samplers read the very same conditioning links.
+
+        Compared by the sampler table's conditioning inputs (positive and
+        negative, or a custom sampler's guider): each a link, equal by node ID
+        text and slot. Then their prompt is one, whatever their stage order.
+        """
+        keys = []
+        for node_id in (first, second):
+            name, inputs = self.node(node_id)
+            conditioning = self.semantics.samplers[name]["conditioning"]
+            values = []
+            for role in sorted(conditioning):
+                value = inputs.get(conditioning[role])
+                if not _link(value):
+                    return False
+                values.append((role, str(value[0]), str(value[1])))
+            keys.append(tuple(values))
+        return keys[0] == keys[1]
+
+    def alone(self, node_id: str) -> bool:
+        """Whether a sampler's prompt is its own links' text alone.
+
+        True when it sets no prompt override and its latent ancestry reaches no
+        listed sampler (a plain first stage). Any failure but running out of
+        visits is ``False``; the walk never recurses into another stage.
+        """
+        name, inputs = self.node(node_id)
+        entry = self.semantics.samplers[name]
+        if entry["strategy"] == _DETAILER:
+            return False
+        if any(
+            inputs.get(override) not in (None, "")
+            for override in entry.get("prompt_overrides", ())
+        ):
+            return False
+        value = inputs.get(entry.get("latent")) if entry.get("latent") else None
+        if value is None:
+            return True
+        if not _link(value):
+            return False
+        queue, queued = self.walk_from(value)
+        try:
+            while queue:
+                current, depth = queue.popleft()
+                if current == node_id or depth >= self.max_depth:
+                    return False
+                self.budget.spend()
+                name, inputs = self.node(current)
+                if name in self.stage_classes or self.stage_shaped(name, inputs):
+                    return False
+                self.enqueue(queue, queued, inputs, depth + 1)
+        except _Unresolved as error:
+            if error.code == "work-limit":
+                raise
+            return False
+        return True
+
+    def saver_stages(self, file_name: Any) -> Optional[list]:
+        """The candidate samplers of the one saver that wrote ``file_name``.
+
+        A saver is any node with a ``filename_prefix`` (literal, or traced as a
+        string) whose last path part makes the file's stem
+        ``<prefix>_<digits>`` with an optional trailing ``_`` (ComfyUI's and
+        VideoHelperSuite's counters). Exactly one saver must match; its
+        linked inputs are walked like a detailer's image ancestry. No match,
+        several, an unreadable walk or no candidate sampler is ``None``: the
+        file is then judged unanchored, never guessed (#381).
+        """
+        match = self.saver_match(file_name)
+        return self.saver_walk(match) if match is not None else None
+
+    def saver_match(self, file_name: Any) -> Optional[str]:
+        """The one node whose ``filename_prefix`` names ``file_name``, or None."""
+        stem = _file_stem(file_name)
+        if stem is None:
+            return None
+        self.budget.reset(self.per_candidate_visits)
+        try:
+            matches = [
+                node_id
+                for node_id, node in self.graph.items()
+                if self.writes(node, stem)
+            ]
+        except (_Unresolved, _Diverging):
+            return None
+        return matches[0] if len(matches) == 1 else None
+
+    def recorded_saver_stages(self, node_id: str) -> Optional[list]:
+        """The candidate samplers of the save node recorded history names (#386).
+
+        The node is walked exactly like a file-name match. A node the graph
+        lacks, a failing walk or no candidate sampler is ``None``: unanchored.
+        """
+        if not isinstance(self.graph.get(node_id), dict):
+            return None
+        self.budget.reset(self.per_candidate_visits)
+        return self.saver_walk(node_id)
+
+    def saver_walk(self, saver_id: str) -> Optional[list]:
+        """The listed samplers in one saver's linked inputs' ancestry, or None."""
+        try:
+            _, inputs = self.node(saver_id)
+            values = [
+                value
+                for name, value in inputs.items()
+                if name != "filename_prefix" and _link(value)
+            ]
+            found = self.stages_from(saver_id, values)
+        except (_Unresolved, _Diverging):
+            return None
+        candidates = [
+            node_id
+            for node_id in found
+            if self.graph[node_id]["class_type"] in self.sampler_classes
+        ]
+        return candidates or None
+
+    def writes(self, node: Any, stem: str) -> bool:
+        """Whether a node's ``filename_prefix`` names the file ``stem``."""
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            return False
+        prefix = node["inputs"].get("filename_prefix")
+        if _link(prefix):
+            try:
+                prefix = self.text(prefix, "string")[0]
+            except _Diverging:
+                return False
+            except _Unresolved as error:
+                if error.code == "work-limit":
+                    raise  # an unfinished scan anchors nothing (never a guess)
+                return False
+        if not isinstance(prefix, str):
+            return False
+        return _counter_of(prefix.replace("\\", "/").split("/")[-1], stem)
+
     def upstream_stages(self, origin: str, value: Any) -> list:
         """Samplers reached from a detailer's image input, in breadth-first order.
 
@@ -1145,8 +1676,18 @@ class _GraphResolver:
         """
         if not _link(value):
             raise _Unresolved("Expected an image link", "malformed")
+        return self.stages_from(origin, [value])
+
+    def stages_from(self, origin: str, values: list) -> list:
+        """``upstream_stages`` from several start links, queued in order once."""
         found: list = []
-        queue, queued = self.walk_from(value)
+        queue: deque = deque()
+        queued: set = set()
+        for value in values:
+            start = str(value[0])
+            if start not in queued:
+                queued.add(start)
+                queue.append((start, 0))
         while queue:
             node_id, depth = queue.popleft()
             if node_id == origin:
@@ -1180,7 +1721,10 @@ class _GraphResolver:
             if self.semantics.samplers[self.graph[node_id]["class_type"]]["strategy"]
             == _DETAILER
         ]
-        if not detailers:
+        # A sampler whose latent continues another's (hires-fix, refiner) is
+        # judged with it in ``stage``, like a detailer's upstream samplers.
+        continued = self.continued_stages(sampler_ids) if len(sampler_ids) > 1 else []
+        if not detailers and not continued:
             return sampler_ids
         try:
             consumers = self.consumers()
@@ -1197,8 +1741,35 @@ class _GraphResolver:
                         absorbed.add(node_id)
             except _Unresolved:
                 continue
+        for node_id in continued:
+            self.budget.reset(self.per_candidate_visits)
+            try:
+                if not self.reaches_output(node_id, consumers):
+                    absorbed.add(node_id)
+            except _Unresolved:
+                continue
         kept = [node_id for node_id in sampler_ids if node_id not in absorbed]
         return kept or sampler_ids
+
+    def continued_stages(self, sampler_ids: list) -> list:
+        """Lineage predecessors of the non-detailer candidates, in order, once.
+
+        A predecessor equal to its own sampler (a cycle) is left out; a walk
+        that cannot read a node names none.
+        """
+        found: list = []
+        for node_id in sampler_ids:
+            entry = self.semantics.samplers[self.graph[node_id]["class_type"]]
+            if entry["strategy"] == _DETAILER or entry.get("latent") is None:
+                continue
+            try:
+                _, inputs = self.node(node_id)
+                earlier = self.lineage_predecessor(inputs.get(entry["latent"]))
+            except _Unresolved:
+                continue
+            if earlier is not None and earlier != node_id and earlier not in found:
+                found.append(earlier)
+        return found
 
     def file_stages(self, sampler_ids: list) -> list:
         """Stages not proven preview-only; all of them when every one is.
@@ -1234,10 +1805,13 @@ class _GraphResolver:
 
     def non_file_outputs(self) -> set:
         names = self.semantics.non_file_outputs
+        # Only a string names a class: a list or object is never looked up (#286).
         return {
             node_id
             for node_id, node in self.graph.items()
-            if isinstance(node, dict) and node.get("class_type") in names
+            if isinstance(node, dict)
+            and isinstance(node.get("class_type"), str)
+            and node["class_type"] in names
         }
 
     def producers_of(self, starts: list, previews: set) -> set:
@@ -1305,17 +1879,20 @@ class _GraphResolver:
         """
         pending: list = [{}]
         results: list = []
+        several = False
         try:
             while pending:
                 self.choices = pending.pop(0)
                 try:
                     results.append(self.stage(sampler_id, frozenset()))
                 except _Diverging as diverging:
-                    if len(results) + len(pending) + 2 > _MAX_BRANCH_CANDIDATES:
+                    count = len(diverging.choices)
+                    if len(results) + len(pending) + count > _MAX_BRANCH_CANDIDATES:
                         raise _Unresolved("Too many selector branches", "work-limit")
+                    several = several or diverging.sources
                     pending.extend(
                         {**self.choices, diverging.key: choice}
-                        for choice in (True, False)
+                        for choice in diverging.choices
                     )
         except _Unresolved as error:
             return _result(
@@ -1329,12 +1906,18 @@ class _GraphResolver:
             self.choices = {}
         if all(item["state"] == "unresolved" for item in results):
             return results[0]
+        if several:
+            # Chained unknown nodes can offer one text twice: list it once.
+            unique: dict = {}
+            for item in results:
+                unique.setdefault(_outcome_key(item), item)
+            results = list(unique.values())
         if len({_outcome_key(item) for item in results}) == 1:
             return results[0]
         return _result(
             "ambiguous",
             sampler_id=sampler_id,
-            reason="Selector branches have different prompts",
+            reason=SEVERAL_SOURCES_REASON if several else SELECTOR_BRANCHES_REASON,
             candidates=results,
         )
 
@@ -1375,7 +1958,13 @@ class _GraphResolver:
                     reason=absent_reason,
                 )
             negative = self.side(inputs[negative_name], sampler_id, guider_id, depth)
-            return _result("resolved", positive, negative, sampler_id)
+            return _result(
+                "resolved",
+                positive,
+                negative,
+                sampler_id,
+                _parts_reason(positive, negative),
+            )
         except _Unresolved as error:
             return _result(
                 "unresolved",
@@ -1426,7 +2015,7 @@ class _GraphResolver:
             return
         raise self.unsupported("Unsupported latent ancestry", node_id)
 
-    def latent_checked(self, sampler_id: str, value: Any) -> None:
+    def latent_checked(self, sampler_id: str, value: Any) -> Optional[str]:
         """``latent_stages`` once per sampler per resolution.
 
         A candidate reusing another candidate's walk is charged its visit cost
@@ -1435,26 +2024,29 @@ class _GraphResolver:
         out of work is never reused, since it depends on the remaining budget.
         """
         if sampler_id in self.latent_walks:
-            error, cost = self.latent_walks[sampler_id]
+            error, cost, earlier = self.latent_walks[sampler_id]
             if sampler_id not in self.latent_charged:
                 self.budget.charge(cost)
                 self.latent_charged.add(sampler_id)
         else:
             before = self.budget.allowance
+            earlier = None
             try:
-                self.latent_stages(sampler_id, value)
+                earlier = self.latent_stages(sampler_id, value)
                 error = None
             except _Unresolved as raised:
                 if raised.code == "work-limit":
                     raise
                 error = raised
-            self.latent_walks[sampler_id] = (error, before - self.budget.allowance)
+            cost = before - self.budget.allowance
+            self.latent_walks[sampler_id] = (error, cost, earlier)
             self.latent_charged.add(sampler_id)
         if error is not None:
             node = dict(error.node) if error.node is not None else None
             raise _Unresolved(str(error), error.code, node)
+        return earlier
 
-    def latent_stages(self, origin: str, value: Any) -> None:
+    def latent_stages(self, origin: str, value: Any) -> Optional[str]:
         """Semantics table: is there an earlier sampler in the latent ancestry?
 
         Every link input of non-sampler nodes is walked breadth-first (encoders,
@@ -1463,10 +2055,14 @@ class _GraphResolver:
         (VAEEncode, EmptyLatentBatch, WanImageToVideo slot 2, ...). An unlisted
         node with sampler-shaped inputs could itself be a stage, so it is
         ``unsupported-node``. Budget or depth exhaustion is never single stage.
+        One earlier sampler that the latent continues through ``lineage``
+        nodes (``lineage_predecessor``) is returned, to be compared in
+        ``stage``; any other sampler found leaves the stages unattributed.
         """
         if not _link(value):
             raise _Unresolved("Unknown latent ancestry", "malformed")
         queue, queued = self.walk_from(value)
+        earlier, lineage, traced = None, None, False
         while queue:
             node_id, depth = queue.popleft()
             if node_id == origin:
@@ -1476,12 +2072,21 @@ class _GraphResolver:
             self.budget.spend()
             name, inputs = self.node(node_id)
             if name in self.stage_classes:
-                # ``multistage-differs`` is reserved for when stage texts are
-                # compared (PR3); until then no stage's prompt is chosen.
-                raise _Unresolved(MULTISTAGE_UNATTRIBUTED_REASON)
+                if not traced:
+                    lineage, traced = self.lineage_predecessor(value), True
+                if node_id != lineage:
+                    if self.same_conditioning(origin, node_id) and self.alone(node_id):
+                        # Same positive and negative links: the same prompt
+                        # whichever stage this is (#381).
+                        continue
+                    # Not the one continued stage: no stage's prompt is chosen.
+                    raise _Unresolved(MULTISTAGE_UNATTRIBUTED_REASON)
+                earlier = node_id
+                continue
             if self.stage_shaped(name, inputs):
                 raise self.unsupported("Unsupported latent ancestry", node_id)
             self.enqueue(queue, queued, inputs, depth + 1)
+        return earlier
 
     def anchor(self, node_id: str) -> str:
         seen = set()
@@ -1607,6 +2212,26 @@ def _parameters(value: Any, max_text_length: int, inspection: bool = False) -> d
     return _result("resolved", positive_side, negative_side)
 
 
+def _file_stem(file_name: Any) -> Optional[str]:
+    """A file name's last path part without its extension, or ``None``."""
+    if not isinstance(file_name, str) or not file_name:
+        return None
+    base = file_name.replace("\\", "/").split("/")[-1]
+    dot = base.rfind(".")
+    stem = base[:dot] if dot > 0 else base
+    return stem or None
+
+
+def _counter_of(prefix: str, stem: str) -> bool:
+    """Whether ``stem`` is ``prefix`` + ``_`` + ASCII digits [+ ``_``]."""
+    if not prefix or not stem.startswith(prefix + "_"):
+        return False
+    rest = stem[len(prefix) + 1 :]
+    if rest.endswith("_"):
+        rest = rest[:-1]
+    return rest != "" and all("0" <= char <= "9" for char in rest)
+
+
 def _profile_with(
     profile: ResolverProfile,
     max_visits: Optional[int],
@@ -1651,17 +2276,28 @@ def resolve_prompt_pair(
     max_visits: Optional[int] = None,
     max_depth: Optional[int] = None,
     max_text_length: Optional[int] = None,
+    file_name: Optional[str] = None,
+    recorded_saver_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve parsed metadata; a present API graph is authoritative over text.
 
     Accepts ``{"prompt": api_graph, "parameters": optional_a1111_text}`` or a
     direct API graph. An optional saver/sampler node ID anchors branch selection.
-    Unanchored multiple samplers are ambiguous, even when their texts are equal
-    (the inspection profile first drops stages that only reach previews).
+    Unanchored multiple samplers are ambiguous unless every branch resolves to
+    the same texts and recipes; then that shared pair is resolved with no
+    ``sampler_id`` (the inspection profile first drops stages that only reach
+    previews).
     ``profile`` selects the bounds; explicit ``max_*`` keywords override it.
+    ``file_name`` (inspection only, unanchored) anchors on the one saver that
+    wrote that file (``_GraphResolver.saver_stages``) when exactly one matches.
+    ``recorded_saver_id`` (inspection only, unanchored) is the save node that
+    recorded history says wrote the file (#386); it is tried before the file
+    name, and a node that yields no candidate sampler anchors nothing.
     """
     profile = _profile_with(profile, max_visits, max_depth, max_text_length)
-    result = _resolve(metadata, output_node_id, adapters, profile)
+    result = _resolve(
+        metadata, output_node_id, adapters, profile, file_name, recorded_saver_id
+    )
     return _legacy_result(result) if profile.legacy else result
 
 
@@ -1714,6 +2350,8 @@ def _resolve(
     output_node_id: Optional[str],
     adapters: Optional[Mapping[Tuple[str, int], OutputAdapter]],
     profile: ResolverProfile,
+    file_name: Optional[str] = None,
+    recorded_saver_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not isinstance(metadata, dict) or not metadata:
         return _result("absent", reason="No parsed prompt metadata")
@@ -1769,28 +2407,100 @@ def _resolve(
                 "unresolved", reason=str(error), reason_code=error.code, node=error.node
             )
     else:
-        sampler_ids = [
+        anchored, by_record = None, False
+        if semantics is not None and recorded_saver_id is not None:
+            anchored = _recorded_anchor(resolver, str(recorded_saver_id), file_name)
+            by_record = anchored is not None
+        elif semantics is not None and file_name is not None:
+            anchored = resolver.saver_stages(file_name)
+        sampler_ids = anchored or [
             node_id
             for node_id, node in normalized.items()
             if isinstance(node, dict)
             and isinstance(node.get("class_type"), str)
             and node["class_type"] in resolver.sampler_classes
         ]
-        if semantics is not None:
+        if semantics is not None and anchored is None:
             sampler_ids = resolver.final_stages(sampler_ids)
+        if semantics is not None and recorded_saver_id is not None:
+            # The caller can tell whether history's saver chose the samplers.
+            return {
+                **_judge(resolver, sampler_ids, normalized, profile),
+                "recorded_anchor": by_record,
+            }
+    return _judge(resolver, sampler_ids, normalized, profile)
+
+
+def _recorded_anchor(
+    resolver: "_GraphResolver", saver_id: str, file_name: Optional[str]
+) -> Optional[list]:
+    """The samplers of the saver history recorded, or None (#386).
+
+    A file name that names a different saver contradicts history: no anchor.
+    """
+    named = resolver.saver_match(file_name) if file_name is not None else None
+    if named is not None and named != saver_id:
+        return None
+    return resolver.recorded_saver_stages(saver_id)
+
+
+def _judge(
+    resolver: "_GraphResolver",
+    sampler_ids: list,
+    normalized: dict,
+    profile: ResolverProfile,
+) -> Dict[str, Any]:
     if not sampler_ids:
         return _no_sampler(normalized, profile)
     if len(sampler_ids) > 1:
+        candidates = [resolver.pair(node_id) for node_id in sampler_ids]
+        shared = _shared_pair(candidates)
+        if shared is not None:
+            return shared
         return _result(
             "ambiguous",
             reason="Multiple sampler branches",
-            candidates=[resolver.pair(node_id) for node_id in sampler_ids],
+            candidates=candidates,
         )
     return resolver.pair(sampler_ids[0])
 
 
+def _recipe_key(result: Dict[str, Any]) -> tuple:
+    """What a reader sees of a result, plus each side's stored recipe."""
+    return _outcome_key(result) + tuple(
+        result[role]["storage_text"] if isinstance(result[role], dict) else None
+        for role in ("positive", "negative")
+    )
+
+
+def _shared_pair(candidates: list) -> Optional[Dict[str, Any]]:
+    """The one pair every sampler branch resolved to, or None (#249).
+
+    A compare grid runs several samplers on one positive and one negative: the
+    prompt is certain even though no single branch made the image. Every branch
+    must be resolved with identical texts and recipes; any other mix stays
+    ambiguous. No sampler is named, since none alone made the output; the sides
+    (and their provenance) are the first branch's, and every branch stays listed
+    in ``candidates`` as the evidence.
+    """
+    first = candidates[0]
+    if first["state"] != "resolved":
+        return None
+    if len({_recipe_key(item) for item in candidates}) != 1:
+        return None
+    return _result(
+        "resolved",
+        positive=first["positive"],
+        negative=first["negative"],
+        reason=IDENTICAL_BRANCHES_REASON,
+        candidates=candidates,
+    )
+
+
 # Bounds for walking a UI workflow's subgraph instances (R1 only).
 _MAX_SUBGRAPH_DEPTH = 8
+# The inspector's own line for evidence it cannot read (``inspect_prompt_evidence``).
+MALFORMED_EVIDENCE_REASON = "Prompt evidence is malformed"
 _MAX_WORKFLOW_NODES = 100_000
 
 
@@ -1821,7 +2531,9 @@ def _prompt_manager_widgets(workflow: Any) -> Dict[str, str]:
 
     Nodes inside a subgraph run as ``"<instance>:<inner>"`` API IDs (nested
     instances chain their IDs); a definition without an instance runs nothing.
-    The walk is bounded in depth and in nodes visited.
+    The walk is bounded in depth and in nodes visited. A node whose ``type`` is
+    a list or an object is skipped: it is neither a subgraph instance nor a
+    PromptManager node (#286).
     """
     nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
     if not isinstance(nodes, list):
@@ -1841,6 +2553,9 @@ def _prompt_manager_widgets(workflow: Any) -> Dict[str, str]:
             if not isinstance(node_id, (str, int)) or isinstance(node_id, bool):
                 continue
             api_id = f"{prefix}{node_id}"
+            if isinstance(kind, (list, dict)):
+                # JSON's unhashable values are never a node type (#286).
+                continue
             if kind in subgraphs and depth < _MAX_SUBGRAPH_DEPTH:
                 stack.append((subgraphs[kind], api_id + ":", depth + 1))
                 continue
@@ -1920,3 +2635,115 @@ def resolve_text_input(
         return resolver.text(inputs.get(input_name), "string")[0]
     except _Unresolved:
         return None
+
+
+_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+
+
+def _numeric(text: str) -> bool:
+    """Whether ``text`` is a plain number (a widget value such as ``2048``)."""
+    return _NUMBER.fullmatch(text) is not None
+
+
+def sampler_less_prompt(graph: Any, *, max_visits: int = 500) -> Dict[str, Any]:
+    """The positive prompt of an API graph with no sampler pair, if one (#252).
+
+    For graphs ``_no_sampler`` finds ``absent`` (no node takes a ``positive``
+    or ``negative`` input, such as a Flux guider or a video wrapper). Only the
+    executed API graph is read, never the UI workflow. A candidate is a node
+    with a ``text`` input whose output another node consumes: a text that
+    feeds nothing did not make the image. Its text is traced as a STRING
+    (``resolve_text_input``); a linked text no rule reads is unknown unless
+    it is built from a candidate's text (``_covered``). Blank and
+    numeric texts are never prompts, and a node with a seed input holds a
+    template, not the prompt (unknown). This repository's own positive-text
+    nodes are authoritative: when they give a text, only they count.
+
+    Returns ``{"state", "text", "texts"}``: ``resolved`` with the one distinct
+    text; ``ambiguous`` when several texts or an unknown one could be the
+    prompt (``texts`` lists the readable ones); ``absent`` when none.
+    """
+    absent = {"state": "absent", "text": None, "texts": []}
+    if not isinstance(graph, dict) or not graph or len(graph) > max_visits:
+        return absent
+    nodes = {str(key): value for key, value in graph.items()}
+    consumed = {
+        str(value[0])
+        for node in nodes.values()
+        if isinstance(node, dict) and isinstance(node.get("inputs"), dict)
+        for value in node["inputs"].values()
+        if _link(value)
+    }
+    own: list = []
+    other: list = []
+    unknown = False
+    for node_id, node in nodes.items():
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if node_id not in consumed or not _has_text_input(node):
+            continue
+        if _seeded(inputs):
+            # Generated at run time (a wildcard or a language model): its
+            # text input is a template, not the prompt that ran.
+            unknown = True
+            continue
+        value = inputs["text"]
+        text = resolve_text_input(nodes, node_id, "text", max_visits=max_visits)
+        if text is None:
+            # A literal that is not a string (a number) is never a prompt.
+            if _link(value) and not _covered(nodes, value):
+                unknown = True
+            continue
+        text = text.strip()
+        if not text or _numeric(text):
+            continue
+        kind = node.get("class_type")
+        if isinstance(kind, str) and kind in _OWN_CLASSES and "Negative" not in kind:
+            own.append(text)
+        else:
+            other.append(text)
+    texts = list(dict.fromkeys(own or other))
+    if len(texts) == 1 and (own or not unknown):
+        return {"state": "resolved", "text": texts[0], "texts": texts}
+    if texts or unknown:
+        return {"state": "ambiguous", "text": None, "texts": texts}
+    return absent
+
+
+def _has_text_input(node: Any) -> bool:
+    inputs = node.get("inputs") if isinstance(node, dict) else None
+    return isinstance(inputs, dict) and "text" in inputs
+
+
+def _seeded(inputs: dict) -> bool:
+    """A seed input: the node's string output is a run-time value (the
+    resolver's ``runtime-value`` rule)."""
+    return any(isinstance(name, str) and name.endswith("seed") for name in inputs)
+
+
+def _covered(nodes: dict, link: list) -> bool:
+    """Whether an unreadable text link is built from a candidate's text.
+
+    True when a node upstream of ``link`` is read through its first output
+    (slot 0, the legacy encoder rule's text) and has an unseeded ``text``
+    input: that candidate is read on its own, and whatever else is joined to
+    it at run time (a caption, a language model) is no stored prompt to
+    choose. Another output of such a node (a loader's trigger words) is not
+    its text. False when the text comes only from inputs no candidate holds
+    (a builder's ``prompt`` field): the prompt is unknown then.
+    """
+    seen, stack = set(), [(str(link[0]), link[1])]
+    while stack:
+        node_id, slot = stack.pop()
+        if (node_id, slot) in seen:
+            continue
+        seen.add((node_id, slot))
+        node = nodes.get(node_id)
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        if not isinstance(inputs, dict):
+            continue
+        if "text" in inputs and slot == 0 and not _seeded(inputs):
+            return True
+        stack.extend(
+            (str(value[0]), value[1]) for value in inputs.values() if _link(value)
+        )
+    return False

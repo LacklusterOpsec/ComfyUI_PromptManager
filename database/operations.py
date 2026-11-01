@@ -4,25 +4,59 @@ Database operations for KikoTextEncode prompt storage and retrieval.
 
 import sqlite3
 import json
+import math
 import datetime
 import os
-from typing import Optional, List, Dict, Any, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:
+    from ..utils.inspection_response import inherited_category
+except ImportError:
+    from utils.inspection_response import inherited_category
 
 from .models import PromptModel, normalize_image_path, utc_now_iso
-from .pairs import PairDependencyError, PairOperations
+from .pairs import PairDependencyError, PairOperations  # noqa: F401 (re-exported)
 from .library import LibraryOperations, titled
 from .image_favorites import ImageFavoriteOperations
+from .image_removal import ImageRemovalOperations, removed_from_library
+from .image_collections import ImageCollectionOperations
+from .annotations import AnnotationOperations
+from .review import ReviewOperations
+from .review_decisions import ReviewDecisionOperations
+from .saved_views import SavedViewOperations
 from .library_commands import LibraryCommandOperations
+from .library_archive import LibraryArchiveOperations, delete_prompt_rows
 from .vocabulary import VocabularyOperations
 from .execution_history import ExecutionHistoryOperations
-from .execution_contexts import ExecutionContextOperations, LIVE_HINT_CTES
+from .execution_contexts import ExecutionContextOperations
 from .execution_outputs import ExecutionOutputOperations
 from .history_reads import HistoryReadOperations
+from .health import HealthOperations, iter_consistency_issues
+from .duplicate_copies import DuplicateCopyOperations
+from .workflow_storage import WorkflowStorageOperations
+from .category_import import CategoryImportOperations
+from .image_categories import ImageCategoryOperations
+from .workflow_documents import (
+    DocumentReader,
+    documents_of_rows,
+    release_documents,
+    resolve_image_row,
+    stored_values,
+)
+from .maintenance import (  # noqa: F401  (ORPHANED_PROMPTS_SQL is re-exported)
+    ORPHANED_PROMPTS_SQL,
+    _LINK_ROWS_SQL,
+    MaintenanceOperations,
+    _delete_ids,
+    _orphaned_ids,
+)
 
 # Import logging system
 try:
     from ..utils.logging_config import get_logger
     from ..utils.hashing import generate_prompt_hash
+    from ..utils.json_strict import dumps_strict
+    from ..utils import library_location
 except ImportError:
     import sys
 
@@ -30,6 +64,8 @@ except ImportError:
     sys.path.insert(0, current_dir)
     from utils.logging_config import get_logger
     from utils.hashing import generate_prompt_hash
+    from utils.json_strict import dumps_strict
+    from utils import library_location
 
 
 # Subquery to fetch tags from junction table, embedded in SELECT statements
@@ -75,40 +111,56 @@ def escape_like(term: str) -> str:
     )
 
 
-def _resolve_db_path(db_path: Optional[str] = None) -> str:
-    """Resolve the database path from config, falling back to defaults.
+def _configured_default_path():
+    """config.json's ``database.default_path``, or None.
 
-    When no explicit path is given, reads PromptManagerConfig.DEFAULT_DB_PATH
-    (set via config.json). Relative paths are resolved against the extension
-    root directory so the database location is predictable regardless of the
-    process working directory (important for Docker deployments).
+    The package-qualified config wins over a standalone ``py.config`` (a
+    custom-node package uses its own configuration).
+    """
+    try:
+        try:
+            from ..py.config import PromptManagerConfig
+        except ImportError:
+            from py.config import PromptManagerConfig
+    except Exception:
+        return None
+    return getattr(PromptManagerConfig, "DEFAULT_DB_PATH", None)
+
+
+def resolve_library_location():
+    """Where the library lives now (``utils.library_location``, #249 S6b).
+
+    The image sources that rule out a ``PROMPT_MANAGER_DATA_DIR`` are read by
+    the resolver itself, exactly as ``config_location`` reads them.
+    """
+    return library_location.resolve_library(_configured_default_path())
+
+
+def _resolve_db_path(db_path: Optional[str] = None) -> str:
+    """Resolve the database path through the one library resolver.
+
+    With no explicit path, ``utils.library_location.resolve_library`` decides
+    (``PROMPT_MANAGER_DATA_DIR``, an explicit ``database.default_path``, a
+    node-folder library not moved yet, else ComfyUI's ``user/__promptmanager``).
+    An explicit relative path is resolved against the extension root, as
+    before, so the location does not depend on the working directory.
 
     Args:
-        db_path: Explicit database path, or None to use config/default.
+        db_path: Explicit database path, or None to use the resolver.
 
     Returns:
-        Absolute path to the SQLite database file.
+        Absolute path to the SQLite database file; its folder exists (a new
+        data folder is created owner-only).
     """
-    extension_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
     if db_path is None:
-        try:
-            try:
-                from ..py.config import PromptManagerConfig
-            except ImportError:
-                from py.config import PromptManagerConfig
-
-            db_path = PromptManagerConfig.DEFAULT_DB_PATH
-        except Exception:
-            db_path = "prompts.db"
-
-    if not os.path.isabs(db_path):
+        db_path = resolve_library_location().db_path
+    elif not os.path.isabs(db_path):
+        extension_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         db_path = os.path.normpath(os.path.join(extension_root, db_path))
 
-    # Ensure parent directory exists for custom paths
     parent = os.path.dirname(db_path)
     if parent:
-        os.makedirs(parent, exist_ok=True)
+        library_location.ensure_private_dir(parent)
 
     return db_path
 
@@ -158,27 +210,20 @@ def _coerce_file_info(metadata: Any) -> tuple:
     )
 
 
-# Exempt references: images, pairs, the __protected__ tag, Library parent
-# state, and live recorded-run hints (computed once, see LIVE_HINT_CTES).
-ORPHANED_PROMPTS_SQL = "WITH " + LIVE_HINT_CTES + """
-SELECT p.id FROM prompts p
-LEFT JOIN generated_images gi ON p.id = gi.prompt_id
-WHERE gi.prompt_id IS NULL
-AND NOT EXISTS (
-    SELECT 1 FROM prompt_pairs pp
-    WHERE pp.positive_prompt_id = p.id OR pp.negative_prompt_id = p.id
-)
-AND NOT EXISTS (
-    SELECT 1 FROM prompt_tags pt
-    JOIN tags t ON pt.tag_id = t.id
-    WHERE pt.prompt_id = p.id AND t.name = '__protected__'
-)
-AND NOT EXISTS (
-    SELECT 1 FROM prompt_library_state ls WHERE ls.prompt_id = p.id
-)
-AND p.id NOT IN (SELECT prompt_id FROM live_hint_prompts)
-"""
-
+# The scan's known set (#249 Activity-2): every image row, with its stored file
+# size and whether its pair link is resolved: exactly one distinct pair, the rule
+# _LINK_SUMMARY_SQL and get_image_prompt_info use. A file is known and resolved
+# when it has exactly one image row, that row is resolved, and the row's stored
+# size equals the file's size now; several rows (one file linked to more than
+# one prompt) are ambiguous, and an unknown (NULL) stored size is not known. The
+# rows are streamed in fetches of KNOWN_PATHS_FETCH_SIZE and only the scanned
+# paths are kept, so memory follows the scan (at most MAX_SCAN_FILES paths), not
+# the table.
+_KNOWN_PATHS_SQL = """SELECT gi.file_path, gi.image_path, gi.file_size,
+       (SELECT COUNT(DISTINCT ip.pair_id) FROM image_prompt_pairs ip
+        WHERE ip.image_id = gi.id) = 1
+FROM generated_images gi"""
+KNOWN_PATHS_FETCH_SIZE = 1000
 
 # One SELECT reads the link summaries of at most this many paths: three bound
 # parameters per path stays under SQLite's historical 999-variable limit.
@@ -201,12 +246,17 @@ LEFT JOIN prompt_library_state pls ON pls.prompt_id = pp.positive_prompt_id
 WHERE gi.image_path IN ({marks}) OR gi.file_path IN ({marks}){fallback}"""
 # One image row describes a card only when no other row claims the same file
 # (as in get_image_link_summaries, several rows are ambiguous). The pair scope
-# and the linked positive follow _LINK_SUMMARY_SQL; category, rating, tags and
-# the searchable text and titles come from that positive (spec D12/D13). Every
+# and the linked positive follow _LINK_SUMMARY_SQL; rating, tags and the
+# searchable text and titles come from that positive (spec D12/D13). The raw
+# recipe and positive categories are read for the inherited category, which
+# Python decides (``inherited_category``, #332 MC4); SQL never filters by
+# category. Every
 # writer since the 3.2.4 migration stores file_path, so it is the path key.
 # The prompt-level conditions are uncorrelated IN sets SQLite builds once, and
 # the CASE evaluates the per-row ambiguity probe only for admitted rows.
-_LINK_FILTER_SQL = """SELECT gi.file_path, p.rating, {hit}, p.id
+_LINK_FILTER_SQL = """SELECT gi.file_path AS file_path, p.rating AS rating,
+       {hit} AS matched, p.id AS positive, pp.id IS NOT NULL AS has_pair,
+       pp.category AS pair_category, p.category AS category
 FROM generated_images gi
 LEFT JOIN prompt_pairs pp ON pp.id = (
     SELECT CASE WHEN COUNT(DISTINCT ip.pair_id) = 1 THEN MIN(ip.pair_id) END
@@ -215,6 +265,44 @@ JOIN prompts p ON p.id = COALESCE(pp.positive_prompt_id, gi.prompt_id)
 WHERE gi.file_path IS NOT NULL AND CASE WHEN {admit} THEN NOT EXISTS (
     SELECT 1 FROM generated_images other
     WHERE other.file_path = gi.file_path AND other.id <> gi.id) ELSE 0 END"""
+# _LINK_FILTER_SQL's rows as one JSON array, built by SQLite in one step (#354).
+# Python's sqlite3 releases and retakes the GIL around every step, so a read
+# that steps once per linked row waits on a busy ComfyUI thread thousands of
+# times. A BLOB value (no writer stores one) makes the value NULL (or
+# json_array refuses it), and the read streams instead. The raw categories are
+# put in only for a category read (#332), so plain reads stay as small as #354
+# measured them.
+_LINK_MATCHES_JSON_SQL = """SELECT CASE
+    WHEN max({blob}) THEN NULL
+    ELSE json_group_array(json_array({columns})) END
+FROM ({select})"""
+_LINK_PLAIN_COLUMNS = ("file_path", "rating", "matched", "positive")
+_LINK_CATEGORY_COLUMNS = _LINK_PLAIN_COLUMNS + ("has_pair", "pair_category", "category")
+# The columns a BLOB can reach: matched, positive and has_pair are computed.
+_LINK_STORED_COLUMNS = ("file_path", "rating", "pair_category", "category")
+# Set when this SQLite has no JSON functions: every later read streams.
+_one_step_unsupported = False
+# One warning per process when a read falls back to streaming.
+_one_step_warned = False
+# The linked positive of each given path (one unambiguous link, pair scope as
+# in _LINK_FILTER_SQL) with the raw categories of its inherited category; {hit}
+# as in link_filter_query. Used for the few files whose current image tags meet
+# a Tags filter (#249 B3).
+_LINK_FACTS_SQL = """SELECT gi.file_path, p.rating, {hit}, p.id,
+pp.id IS NOT NULL, pp.category, p.category
+FROM generated_images gi
+LEFT JOIN prompt_pairs pp ON pp.id = (
+    SELECT CASE WHEN COUNT(DISTINCT ip.pair_id) = 1 THEN MIN(ip.pair_id) END
+    FROM image_prompt_pairs ip WHERE ip.image_id = gi.id)
+JOIN prompts p ON p.id = COALESCE(pp.positive_prompt_id, gi.prompt_id)
+WHERE gi.file_path IN ({marks}) AND NOT EXISTS (
+    SELECT 1 FROM generated_images other
+    WHERE other.file_path = gi.file_path AND other.id <> gi.id)"""
+_POSITIVE_TAG_NAMES_SQL = (
+    "SELECT pt.prompt_id, t.name FROM prompt_tags pt JOIN tags t "
+    "ON t.id = pt.tag_id WHERE pt.prompt_id IN ({marks})"
+)
+_FACTS_CHUNK = 500
 # The positive's text, its Library title or one of its tag names contains
 # :pattern (LIKE, so ASCII case is ignored as in Library search). A pair's own
 # title names its negative variant and is never searched (#249 D12).
@@ -230,8 +318,24 @@ _LINK_FILTER_TAG = (
 )
 
 
+# One unambiguously linked image's facts for the Images filters, a plain tuple
+# (hit, rating, positive id, inherited category): built per linked row, so no
+# NamedTuple. The category is the inherited one (#332 MC4: the recipe's when
+# set, else the positive's), never the image's own category.
+LinkMatch = Tuple[bool, Optional[int], int, Any]
+
+
+def _link_match(rating, matched, positive, has_pair, pair_category, category):
+    inherited, _scope = inherited_category(category, pair_category, bool(has_pair))
+    return (bool(matched), rating, positive, inherited)
+
+
 def link_filter_query(
-    q: str, category: Optional[str], tags: List[str], *, every_link: bool = False
+    q: str,
+    tags: List[str],
+    *,
+    every_link: bool = False,
+    category: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """The workspace filter SELECT and its named parameters (all bound).
 
@@ -245,7 +349,9 @@ def link_filter_query(
         params["pattern"] = f"%{escape_like(q)}%"
     admitted = []
     if category is not None:
-        admitted.append("p.category = :category")
+        # Only narrows: an inherited category is one of the two raw values;
+        # which one is decided in Python (inherited_category, #332 MC4).
+        admitted.append("(p.category = :category OR pp.category = :category)")
         params["category"] = category
     for index, tag in enumerate(tags):
         admitted.append(_LINK_FILTER_TAG.format(index=index))
@@ -254,6 +360,50 @@ def link_filter_query(
         admitted.append(hit)
     sql = _LINK_FILTER_SQL.format(hit=hit, admit=" AND ".join(admitted) or "1")
     return sql, params
+
+
+def link_matches_json_query(sql: str, categories: bool = False) -> str:
+    """*sql* from link_filter_query, wrapped to return its rows as one JSON value.
+
+    With *categories* each row also carries the raw values the inherited
+    category is decided from; otherwise only path, rating, hit and positive.
+    """
+    columns = _LINK_CATEGORY_COLUMNS if categories else _LINK_PLAIN_COLUMNS
+    blob = " OR ".join(
+        f"typeof({name}) = 'blob'" for name in _LINK_STORED_COLUMNS if name in columns
+    )
+    return _LINK_MATCHES_JSON_SQL.format(
+        blob=blob, columns=", ".join(columns), select=sql
+    )
+
+
+def _link_matches_from_rows(
+    rows: Iterable[Sequence[Any]], categories: bool, wanted: Optional[Set[str]]
+) -> Dict[str, LinkMatch]:
+    """LinkMatch per wanted path from link rows (one-step or streamed).
+
+    Without *categories* the inherited category is None, as the caller then
+    never compares it.
+    """
+    matches: Dict[str, LinkMatch] = {}
+    for path, rating, matched, positive, *raw in rows:
+        if wanted is None or path in wanted:
+            if categories:
+                matches[path] = _link_match(rating, matched, positive, *raw[:3])
+            else:
+                matches[path] = (bool(matched), rating, positive, None)
+    return matches
+
+
+def _streamed_link_matches(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: Dict[str, Any],
+    wanted: Optional[Set[str]],
+    categories: bool = False,
+) -> Dict[str, LinkMatch]:
+    """The link read stepped once per row (the fallback of the one-step read)."""
+    return _link_matches_from_rows(conn.execute(sql, params), categories, wanted)
 
 
 _ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
@@ -300,12 +450,25 @@ class PromptDatabase(
     PairOperations,
     LibraryOperations,
     LibraryCommandOperations,
+    LibraryArchiveOperations,
     VocabularyOperations,
     ExecutionHistoryOperations,
     ExecutionContextOperations,
     ExecutionOutputOperations,
     HistoryReadOperations,
     ImageFavoriteOperations,
+    ImageCollectionOperations,
+    AnnotationOperations,
+    ReviewOperations,
+    ReviewDecisionOperations,
+    SavedViewOperations,
+    HealthOperations,
+    MaintenanceOperations,
+    DuplicateCopyOperations,
+    WorkflowStorageOperations,
+    CategoryImportOperations,
+    ImageCategoryOperations,
+    ImageRemovalOperations,
 ):
     """Database operations class for managing prompts."""
 
@@ -322,6 +485,25 @@ class PromptDatabase(
         self.logger.debug(f"Initializing database operations with path: {db_path}")
         self.model = PromptModel(db_path)
         self.logger.debug("Database operations initialized successfully")
+
+    def survive_library_switch(self, write):
+        """Run ``write()``; once more if it failed while the library moved.
+
+        A background write (run counting, the image monitor) that was waiting
+        on the old file when Move library switched fails when its connection
+        is closed. When the model's generation changed during the attempt,
+        the write runs again on a fresh connection, which is the new library;
+        any other failure is raised as it was. ``write`` must open its own
+        transaction (every PromptDatabase method does).
+        """
+        generation = self.model.generation
+        try:
+            return write()
+        except Exception:
+            if self.model.generation == generation:
+                raise
+            self.logger.info("Running a write again on the moved library")
+            return write()
 
     def close(self) -> None:
         """Close the calling thread's database connection (see PromptModel.close)."""
@@ -376,26 +558,9 @@ class PromptDatabase(
 
         try:
             with self.model.get_connection() as conn:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO prompts (
-                        text, category, tags, rating, notes, hash, created_at,
-                        updated_at
-                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        text.strip(),
-                        category,
-                        rating,
-                        notes,
-                        prompt_hash,
-                        datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    ),
+                prompt_id = self._insert_prompt(
+                    conn, text, category, tags, rating, notes, prompt_hash
                 )
-                prompt_id = cursor.lastrowid
-                if tags:
-                    self._sync_prompt_tags(conn, prompt_id, tags)
                 conn.commit()
                 self.logger.debug(f"Successfully saved prompt with ID: {prompt_id}")
                 return prompt_id
@@ -410,6 +575,32 @@ class PromptDatabase(
                 f"returning existing ID {existing['id']}"
             )
             return existing["id"]
+
+    def _insert_prompt(
+        self,
+        conn: sqlite3.Connection,
+        text: str,
+        category: Optional[str],
+        tags: Optional[List[str]],
+        rating: Optional[int],
+        notes: Optional[str],
+        prompt_hash: Optional[str],
+    ) -> int:
+        """Insert one prompt row and its tags on ``conn`` (no commit)."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cursor = conn.execute(
+            """
+            INSERT INTO prompts (
+                text, category, tags, rating, notes, hash, created_at,
+                updated_at
+            ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)
+            """,
+            (text.strip(), category, rating, notes, prompt_hash, now, now),
+        )
+        prompt_id = cursor.lastrowid
+        if tags:
+            self._sync_prompt_tags(conn, prompt_id, tags)
+        return prompt_id
 
     def record_prompt_use(self, prompt_id: int, times: int = 1) -> bool:
         """
@@ -743,10 +934,12 @@ class PromptDatabase(
         """
         with self._pair_transaction() as conn:
             self._ensure_prompts_unpaired(conn, [prompt_id])
+            documents = documents_of_rows(conn, "prompt_id", [prompt_id])
             # First delete related images to avoid foreign key constraint
             conn.execute(
                 "DELETE FROM generated_images WHERE prompt_id = ?", (prompt_id,)
             )
+            release_documents(conn, documents)
             # Then delete the prompt
             cursor = conn.execute("DELETE FROM prompts WHERE id = ?", (prompt_id,))
             conn.commit()
@@ -770,10 +963,12 @@ class PromptDatabase(
                 return 0
             self._ensure_prompts_unpaired(conn, ids)
             placeholders = ",".join("?" * len(ids))
+            documents = documents_of_rows(conn, "prompt_id", ids)
             conn.execute(
                 f"DELETE FROM generated_images WHERE prompt_id IN ({placeholders})",
                 ids,
             )
+            release_documents(conn, documents)
             conn.execute(
                 f"DELETE FROM prompt_tags WHERE prompt_id IN ({placeholders})",
                 ids,
@@ -1067,16 +1262,39 @@ class PromptDatabase(
             }
 
     @staticmethod
+    def _bump_image_tag_bytes(conn: sqlite3.Connection, tag_id: int) -> int:
+        """Move the tag revision of every image set that carries *tag_id*.
+
+        Vocabulary rename, merge and delete change what an image's set reads
+        as, so a Tag dialog opened before the change must see ``tag-conflict``
+        on Save instead of recreating the old name. Bumps the image index
+        revision once when any set was affected; returns that count.
+        """
+        cursor = conn.execute(
+            "UPDATE media_annotation_bytes SET tag_revision = tag_revision + 1 "
+            "WHERE id IN (SELECT byte_id FROM media_image_tags WHERE tag_id = ?)",
+            (tag_id,),
+        )
+        if cursor.rowcount > 0:
+            conn.execute(
+                "UPDATE media_annotation_metadata SET "
+                "image_index_revision = image_index_revision + 1 WHERE singleton_id = 1"
+            )
+        return cursor.rowcount
+
+    @classmethod
     def _move_tag_links(
-        conn: sqlite3.Connection, source_id: int, target_id: int
+        cls, conn: sqlite3.Connection, source_id: int, target_id: int
     ) -> None:
-        """Repoint component and pair links from source to target.
+        """Repoint component, pair and image links from source to target.
 
         Owners that already carry the target keep that one link; the source's
-        leftover duplicates are removed. The source registry row is left for the
-        caller to delete.
+        leftover duplicates are removed (an image set keeps the target's
+        position). The source registry row is left for the caller to delete.
+        Image sets that carried the source get a new tag revision first.
         """
-        for junction in ("prompt_tags", "prompt_pair_tags"):
+        cls._bump_image_tag_bytes(conn, source_id)
+        for junction in ("prompt_tags", "prompt_pair_tags", "media_image_tags"):
             conn.execute(
                 f"UPDATE OR IGNORE {junction} SET tag_id = ? WHERE tag_id = ?",
                 (target_id, source_id),
@@ -1129,6 +1347,7 @@ class PromptDatabase(
                 conn.execute("DELETE FROM tags WHERE id = ?", (old_tag_id,))
             else:
                 # Simple rename
+                self._bump_image_tag_bytes(conn, old_tag_id)
                 conn.execute(
                     "UPDATE tags SET name = ? WHERE id = ?", (new_name, old_tag_id)
                 )
@@ -1170,6 +1389,7 @@ class PromptDatabase(
             affected = cursor.fetchone()["c"]
 
             # CASCADE delete handles prompt_tags entries
+            self._bump_image_tag_bytes(conn, tag_id)
             conn.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
             conn.commit()
 
@@ -1222,7 +1442,10 @@ class PromptDatabase(
                 pair_count = conn.execute(
                     "SELECT COUNT(*) FROM prompt_pair_tags WHERE tag_id = ?", (src_id,)
                 ).fetchone()[0]
-                if src_count or pair_count:
+                image_count = conn.execute(
+                    "SELECT COUNT(*) FROM media_image_tags WHERE tag_id = ?", (src_id,)
+                ).fetchone()[0]
+                if src_count or pair_count or image_count:
                     self._move_tag_links(conn, src_id, target_id)
                     tags_merged += 1
                     affected += src_count
@@ -1468,80 +1691,14 @@ class PromptDatabase(
         self.logger.info("Starting duplicate cleanup process with image preservation")
         try:
             with self._pair_transaction() as conn:
-                # Find duplicates by text content (case-insensitive)
-                # Note: Removed ORDER BY from GROUP_CONCAT for SQLite compatibility
-                # We'll sort the IDs manually after fetching
-                cursor = conn.execute("""
-                    SELECT LOWER(TRIM(text)) as normalized_text, COUNT(*) as count,
-                           GROUP_CONCAT(id) as ids,
-                           GROUP_CONCAT(created_at) as created_dates
-                    FROM prompts
-                    GROUP BY LOWER(TRIM(text))
-                    HAVING COUNT(*) > 1
-                """)
-
-                duplicates = cursor.fetchall()
-                self.logger.debug(
-                    f"Found {len(duplicates)} groups of duplicate prompts"
-                )
+                groups, _paired = self._duplicate_groups(conn)
+                self.logger.debug(f"Found {len(groups)} groups of duplicate prompts")
                 total_removed = 0
                 total_images_transferred = 0
-
-                for duplicate in duplicates:
-                    ids = duplicate["ids"].split(",")
-                    created_dates = duplicate["created_dates"].split(",")
-
-                    # Sort IDs by created_at date to keep the oldest
-                    id_date_pairs = list(zip(ids, created_dates))
-                    id_date_pairs.sort(key=lambda x: x[1])  # Sort by date
-                    sorted_ids = [int(pair[0]) for pair in id_date_pairs]
-
-                    try:
-                        self._ensure_prompts_unpaired(conn, sorted_ids)
-                    except PairDependencyError:
-                        continue
-
-                    # Keep the oldest one (first), merge and delete the rest
-                    primary_id = sorted_ids[0]  # Keep the oldest
-                    duplicate_ids = sorted_ids[1:]
-
-                    self.logger.debug(
-                        f"Merging duplicates: keeping {primary_id}, removing "
-                        f"{duplicate_ids}"
-                    )
-
-                    # Get primary prompt details
-                    cursor = conn.execute(
-                        "SELECT * FROM prompts WHERE id = ?", (primary_id,)
-                    )
-                    primary_prompt = cursor.fetchone()
-                    if not primary_prompt:
-                        continue
-
-                    # Collect and merge metadata from all duplicates
-                    merged_metadata = self._merge_duplicate_metadata(
-                        conn, primary_id, duplicate_ids
-                    )
-
-                    # Transfer all images from duplicates to primary prompt
-                    images_transferred = self._transfer_images_to_primary(
-                        conn, primary_id, duplicate_ids
-                    )
-                    total_images_transferred += images_transferred
-
-                    # Update primary prompt with merged metadata
-                    if merged_metadata:
-                        self._update_primary_with_merged_metadata(
-                            conn, primary_id, merged_metadata
-                        )
-
-                    # Delete duplicate prompts (images already transferred)
-                    for duplicate_id in duplicate_ids:
-                        conn.execute(
-                            "DELETE FROM prompts WHERE id = ?", (duplicate_id,)
-                        )
-                        total_removed += 1
-                        self.logger.debug(f"Removed duplicate prompt {duplicate_id}")
+                for sorted_ids in groups:
+                    removed, moved = self._merge_duplicate_group(conn, sorted_ids)
+                    total_removed += removed
+                    total_images_transferred += moved
 
                 conn.commit()
 
@@ -1572,83 +1729,141 @@ class PromptDatabase(
             metadata: Optional metadata about the image
 
         Returns:
-            int: The ID of the created image record
+            int: The ID of the created image record, or 0 when nothing was
+            linked (invalid or unknown prompt, already linked, or an error,
+            which is logged)
         """
-        # Validate that prompt_id is a valid integer and exists in prompts table
         try:
-            # Convert prompt_id to integer if it's a string number
-            if isinstance(prompt_id, str) and prompt_id.isdigit():
-                prompt_id_int = int(prompt_id)
-            elif isinstance(prompt_id, int):
-                prompt_id_int = prompt_id
-            else:
-                # Handle temporary IDs like "temp_123456" - skip linking
-                if isinstance(prompt_id, str) and prompt_id.startswith("temp_"):
-                    self.logger.debug(
-                        f"Skipping image linking for temporary prompt ID: {prompt_id}"
-                    )
-                    return 0
-                else:
-                    self.logger.warning(
-                        f"Invalid prompt_id format: {prompt_id}, skipping image linking"
-                    )
-                    return 0
-
-            # Verify the prompt exists in the database
-            with self.model.get_connection() as conn:
-                cursor = conn.execute(
-                    "SELECT id FROM prompts WHERE id = ?", (prompt_id_int,)
-                )
-                if not cursor.fetchone():
-                    self.logger.warning(
-                        f"Prompt ID {prompt_id_int} not found in database, skipping "
-                        "image linking"
-                    )
-                    return 0
-
-                # Proceed with linking
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                filename = os.path.basename(image_path)
-                file_path = normalize_image_path(image_path)
-                file_size, width, height, image_format = _coerce_file_info(metadata)
-
-                # INSERT OR IGNORE skips a file already linked to this prompt
-                # (same prompt_id + normalised full path)
-                cursor = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO generated_images
-                    (prompt_id, image_path, filename, file_path, file_size, width,
-                     height, format, workflow_data, prompt_metadata, parameters)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        prompt_id_int,
-                        image_path,
-                        filename,
-                        file_path,
-                        file_size,
-                        width,
-                        height,
-                        image_format,
-                        json.dumps(metadata.get("workflow", {})),
-                        json.dumps(metadata.get("prompt", {})),
-                        json.dumps(metadata.get("parameters", {})),
-                    ),
-                )
-                conn.commit()
-
-                if cursor.rowcount == 0:
-                    self.logger.debug(
-                        f"Image {file_path} already linked to prompt {prompt_id_int}"
-                    )
-                    return 0
-
-                return cursor.lastrowid
-
+            return self.link_image_to_prompt_or_raise(prompt_id, image_path, metadata)
         except Exception as e:
             self.logger.error(f"Error linking image to prompt {prompt_id}: {e}")
             return 0
+
+    def link_image_to_prompt_or_raise(
+        self, prompt_id: str, image_path: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> int:
+        """``link_image_to_prompt`` that raises database errors.
+
+        The image monitor links through this so a write that failed because
+        Move library switched reaches ``survive_library_switch`` and runs
+        again on the new library (#249 S6b). Each call is one transaction:
+        a failed attempt rolls back, and a committed one does not raise.
+        Returns 0 for an invalid or unknown prompt or an image already linked.
+        """
+        # Validate that prompt_id is a valid integer and exists in prompts table
+        # Convert prompt_id to integer if it's a string number
+        if isinstance(prompt_id, str) and prompt_id.isdigit():
+            prompt_id_int = int(prompt_id)
+        elif isinstance(prompt_id, int):
+            prompt_id_int = prompt_id
+        else:
+            # Handle temporary IDs like "temp_123456" - skip linking
+            if isinstance(prompt_id, str) and prompt_id.startswith("temp_"):
+                self.logger.debug(
+                    f"Skipping image linking for temporary prompt ID: {prompt_id}"
+                )
+                return 0
+            else:
+                self.logger.warning(
+                    f"Invalid prompt_id format: {prompt_id}, skipping image linking"
+                )
+                return 0
+
+        # Verify the prompt exists in the database
+        with self.model.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT id FROM prompts WHERE id = ?", (prompt_id_int,)
+            )
+            if not cursor.fetchone():
+                self.logger.warning(
+                    f"Prompt ID {prompt_id_int} not found in database, skipping "
+                    "image linking"
+                )
+                return 0
+
+            # Proceed with linking
+            image_id = self._insert_image_link(
+                conn, prompt_id_int, image_path, metadata
+            )
+            conn.commit()
+
+            if not image_id:
+                self.logger.debug(
+                    f"Image {normalize_image_path(image_path)} already linked to "
+                    f"prompt {prompt_id_int}"
+                )
+                return 0
+
+            return image_id
+
+    def _insert_image_link(
+        self,
+        conn: sqlite3.Connection,
+        prompt_id_int: int,
+        image_path: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Insert one image link on ``conn`` (no commit).
+
+        Returns the new image row's id, or 0 when the file is already linked
+        to this prompt (``INSERT OR IGNORE``).
+        """
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if removed_from_library(conn, image_path):
+            # #480: the user removed this exact file from the library; its
+            # bytes are unchanged, so nothing links it again.
+            self.logger.debug("Not linking a file removed from the library")
+            return 0
+        filename = os.path.basename(image_path)
+        file_path = normalize_image_path(image_path)
+        file_size, width, height, image_format = _coerce_file_info(metadata)
+        # Each workflow and prompt graph is stored once (new form).
+        documents = stored_values(
+            conn,
+            {
+                "workflow_data": dumps_strict(metadata.get("workflow", {})),
+                "prompt_metadata": dumps_strict(metadata.get("prompt", {})),
+            },
+        )
+
+        # INSERT OR IGNORE skips a file already linked to this prompt
+        # (same prompt_id + normalised full path)
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO generated_images
+            (prompt_id, image_path, filename, file_path, file_size, width,
+             height, format, workflow_data, prompt_metadata, parameters,
+             workflow_document_id, prompt_document_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                prompt_id_int,
+                image_path,
+                filename,
+                file_path,
+                file_size,
+                width,
+                height,
+                image_format,
+                documents["workflow_data"],
+                documents["prompt_metadata"],
+                dumps_strict(metadata.get("parameters", {})),
+                documents["workflow_document_id"],
+                documents["prompt_document_id"],
+            ),
+        )
+        if cursor.rowcount == 0:
+            # Already linked: a document made only for this row goes.
+            release_documents(
+                conn,
+                (
+                    documents["workflow_document_id"],
+                    documents["prompt_document_id"],
+                ),
+            )
+            return 0
+        return cursor.lastrowid
 
     def get_prompt_images(self, prompt_id: str) -> List[Dict[str, Any]]:
         """
@@ -1669,7 +1884,8 @@ class PromptDatabase(
                 """,
                 (prompt_id,),
             )
-            return [self._image_row_to_dict(row) for row in cursor.fetchall()]
+            reader = DocumentReader(conn)
+            return [self._image_row_to_dict(row, reader) for row in cursor]
 
     def get_recent_images(
         self, limit: int = 50, offset: int = 0
@@ -1695,7 +1911,8 @@ class PromptDatabase(
                 """,
                 (int(limit), max(0, int(offset))),
             )
-            return [self._image_row_to_dict(row) for row in cursor.fetchall()]
+            reader = DocumentReader(conn)
+            return [self._image_row_to_dict(row, reader) for row in cursor]
 
     def get_all_images(
         self,
@@ -1729,10 +1946,10 @@ class PromptDatabase(
 
         with self.model.get_connection() as conn:
             cursor = conn.execute(sql, params)
-            rows = cursor.fetchall()
+            reader = DocumentReader(conn)
             result = []
-            for row in rows:
-                data = self._image_row_to_dict(row)
+            for row in cursor:
+                data = self._image_row_to_dict(row, reader)
                 if row["_prompt_tags_list"]:
                     data["prompt_tags"] = row["_prompt_tags_list"].split("|||")
                 else:
@@ -1770,7 +1987,8 @@ class PromptDatabase(
                     max(0, int(offset)),
                 ),
             )
-            return [self._image_row_to_dict(row) for row in cursor.fetchall()]
+            reader = DocumentReader(conn)
+            return [self._image_row_to_dict(row, reader) for row in cursor]
 
     def get_image_by_id(self, image_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -1787,7 +2005,7 @@ class PromptDatabase(
                 "SELECT * FROM generated_images WHERE id = ?", (image_id,)
             )
             row = cursor.fetchone()
-            return self._image_row_to_dict(row) if row else None
+            return self._image_row_to_dict(row, DocumentReader(conn)) if row else None
 
     def delete_image(self, image_id: int) -> bool:
         """
@@ -1800,31 +2018,54 @@ class PromptDatabase(
             bool: True if deletion was successful
         """
         with self.model.get_connection() as conn:
+            documents = documents_of_rows(conn, "id", [image_id])
             cursor = conn.execute(
                 "DELETE FROM generated_images WHERE id = ?", (image_id,)
             )
+            release_documents(conn, documents)
             conn.commit()
             return cursor.rowcount > 0
 
-    def cleanup_missing_images(self) -> int:
+    def cleanup_missing_images(self, roots=None) -> int:
         """
         Remove image records where the actual file no longer exists.
+
+        Args:
+            roots: The image sources links are judged under (the health
+                check's). When given, only a link under a source that can be
+                read now is removed: a link under an unavailable source (an
+                unmounted drive) or outside every source is kept. None keeps
+                the old rule: every link whose file does not exist.
 
         Returns:
             int: Number of orphaned records removed
         """
+        if roots is not None:
+            with self.model.get_connection() as conn:
+                rows = [tuple(row) for row in conn.execute(_LINK_ROWS_SQL)]
+            # Files are looked at before the write transaction starts.
+            ids = self._missing_link_ids(rows, [str(root) for root in roots])
+            if not ids:
+                return 0
+            with self._pair_transaction() as conn:
+                return _delete_ids(conn, "generated_images", ids)
+
         removed_count = 0
 
         with self.model.get_connection() as conn:
             cursor = conn.execute("SELECT id, image_path FROM generated_images")
             images = cursor.fetchall()
 
-            for image in images:
-                if not os.path.exists(image["image_path"]):
-                    conn.execute(
-                        "DELETE FROM generated_images WHERE id = ?", (image["id"],)
-                    )
-                    removed_count += 1
+            removed = [
+                image["id"]
+                for image in images
+                if not os.path.exists(image["image_path"])
+            ]
+            documents = documents_of_rows(conn, "id", removed)
+            for image_id in removed:
+                conn.execute("DELETE FROM generated_images WHERE id = ?", (image_id,))
+                removed_count += 1
+            release_documents(conn, documents)
 
             conn.commit()
 
@@ -1838,19 +2079,23 @@ class PromptDatabase(
             obj: The object to clean (dict, list, or scalar)
 
         Returns:
-            Cleaned object with NaN values replaced by None
+            Cleaned object with NaN and Infinity values replaced by None
         """
         if isinstance(obj, dict):
             return {key: self._clean_nan_values(value) for key, value in obj.items()}
         elif isinstance(obj, list):
             return [self._clean_nan_values(item) for item in obj]
-        elif isinstance(obj, float) and str(obj) == "nan":
+        elif isinstance(obj, float) and not math.isfinite(obj):
             return None
         else:
             return obj
 
     def _merge_duplicate_metadata(
-        self, conn: sqlite3.Connection, primary_id: int, duplicate_ids: List[int]
+        self,
+        conn: sqlite3.Connection,
+        primary_id: int,
+        duplicate_ids: List[int],
+        strict: bool = False,
     ) -> Dict[str, Any]:
         """
         Merge metadata from duplicate prompts, prioritizing non-empty values.
@@ -1910,11 +2155,17 @@ class PromptDatabase(
             return merged
 
         except Exception as e:
+            if strict:  # a reviewed apply rolls back instead
+                raise
             self.logger.error(f"Error merging metadata: {e}", exc_info=True)
             return {}
 
     def _transfer_images_to_primary(
-        self, conn: sqlite3.Connection, primary_id: int, duplicate_ids: List[int]
+        self,
+        conn: sqlite3.Connection,
+        primary_id: int,
+        duplicate_ids: List[int],
+        strict: bool = False,
     ) -> int:
         """
         Transfer all images from duplicate prompts to the primary prompt.
@@ -1946,11 +2197,17 @@ class PromptDatabase(
             return transferred_count
 
         except Exception as e:
+            if strict:  # a reviewed apply rolls back instead
+                raise
             self.logger.error(f"Error transferring images: {e}", exc_info=True)
             return 0
 
     def _update_primary_with_merged_metadata(
-        self, conn: sqlite3.Connection, primary_id: int, merged_metadata: Dict[str, Any]
+        self,
+        conn: sqlite3.Connection,
+        primary_id: int,
+        merged_metadata: Dict[str, Any],
+        strict: bool = False,
     ) -> None:
         """
         Update the primary prompt with merged metadata.
@@ -1981,6 +2238,8 @@ class PromptDatabase(
             )
 
         except Exception as e:
+            if strict:  # a reviewed apply rolls back instead
+                raise
             self.logger.error(
                 f"Error updating primary prompt metadata: {e}", exc_info=True
             )
@@ -2094,14 +2353,10 @@ class PromptDatabase(
         Returns:
             Number of prompts actually deleted.
         """
-        count = 0
         with self._pair_transaction() as conn:
             self._ensure_prompts_unpaired(conn, prompt_ids)
-            for pid in prompt_ids:
-                conn.execute("DELETE FROM generated_images WHERE prompt_id = ?", (pid,))
-                cursor = conn.execute("DELETE FROM prompts WHERE id = ?", (pid,))
-                if cursor.rowcount > 0:
-                    count += 1
+            # The workspace Library's delete runs the same statements (#443).
+            count = delete_prompt_rows(conn, list(dict.fromkeys(prompt_ids)))
             conn.commit()
         return count
 
@@ -2175,7 +2430,8 @@ class PromptDatabase(
             cursor = conn.execute(
                 """SELECT gi.prompt_id, p.text, p.category, p.rating, p.notes,
                           gi.workflow_data, gi.prompt_metadata, gi.generation_time,
-                          gi.parameters, gi.id, gi.image_path, gi.file_path
+                          gi.parameters, gi.id, gi.image_path, gi.file_path,
+                          gi.workflow_document_id, gi.prompt_document_id
                    FROM generated_images gi
                    JOIN prompts p ON gi.prompt_id = p.id
                    WHERE gi.image_path = ? OR gi.file_path = ?
@@ -2255,12 +2511,21 @@ class PromptDatabase(
                         "text_source": source,
                     }
             tags = self._get_prompt_tags(conn, row[0])
+            texts = resolve_image_row(DocumentReader(conn), row)
             try:
-                workflow = json.loads(row[5]) if row[5] else None
+                workflow = (
+                    json.loads(texts["workflow_data"])
+                    if texts["workflow_data"]
+                    else None
+                )
             except (json.JSONDecodeError, TypeError):
                 workflow = None
             try:
-                prompt_meta = json.loads(row[6]) if row[6] else None
+                prompt_meta = (
+                    json.loads(texts["prompt_metadata"])
+                    if texts["prompt_metadata"]
+                    else None
+                )
             except (json.JSONDecodeError, TypeError):
                 prompt_meta = None
             return {
@@ -2277,6 +2542,52 @@ class PromptDatabase(
                 "generation_time": row[7],
                 "parameters": row[8] if len(row) > 8 else None,
             }
+
+    def get_known_resolved_paths(self, files: Dict[str, Optional[int]]) -> Set[str]:
+        """The paths in ``files`` the Library already links with a resolved link.
+
+        ``files`` maps each scanned path to its size on disk (None when it could
+        not be read). A path qualifies when exactly one ``generated_images`` row
+        claims the file, that row has exactly one pair link
+        (``image_prompt_pairs``, written only by resolved ingestion), and its
+        stored ``file_size`` is not NULL and equals the given size, so a file
+        replaced at the same path is read again. Files linked without a pair
+        (the monitor's fallback and FIFO links, the legacy positive-only
+        import), linked to several prompts or pairs, or not linked at all do
+        not qualify. Both sides go through ``normalize_image_path`` (absolute,
+        normalized, ``os.path.normcase``), so a Windows row stored in another
+        case or spelling still matches. One query, streamed; returns the
+        matching keys of ``files``.
+        """
+        wanted: Dict[str, List[Tuple[str, Optional[int]]]] = {}
+        for path, size in files.items():
+            key = normalize_image_path(str(path))
+            wanted.setdefault(key, []).append((str(path), size))
+        if not wanted:
+            return set()
+        rows_seen: Dict[str, int] = {}
+        stored_sizes: Dict[str, int] = {}
+        with self.model.get_connection() as conn:
+            cursor = conn.execute(_KNOWN_PATHS_SQL)
+            while True:
+                rows = cursor.fetchmany(KNOWN_PATHS_FETCH_SIZE)
+                if not rows:
+                    break
+                for file_path, image_path, file_size, is_resolved in rows:
+                    # image_path is NOT NULL; file_path is NULL only on old rows.
+                    key = normalize_image_path(file_path or image_path)
+                    if key not in wanted:
+                        continue
+                    rows_seen[key] = rows_seen.get(key, 0) + 1
+                    if is_resolved and file_size is not None:
+                        stored_sizes[key] = file_size
+        return {
+            path
+            for key, stored_size in stored_sizes.items()
+            if rows_seen[key] == 1
+            for path, size in wanted[key]
+            if size is not None and size == stored_size
+        }
 
     def get_image_link_summaries(
         self, paths: List[str], allow_filename_fallback: bool = True
@@ -2330,47 +2641,137 @@ class PromptDatabase(
     def get_image_link_matches(
         self,
         q: str,
-        category: Optional[str],
         tags: List[str],
         *,
         every_link: bool = False,
         wanted: Optional[Set[str]] = None,
-    ) -> Dict[str, Tuple[bool, Optional[int], int]]:
-        """Map normalized paths of unambiguously linked images to
-        (hit, rating, positive id).
+        category: Optional[str] = None,
+    ) -> Dict[str, LinkMatch]:
+        """Map normalized paths of unambiguously linked images to a LinkMatch
+        (hit, rating, positive id, inherited category).
 
-        Rows are limited to images whose linked positive has *category* and
-        every tag in *tags* (exact names). ``hit`` says whether *q* occurs in
+        Rows are limited to images whose linked positive has every tag in
+        *tags* (exact names). The category filter is applied by the caller to
+        the effective category (#332). ``hit`` says whether *q* occurs in
         the positive's text, Library title or a tag name; a pair's own title
         names its negative variant and is not searched.
-        Without category or tags only hits are returned, unless *every_link*
+        Without tags only hits are returned, unless *every_link*
         asks for every linked image (the rating sort and the positive count).
-        The positive id is the card's linked positive. One SELECT whose rows
-        are streamed; with *wanted* (the listing's normalized paths) only those
-        paths are kept, so memory is bounded by the listing, not the database.
-        """
-        sql, params = link_filter_query(q, category, tags, every_link=every_link)
-        matches: Dict[str, Tuple[bool, Optional[int], int]] = {}
-        with self.model.get_connection() as conn:
-            for path, rating, matched, positive in conn.execute(sql, params):
-                if wanted is None or path in wanted:
-                    matches[path] = (bool(matched), rating, positive)
-        return matches
+        The positive id is the card's linked positive. With *category* only
+        links whose raw recipe or positive category is that value are read (a
+        superset of the links that inherit it; the caller compares the
+        inherited value) and the inherited category is decided per row;
+        otherwise it is None, which keeps the plain reads cheap.
 
-    def get_image_paths_matching(
-        self, q: str, category: Optional[str], tags: List[str]
-    ) -> Set[str]:
-        """Normalized paths whose linked positive matches *q*, *category* and *tags*.
+        One SELECT, returned as one JSON value (#354): SQLite steps once, so
+        the read takes the GIL back a constant two or three times instead of
+        once per linked row while ComfyUI generates. Peak memory therefore
+        grows with the database's matching linked rows (about 530 bytes each,
+        more with the raw categories of a category read, freed on return); the
+        result is bounded by *wanted* (the listing's normalized paths) when
+        given. Where the JSON step fails (no JSON functions, a BLOB value, a
+        JSON text over SQLite's length limit) the rows are streamed as before.
+        """
+        sql, params = link_filter_query(
+            q, tags, every_link=every_link, category=category
+        )
+        categories = category is not None
+        with self.model.get_connection() as conn:
+            rows = None
+            if not _one_step_unsupported:
+                rows = self._one_step_link_rows(conn, sql, params, categories)
+            if rows is None:
+                return _streamed_link_matches(conn, sql, params, wanted, categories)
+        return _link_matches_from_rows(rows, categories, wanted)
+
+    def _one_step_link_rows(
+        self,
+        conn: sqlite3.Connection,
+        sql: str,
+        params: Dict[str, Any],
+        categories: bool = False,
+    ) -> Optional[List[List[Any]]]:
+        """*sql*'s rows from one JSON value, or None when this read must stream.
+
+        An interrupted read (Move library retiring the connection) is raised
+        as before, never retried row by row.
+        """
+        global _one_step_unsupported, _one_step_warned
+        error: Optional[str] = None
+        try:
+            cursor = conn.execute(link_matches_json_query(sql, categories), params)
+            try:
+                ((document,),) = cursor.fetchall()
+            finally:
+                cursor.close()  # resets the statement: its snapshot ends now
+        except (sqlite3.OperationalError, sqlite3.DataError) as failure:
+            # DataError: the JSON text is longer than SQLITE_LIMIT_LENGTH.
+            error = str(failure)
+            if error == "interrupted":
+                raise
+            if error.startswith("no such function"):
+                _one_step_unsupported = True
+        else:
+            if document is not None:
+                return json.loads(document)
+            error = "a BLOB value"
+        if not _one_step_warned:
+            _one_step_warned = True
+            self.logger.warning(
+                "Reading image links row by row (slower while ComfyUI "
+                "generates); the one-step read failed: %s",
+                error,
+            )
+        return None
+
+    def get_image_link_facts(
+        self, paths: List[str], q: str = ""
+    ) -> Dict[str, Tuple[bool, Optional[int], int, Any, Tuple[str, ...]]]:
+        """Map each normalized path with one unambiguous link to its positive's
+        (hit, rating, positive id, inherited category, tag names).
+
+        The link is resolved as in get_image_link_matches, and ``hit`` says
+        whether *q* occurs in the positive's text, Library title or a tag
+        name (always true without *q*). Paths go in chunks of 500 through the
+        ``file_path`` index; the tag names are read for those positives only.
+        """
+        hit, params = "1", {}
+        if q:
+            hit = _LINK_FILTER_HIT
+            params["pattern"] = f"%{escape_like(q)}%"
+        rows: Dict[str, LinkMatch] = {}
+        names: Dict[int, List[str]] = {}
+        unique = list(dict.fromkeys(paths))
+        with self.model.get_connection() as conn:
+            for start in range(0, len(unique), _FACTS_CHUNK):
+                chunk = unique[start : start + _FACTS_CHUNK]
+                bound = {f"path{i}": path for i, path in enumerate(chunk)}
+                marks = ",".join(f":{key}" for key in bound)
+                sql = _LINK_FACTS_SQL.format(hit=hit, marks=marks)
+                for path, *row in conn.execute(sql, {**params, **bound}):
+                    rows[path] = _link_match(*row)
+            positives = sorted({row[2] for row in rows.values()})
+            for start in range(0, len(positives), _FACTS_CHUNK):
+                chunk = positives[start : start + _FACTS_CHUNK]
+                marks = ",".join("?" * len(chunk))
+                for positive, name in conn.execute(
+                    _POSITIVE_TAG_NAMES_SQL.format(marks=marks), chunk
+                ):
+                    names.setdefault(positive, []).append(name)
+        return {
+            path: (*row, tuple(names.get(row[2], ()))) for path, row in rows.items()
+        }
+
+    def get_image_paths_matching(self, q: str, tags: List[str]) -> Set[str]:
+        """Normalized paths whose linked positive matches *q* and *tags*.
 
         See get_image_link_matches; an empty *q* matches every linked image
-        the category and tags admit.
+        the tags admit.
         """
         return {
             path
-            for path, (hit, _rating, _positive) in self.get_image_link_matches(
-                q, category, tags
-            ).items()
-            if hit or not q
+            for path, match in self.get_image_link_matches(q, tags).items()
+            if match[0] or not q
         }
 
     def get_prompt_id_for_image(self, image_path: str) -> Optional[int]:
@@ -2408,57 +2809,36 @@ class PromptDatabase(
         Returns number of prompts removed.
         """
         with self._pair_transaction() as conn:
-            cursor = conn.execute(ORPHANED_PROMPTS_SQL)
-            orphaned = [row["id"] for row in cursor.fetchall()]
+            orphaned = _orphaned_ids(conn)
             if not orphaned:
                 return 0
-            placeholders = ",".join(["?"] * len(orphaned))
-            cursor = conn.execute(
-                f"DELETE FROM prompts WHERE id IN ({placeholders})", orphaned
-            )
+            removed = _delete_ids(conn, "prompts", orphaned)
             conn.commit()
-            return cursor.rowcount
+            return removed
 
     def check_consistency(self) -> List[str]:
-        """Run consistency checks and return a list of issue descriptions."""
-        issues: List[str] = []
+        """Run consistency checks and return a list of issue descriptions.
+
+        The same queries back the System health check's Consistency row
+        (database/health.py).
+        """
         with self.model.get_connection() as conn:
-            # Check for orphaned prompt_tags entries
-            cursor = conn.execute("""
-                SELECT pt.prompt_id, pt.tag_id FROM prompt_tags pt
-                LEFT JOIN prompts p ON pt.prompt_id = p.id
-                WHERE p.id IS NULL
-            """)
-            for ref in cursor.fetchall():
-                issues.append(
-                    "prompt_tags entry references non-existent prompt "
-                    f"{ref['prompt_id']}"
-                )
+            return list(iter_consistency_issues(conn))
 
-            # Check for orphaned image entries
-            cursor = conn.execute("""
-                SELECT gi.id, gi.prompt_id FROM generated_images gi
-                LEFT JOIN prompts p ON gi.prompt_id = p.id
-                WHERE p.id IS NULL
-            """)
-            for ref in cursor.fetchall():
-                issues.append(
-                    f"Image {ref['id']} references non-existent prompt "
-                    f"{ref['prompt_id']}"
-                )
-        return issues
-
-    def _image_row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _image_row_to_dict(
+        self, row: sqlite3.Row, reader: DocumentReader
+    ) -> Dict[str, Any]:
         """
         Convert an image database row to a dictionary with parsed JSON fields.
 
         Args:
             row: SQLite row object
+            reader: The workflow document reader of the row's connection
 
         Returns:
             Dictionary representation of the row
         """
-        data = dict(row)
+        data = resolve_image_row(reader, row)
 
         # Parse JSON fields
         for field in ["workflow_data", "prompt_metadata", "parameters"]:

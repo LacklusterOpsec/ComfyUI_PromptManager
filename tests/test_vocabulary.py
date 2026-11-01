@@ -1,5 +1,7 @@
 """Bounded vocabulary reads count exactly what Library Browse shows."""
 
+import hashlib
+import os
 import re
 import sqlite3
 import tempfile
@@ -10,6 +12,11 @@ from unittest.mock import patch
 from database.library_commands import LibraryCommandError
 from database.operations import PromptDatabase
 from utils.hashing import generate_prompt_hash
+
+try:
+    from test_image_categories import category_checksum
+except ImportError:
+    from tests.test_image_categories import category_checksum
 
 
 class TestVocabularyReads(unittest.TestCase):
@@ -61,7 +68,48 @@ class TestVocabularyReads(unittest.TestCase):
         by_name = {row["name"]: row for row in page["tags"]}
         self.assertEqual(by_name["z"]["prompt_count"], 0)
         self.assertEqual(by_name["a"]["prompt_count"], 2)
-        self.assertEqual(set(by_name["c"]), {"id", "name", "prompt_count"})
+        self.assertEqual(
+            set(by_name["c"]), {"id", "name", "prompt_count", "image_count"}
+        )
+        self.assertEqual({row["image_count"] for row in page["tags"]}, {0})
+
+    def image(self, name, tags, digest="a", mtime_ns=1):
+        """Tag the bytes ``digest`` of the file ``name``; return its locator."""
+        locator = os.path.normcase(os.path.join(os.path.realpath(self.temp.name), name))
+        self.read(
+            "replace_image_tags",
+            locator=locator,
+            sha256=hashlib.sha256(digest.encode()).hexdigest(),
+            size=1,
+            mtime_ns=mtime_ns,
+            expected_epoch=self.db.get_execution_epoch(),
+            expected_tag_revision=0,
+            tags=tags,
+        )
+        return locator
+
+    def test_tag_rows_report_image_count_by_locator(self):
+        self.save("Prompt only", tags=["prompt-only"])
+        self.image("one.png", ["twice", "shared"], digest="old")
+        self.image(
+            "one.png", ["twice"], digest="new", mtime_ns=2
+        )  # two bytes, one file
+        self.image("two.png", ["shared"], digest="new")  # equal digest, other locator
+        self.image("three.png", ["prior-only"], digest="first")
+        self.image("three.png", [], digest="second", mtime_ns=2)
+        rows = {row["name"]: row for row in self.all_tags()}
+        self.assertEqual(rows["twice"]["image_count"], 1)
+        row = rows["shared"]
+        self.assertEqual(row["image_count"], 2)
+        self.assertEqual(rows["prior-only"]["image_count"], 1)
+        self.assertEqual(rows["prompt-only"]["image_count"], 0)
+        self.assertEqual(
+            {name: r["prompt_count"] for name, r in rows.items()},
+            {"prompt-only": 1, "twice": 0, "shared": 0, "prior-only": 0},
+        )
+        self.assertEqual(
+            self.db.list_library(tags=["shared"])["total"], row["prompt_count"]
+        )
 
     def test_prompt_count_equals_library_browse_total_for_every_tag(self):
         self.save("Parent only", tags=["parent-only"])
@@ -125,7 +173,8 @@ class TestVocabularyReads(unittest.TestCase):
         self.assertEqual(page["total"], 4)
         self.assertFalse(page["has_more"])
         for row in page["categories"]:
-            self.assertEqual(set(row), {"value", "prompt_count"})
+            self.assertEqual(set(row), {"value", "prompt_count", "image_count"})
+            self.assertEqual(row["image_count"], 0)
             self.assertEqual(
                 row["prompt_count"],
                 self.db.list_library(category=row["value"])["total"],
@@ -195,6 +244,111 @@ class TestVocabularyReads(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.read("list_vocabulary_tags", **options)
 
+    def own(self, value, *paths, root="root"):
+        """Give each relative path under ``root`` the own category ``value``."""
+        self.db.set_image_categories([(root, path) for path in paths], value)
+
+    def all_categories(self, limit=200):
+        rows, pages, after = [], [], None
+        while True:
+            page = self.read("list_vocabulary_categories", limit=limit, after=after)
+            pages.append(page)
+            rows.extend(page["categories"])
+            if not page["has_more"]:
+                return rows, pages
+            after = page["next_key"]
+
+    def test_category_list_includes_image_only_values_last(self):
+        self.save("Oldest", category="Zeta")
+        self.save("Newer", category="Alpha")
+        self.own("Zeta", "a.png", "b.png")
+        self.own("Only images B", "c.png")
+        self.own("Only images A", "d.png", "e.png", "gone.png")
+        rows, _pages = self.all_categories()
+        self.assertEqual(
+            rows,
+            [
+                {"value": "Zeta", "prompt_count": 1, "image_count": 2},
+                {"value": "Alpha", "prompt_count": 1, "image_count": 0},
+                {"value": "Only images A", "prompt_count": 0, "image_count": 3},
+                {"value": "Only images B", "prompt_count": 0, "image_count": 1},
+            ],
+        )
+        page = self.read("list_vocabulary_categories")
+        self.assertEqual(page["total"], 4)
+
+    def test_category_cursor_crosses_into_image_only_values(self):
+        for index in range(3):
+            self.save(f"Owner {index}", category=f"P{index}")
+        self.own("P1", "shared.png")
+        self.own("I-b", "x.png")
+        self.own("I-a", "y.png")
+        self.own("I-c", "z.png", root="other")
+        for limit in (1, 2, 3, 4):
+            with self.subTest(limit=limit):
+                rows, pages = self.all_categories(limit=limit)
+                self.assertEqual(
+                    [row["value"] for row in rows],
+                    ["P0", "P1", "P2", "I-a", "I-b", "I-c"],
+                )
+                self.assertEqual({page["total"] for page in pages}, {6})
+                self.assertEqual(
+                    [row["image_count"] for row in rows], [0, 1, 0, 1, 1, 1]
+                )
+        first = self.read("list_vocabulary_categories", limit=3)
+        self.assertEqual(first["next_key"], [3, "P2"])
+        second = self.read("list_vocabulary_categories", limit=1, after=[3, "P2"])
+        self.assertEqual(second["next_key"], [2**63 - 1, "I-a"])
+
+    def test_image_rows_on_a_prompt_value_count_once(self):
+        self.save("Owner", category="Shared")
+        self.db.save_prompt_pair("Owner", "Noise", category="Shared")
+        self.own("Shared", *[f"{n}.png" for n in range(5)])
+        self.own("Shared", "elsewhere.png", root="second")
+        rows, _pages = self.all_categories()
+        self.assertEqual(
+            rows, [{"value": "Shared", "prompt_count": 1, "image_count": 6}]
+        )
+
+    def test_library_options_ignore_image_categories(self):
+        self.save("Owner", category="Prompt value")
+        before = self.db.get_library_options()
+        self.own("Image value", "a.png")
+        self.own("Prompt value", "b.png")
+        self.assertEqual(self.db.get_library_options(), before)
+        self.assertEqual(before["categories"], ["Prompt value"])
+
+    def test_category_reads_use_the_image_category_index(self):
+        from database import vocabulary
+
+        self.own("Value", "a.png")
+        statements = [
+            vocabulary._CATEGORY_ROWS + "SELECT COUNT(*) FROM counted",
+            vocabulary._CATEGORY_ROWS
+            + "SELECT value,first_pid,prompt_count,image_count FROM counted "
+            "WHERE first_pid>? OR (first_pid=? AND value>?) "
+            "ORDER BY first_pid,value LIMIT ?",
+        ]
+        plans = []
+        with self.db.model.get_connection() as conn:
+            for sql in statements:
+                params = [1] * sql.count("?")
+                plans.extend(
+                    row[-1] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+                )
+            for sql in (
+                vocabulary._IMAGE_CATEGORY_ROWIDS,
+                *vocabulary._CATEGORY_UPDATES,
+            ):
+                params = [1] * sql.count("?")
+                plans.extend(
+                    row[-1] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+                )
+        image_steps = [step for step in plans if "image_categories" in step]
+        self.assertTrue(image_steps)
+        for step in image_steps:
+            self.assertIn("idx_image_categories_category", step, step)
+
     def test_reads_share_one_snapshot_and_report_epoch(self):
         self.save("Cat", category="Animal", tags=["cat"])
         epoch = self.db.get_execution_epoch()
@@ -208,6 +362,162 @@ class TestVocabularyReads(unittest.TestCase):
             inner = helper(conn, snapshot_epoch, limit=10, after=None)
             self.assertEqual(inner["library_epoch"], epoch)
             self.assertTrue(conn.in_transaction)
+
+
+class _ReadFixture(unittest.TestCase):
+    """TestVocabularyReads' database and helpers, without re-running its tests."""
+
+    setUp = TestVocabularyReads.setUp
+    tearDown = TestVocabularyReads.tearDown
+    save = TestVocabularyReads.save
+    read = TestVocabularyReads.read
+    add_unused = TestVocabularyReads.add_unused
+    all_tags = TestVocabularyReads.all_tags
+
+
+class TestVocabularyTagSearchAndSort(_ReadFixture):
+    """#444: tag search, tag sort and the untagged prompts count."""
+
+    def names(self, **options):
+        rows, after = [], None
+        while True:
+            page = self.read("list_vocabulary_tags", limit=2, after=after, **options)
+            rows.extend(row["name"] for row in page["tags"])
+            if not page["has_more"]:
+                return rows
+            after = page["next_key"]
+
+    def seed_counts(self):
+        self.save("One", tags=["beta", "Alpha"])
+        self.save("Two", tags=["beta", "gamma"])
+        self.save("Three", tags=["beta"])
+        self.add_unused("delta", "100%_off", "100x-off")
+
+    def test_search_is_a_case_insensitive_literal_substring(self):
+        self.seed_counts()
+        self.assertEqual(self.names(search="ALP"), ["Alpha"])
+        self.assertEqual(self.names(search="%"), ["100%_off"])
+        self.assertEqual(self.names(search="_"), ["100%_off"])
+        self.assertEqual(
+            self.names(search="  a  "), ["beta", "Alpha", "gamma", "delta"]
+        )
+        page = self.read("list_vocabulary_tags", search="a")
+        self.assertEqual(page["total"], 4)
+        self.assertEqual(self.read("list_vocabulary_tags", search="")["total"], 6)
+
+    def test_each_sort_orders_rows_and_continues_without_gaps(self):
+        self.seed_counts()
+        self.assertEqual(
+            self.names(), ["beta", "Alpha", "gamma", "delta", "100%_off", "100x-off"]
+        )
+        self.assertEqual(self.names(sort="created"), self.names())
+        self.assertEqual(
+            self.names(sort="name"),
+            ["100%_off", "100x-off", "Alpha", "beta", "delta", "gamma"],
+        )
+        self.assertEqual(
+            self.names(sort="name-desc"),
+            ["gamma", "delta", "beta", "Alpha", "100x-off", "100%_off"],
+        )
+        # Ties keep creation order: Alpha and gamma (1), then the unused tags (0).
+        self.assertEqual(
+            self.names(sort="prompts"),
+            ["beta", "Alpha", "gamma", "delta", "100%_off", "100x-off"],
+        )
+        self.assertEqual(
+            self.names(sort="prompts-asc"),
+            ["delta", "100%_off", "100x-off", "Alpha", "gamma", "beta"],
+        )
+        self.assertEqual(
+            self.names(sort="name", search="a"), ["Alpha", "beta", "delta", "gamma"]
+        )
+
+    def test_count_sort_uses_the_row_counts(self):
+        self.save("Parent", tags=["direct"])
+        self.db.save_prompt_pair("Owner", "Noise", tags=["pair"])
+        self.db.save_prompt_pair("Owner two", "Noise two", tags=["pair"])
+        archived = self.db.save_prompt_pair("Gone", "Gone noise", tags=["archived"])
+        self.db.archive_prompt_pair(archived)
+        page = self.read("list_vocabulary_tags", sort="prompts")
+        self.assertEqual(
+            [(row["name"], row["prompt_count"]) for row in page["tags"]],
+            [("pair", 2), ("direct", 1), ("archived", 0)],
+        )
+
+    def test_invalid_search_sort_and_keys_are_refused(self):
+        self.seed_counts()
+        for options in (
+            {"sort": "count"},
+            {"sort": None},
+            {"search": "x" * 201},
+            {"search": 3},
+            {"sort": "name", "after": 3},
+            {"sort": "name", "after": ["a"]},
+            {"sort": "prompts", "after": ["a", 1]},
+            {"sort": "created", "after": ["a", 1]},
+        ):
+            with self.assertRaises(ValueError, msg=options):
+                self.read("list_vocabulary_tags", **options)
+
+    def test_untagged_count_is_every_parent_no_tag_browse_returns(self):
+        self.save("Plain")
+        self.save("Tagged", tags=["t"])
+        self.db.save_prompt_pair("Pair tagged", "Noise", tags=["p"])
+        self.db.save_prompt_pair("Pair plain", "Noise plain")
+        archived = self.db.save_prompt_pair("Archived tag", "Old", tags=["old"])
+        self.db.archive_prompt_pair(archived)
+        self.add_unused("unused")
+        page = self.read("list_vocabulary_tags", search="zzz")
+        untagged = self.db.list_library(tag_mode="untagged")
+        self.assertEqual(
+            sorted(item["text"] for item in untagged["items"]),
+            ["Archived tag", "Pair plain", "Plain"],
+        )
+        self.assertEqual(page["untagged_count"], untagged["total"])
+        self.assertEqual(page["untagged_count"], 3)
+        tagged = set()
+        for row in self.all_tags():
+            tagged |= {
+                item["id"] for item in self.db.list_library(tags=[row["name"]])["items"]
+            }
+        everyone = {item["id"] for item in self.db.list_library()["items"]}
+        self.assertEqual({item["id"] for item in untagged["items"]}, everyone - tagged)
+
+
+class TestLibraryTagMode(_ReadFixture):
+    def test_untagged_mode_combines_with_text_and_category(self):
+        self.save("Red plain", category="Colors")
+        self.save("Blue plain")
+        self.save("Red tagged", category="Colors", tags=["red"])
+        self.assertEqual(
+            [
+                i["text"]
+                for i in self.db.list_library(text="red", tag_mode="untagged")["items"]
+            ],
+            ["Red plain"],
+        )
+        self.assertEqual(
+            [
+                i["text"]
+                for i in self.db.list_library(category="Colors", tag_mode="untagged")[
+                    "items"
+                ]
+            ],
+            ["Red plain"],
+        )
+        self.assertEqual(
+            self.db.list_library(tag_mode="all")["total"],
+            self.db.list_library()["total"],
+        )
+
+    def test_untagged_mode_refuses_tags_and_unknown_modes(self):
+        for options in (
+            {"tag_mode": "untagged", "tags": ["x"]},
+            {"tag_mode": "none"},
+            {"tag_mode": None},
+        ):
+            with self.assertRaises(ValueError, msg=options):
+                self.db.list_library(**options)
 
 
 _TAG_TABLES = ('"tags"', '"prompt_tags"', '"prompt_pair_tags"', '"sqlite_sequence"')
@@ -302,7 +612,12 @@ class TestVocabularyTagCommands(unittest.TestCase):
         self.assertTrue(created["created"])
         self.assertEqual(
             created["tag"],
-            {"id": self.tag_id("sunset"), "name": "sunset", "prompt_count": 0},
+            {
+                "id": self.tag_id("sunset"),
+                "name": "sunset",
+                "prompt_count": 0,
+                "image_count": 0,
+            },
         )
         after = self.junction_rows()
         self.assertEqual(after[1:], before[1:])
@@ -345,9 +660,15 @@ class TestVocabularyTagCommands(unittest.TestCase):
             {
                 "library_epoch": self.epoch,
                 "merged": False,
-                "tag": {"id": tag_id, "name": "dramatic", "prompt_count": 2},
+                "tag": {
+                    "id": tag_id,
+                    "name": "dramatic",
+                    "prompt_count": 2,
+                    "image_count": 0,
+                },
                 "components_changed": 2,
                 "pairs_changed": 2,
+                "images_changed": 0,
             },
         )
         self.assertIsNone(self.tag_id("moody"))
@@ -397,7 +718,8 @@ class TestVocabularyTagCommands(unittest.TestCase):
         )
         self.assertFalse(result["merged"])
         self.assertEqual(
-            result["tag"], {"id": tag_id, "name": "cat", "prompt_count": 1}
+            result["tag"],
+            {"id": tag_id, "name": "cat", "prompt_count": 1, "image_count": 0},
         )
         self.assertEqual(self.db.get_prompt_by_id(prompt)["tags"], ["cat"])
 
@@ -467,6 +789,7 @@ class TestVocabularyTagCommands(unittest.TestCase):
                     "other_prompts": 1,
                     "negative_variants": 1,
                     "archived_negative_variants": 1,
+                    "images": 0,
                 },
             },
         )
@@ -482,6 +805,7 @@ class TestVocabularyTagCommands(unittest.TestCase):
                 "deleted": True,
                 "components_changed": 2,
                 "pairs_changed": 2,
+                "images_changed": 0,
             },
         )
         self.assertIsNone(self.tag_id("moody"))
@@ -493,6 +817,69 @@ class TestVocabularyTagCommands(unittest.TestCase):
                 "delete_vocabulary_tag", tag_id, expected_epoch=self.epoch, name="moody"
             )
         self.assertEqual(caught.exception.code, "vocabulary-conflict")
+
+    def image(self, name, tags, digest="a", mtime_ns=1):
+        locator = os.path.normcase(os.path.join(os.path.realpath(self.temp.name), name))
+        self.command(
+            "replace_image_tags",
+            locator=locator,
+            sha256=hashlib.sha256(digest.encode()).hexdigest(),
+            size=1,
+            mtime_ns=mtime_ns,
+            expected_epoch=self.epoch,
+            expected_tag_revision=0,
+            tags=tags,
+        )
+        return locator
+
+    def test_impact_and_delete_counts_include_images(self):
+        self.owners()
+        self.image("a.png", ["moody", "keep"])
+        self.image("a.png", ["moody"], digest="prior", mtime_ns=2)
+        self.image("b.png", ["moody"])
+        tag_id = self.tag_id("moody")
+        impact = self.command("vocabulary_tag_impact", tag_id)["impact"]
+        self.assertEqual(impact["images"], 2)
+        self.assertEqual(
+            self.command("vocabulary_tag_impact", self.tag_id("keep"))["impact"],
+            {
+                "positive_prompts": 0,
+                "other_prompts": 0,
+                "negative_variants": 0,
+                "archived_negative_variants": 0,
+                "images": 1,
+            },
+        )
+        result = self.command(
+            "delete_vocabulary_tag", tag_id, expected_epoch=self.epoch, name="moody"
+        )
+        self.assertEqual(
+            (
+                result["components_changed"],
+                result["pairs_changed"],
+                result["images_changed"],
+            ),
+            (2, 2, 2),
+        )
+        with self.db.model.get_connection() as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM media_image_tags").fetchone()[0], 1
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM media_annotation_bytes").fetchone()[
+                    0
+                ],
+                3,
+            )
+        renamed = self.command(
+            "rename_vocabulary_tag",
+            self.tag_id("keep"),
+            expected_epoch=self.epoch,
+            name="keep",
+            new_name="kept",
+        )
+        self.assertEqual(renamed["images_changed"], 1)
+        self.assertEqual(renamed["tag"]["image_count"], 1)
 
 
 _OLD_STAMP = "2000-01-01T00:00:00+00:00"
@@ -621,6 +1008,7 @@ class TestVocabularyCategoryCommands(unittest.TestCase):
                 "other_prompts": 1,
                 "negative_variants": 2,
                 "archived_negative_variants": 1,
+                "images": 0,
             },
         )
         self.assertFalse(result["target_exists"])
@@ -690,6 +1078,7 @@ class TestVocabularyCategoryCommands(unittest.TestCase):
                 "other_prompts": 0,
                 "negative_variants": 0,
                 "archived_negative_variants": 0,
+                "images": 0,
             },
         )
         self.assertEqual(self.rows("prompts")[variant]["category"], "Other")
@@ -782,6 +1171,171 @@ class TestVocabularyCategoryCommands(unittest.TestCase):
                 self.apply(bad)
         self.assertEqual(self.snapshot(), before)
 
+    def own(self, value, *paths, root="root"):
+        self.db.set_image_categories([(root, path) for path in paths], value)
+
+    def image_rows(self):
+        with self.db.model.get_connection() as conn:
+            return {
+                (row[0], row[1]): (row[2], row[3], row[4])
+                for row in conn.execute(
+                    "SELECT root_key,relative_path,category,updated_at,rowid "
+                    "FROM image_categories ORDER BY rowid"
+                )
+            }
+
+    def checksum(self):
+        with self.db.model.get_connection() as conn:
+            return category_checksum(conn)
+
+    def test_preview_counts_image_rows(self):
+        self.owners()
+        self.own("Scenery", "a.png", "b.png", "missing.png")
+        self.own("Scenery", "c.png", root="second")
+        self.own("Other", "d.png")
+        before = self.image_rows()
+        result = self.preview()
+        self.assertEqual(result["impact"]["images"], 4)
+        self.assertEqual(self.image_rows(), before)
+        self.assertTrue(self.preview(target="Other")["target_exists"])
+
+    def test_apply_renames_image_categories(self):
+        self.owners()
+        bystander = self.save("Bystander", category="Other")
+        self.own("Scenery", "a.png", "b.png")
+        self.own("Scenery", "c.png", root="second")
+        self.own(" Scenery ", "padded.png")
+        self.own("Other", "d.png")
+        self.age_rows()
+        with self.db.model.get_connection() as conn:
+            conn.execute("UPDATE image_categories SET updated_at=?", (_OLD_STAMP,))
+        images_before = self.image_rows()
+        prompts_before, pairs_before = self.snapshot()
+        preview = self.preview()
+        receipt = self.apply(preview["impact_token"])
+        self.assertEqual(receipt["impact"]["images"], 3)
+        images_after = self.image_rows()
+        self.assertEqual(set(images_after), set(images_before))
+        renamed = {("root", "a.png"), ("root", "b.png"), ("second", "c.png")}
+        for key, (value, stamp, rowid) in images_after.items():
+            old_value, old_stamp, old_rowid = images_before[key]
+            self.assertEqual(rowid, old_rowid, key)
+            if key in renamed:
+                self.assertEqual(value, "Landscape")
+                self.assertNotEqual(stamp, _OLD_STAMP)
+            else:
+                self.assertEqual((value, stamp), (old_value, old_stamp))
+        prompts_after, pairs_after = self.snapshot()
+        self.assertEqual(prompts_after[bystander], prompts_before[bystander])
+        for before, after in (
+            (prompts_before, prompts_after),
+            (pairs_before, pairs_after),
+        ):
+            for row_id, row in after.items():
+                if before[row_id]["category"] != "Scenery":
+                    self.assertEqual(row, before[row_id])
+        # Merging into a value images already hold keeps every file key.
+        merge = self.preview(source="Landscape", target="Other")
+        self.assertTrue(merge["target_exists"])
+        self.assertEqual(merge["impact"]["images"], 3)
+        receipt = self.apply(merge["impact_token"], source="Landscape", target="Other")
+        self.assertTrue(receipt["consolidated"])
+        merged = self.image_rows()
+        self.assertEqual(set(merged), set(images_before))
+        self.assertEqual(
+            sorted(key for key, row in merged.items() if row[0] == "Other"),
+            sorted([*renamed, ("root", "d.png")]),
+        )
+
+    def test_image_only_value_can_be_renamed(self):
+        self.save("Bystander", category="Kept")
+        self.db.save_prompt_pair("Pair", "Noise", category="Kept")
+        self.own("Image only", "a.png", "b.png")
+        self.age_rows()
+        before = self.checksum()
+        preview = self.preview(source="Image only", target="Renamed")
+        self.assertEqual(
+            preview["impact"],
+            {
+                "positive_prompts": 0,
+                "other_prompts": 0,
+                "negative_variants": 0,
+                "archived_negative_variants": 0,
+                "images": 2,
+            },
+        )
+        self.assertFalse(preview["target_exists"])
+        receipt = self.apply(
+            preview["impact_token"], source="Image only", target="Renamed"
+        )
+        self.assertFalse(receipt["consolidated"])
+        self.assertEqual({row[0] for row in self.image_rows().values()}, {"Renamed"})
+        self.assertEqual(self.checksum(), before)
+        # An image-only target counts as existing.
+        self.own("Image target", "c.png")
+        self.assertTrue(
+            self.preview(source="Renamed", target="Image target")["target_exists"]
+        )
+        # Nothing holds the value any more: refused.
+        with self.assertRaises(LibraryCommandError) as caught:
+            self.preview(source="Image only", target="Again")
+        self.assertEqual(caught.exception.code, "vocabulary-conflict")
+
+    def test_token_refused_after_an_image_row_gains_or_loses_the_value(self):
+        self.owners()
+        self.own("Scenery", "a.png", "b.png")
+
+        def gain():
+            self.own("Scenery", "late.png")
+
+        def lose():
+            self.db.clear_image_categories([("root", "a.png")])
+
+        def move_away():
+            self.own("Elsewhere", "b.png")
+
+        def target_on_image():
+            self.own("Landscape", "target.png")
+
+        for mutate in (gain, lose, move_away, target_on_image):
+            with self.subTest(mutate.__name__):
+                token = self.preview()["impact_token"]
+                mutate()
+                before = self.snapshot(), self.image_rows()
+                with self.assertRaises(LibraryCommandError) as caught:
+                    self.apply(token)
+                self.assertEqual(caught.exception.code, "vocabulary-conflict")
+                self.assertEqual((self.snapshot(), self.image_rows()), before)
+
+    def test_image_category_failure_rolls_back_prompts(self):
+        self.owners()
+        self.own("Scenery", "a.png")
+        token = self.preview()["impact_token"]
+        with self.db.model.get_connection() as conn:
+            conn.execute(
+                "CREATE TRIGGER abort_images BEFORE UPDATE ON image_categories "
+                "BEGIN SELECT RAISE(ABORT, 'boom'); END"
+            )
+        before = self.snapshot(), self.image_rows()
+        with self.assertRaises(sqlite3.Error):
+            self.apply(token)
+        self.assertEqual((self.snapshot(), self.image_rows()), before)
+
+    def test_category_exists_reads_the_image_index(self):
+        from database import vocabulary
+
+        with self.db.model.get_connection() as conn:
+            plan = [
+                row[-1]
+                for row in conn.execute(
+                    "EXPLAIN QUERY PLAN " + vocabulary._CATEGORY_EXISTS, {"v": "x"}
+                )
+            ]
+        steps = [step for step in plan if "image_categories" in step]
+        self.assertTrue(steps, plan)
+        for step in steps:
+            self.assertIn("idx_image_categories_category", step)
+
     def test_category_apply_failure_rolls_back(self):
         self.owners()
         token = self.preview()["impact_token"]
@@ -821,6 +1375,18 @@ class TestSharedTokenHashing(unittest.TestCase):
                 "e", "S", "T", True, [(1, True), (2, False)], [(5, False)]
             ),
             "cefe7f6a5544b7f6a203f5527810899c6af568aa7abc1b75adffbfb5ae6251ae",
+        )
+        with_images = category_impact_token(
+            "e", "S", "T", True, [(1, True)], [], images=[9, 4]
+        )
+        self.assertRegex(with_images, r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(
+            with_images,
+            category_impact_token("e", "S", "T", True, [(1, True)], [], images=[4, 9]),
+        )
+        self.assertNotEqual(
+            with_images,
+            category_impact_token("e", "S", "T", True, [(1, True)], [], images=[4]),
         )
 
 

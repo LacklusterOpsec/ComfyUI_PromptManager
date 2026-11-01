@@ -8,6 +8,7 @@ import contextlib
 import csv
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -15,12 +16,30 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+
+# Run in a child interpreter: import py.autotag with a stub ComfyUI ``server``
+# and print every ML backend that the import pulled in.
+_IMPORT_AUTOTAG_REPORT_BACKENDS = """
+import sys
+from unittest.mock import MagicMock
+sys.modules["server"] = MagicMock()
+import py.autotag
+print(*sorted({"onnxruntime", "llama_cpp"} & set(sys.modules)))
+"""
 
 from PIL import Image
 
-from py import autotag
-from py.autotag import MODELS, AutoTagService
+# py.autotag reads its saved defaults from py.config, which imports ComfyUI's
+# ``server`` at load: stand in for it when this module runs alone.
+_mock_server = MagicMock()
+_mock_server.PromptServer.instance.routes = MagicMock()
+sys.modules.setdefault("server", _mock_server)
+
+from py import autotag  # noqa: E402
+from py.autotag import MODELS, AutoTagService  # noqa: E402
+from py.config import AutotagConfig  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -135,17 +154,26 @@ class TestModelInjection(EngineTestCase):
         self.assertEqual(service._model_loader, service._load_model)
 
     def test_importing_autotag_does_not_import_ml_backends(self):
-        for heavy in ("onnxruntime", "llama_cpp"):
-            self.assertNotIn(heavy, sys.modules)
+        # A fresh interpreter: earlier tests in this process may have imported
+        # an installed backend, so only a clean import can prove this (#472).
+        result = subprocess.run(
+            [sys.executable, "-c", _IMPORT_AUTOTAG_REPORT_BACKENDS],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), [])
 
     def test_default_wd14_loader_reports_missing_onnxruntime(self):
         _touch_model_files(self.models_dir, "wd14-vit")
         service = AutoTagService(models_dir=self.models_dir)
-        if "onnxruntime" in sys.modules:
-            self.skipTest("onnxruntime is installed in this environment")
 
-        with self.assertRaises(RuntimeError) as ctx:
-            service.load_model("wd14-vit")
+        # A None entry makes onnxruntime unimportable even where it is installed.
+        with _patch_modules({"onnxruntime": None}):
+            with self.assertRaises(RuntimeError) as ctx:
+                service.load_model("wd14-vit")
 
         self.assertIn("onnxruntime", str(ctx.exception))
         self.assertFalse(service.is_model_loaded())
@@ -254,12 +282,19 @@ class TestWd14Thresholding(EngineTestCase):
         self.assertEqual(list(feeds.keys()), ["input"])
         self.assertEqual(tuple(feeds["input"].shape), (1, 8, 8, 3))
 
-    def test_service_threshold_setters_clamp(self):
-        service = self._loaded([0.0] * 6)
-        service.wd14_general_threshold = 1.7
-        service.wd14_character_threshold = -2
-        self.assertEqual(service.wd14_general_threshold, 1.0)
-        self.assertEqual(service.wd14_character_threshold, 0.0)
+    def test_service_thresholds_are_the_saved_defaults(self):
+        # #328: one configuration; the service has no thresholds of its own.
+        service = self._loaded([0.9, 0.3, 0.8, 0.99, 0.99, 0.5])
+        with (
+            patch.object(AutotagConfig, "GENERAL_THRESHOLD", 0.25),
+            patch.object(AutotagConfig, "CHARACTER_THRESHOLD", 0.75),
+        ):
+            self.assertEqual(
+                (service.wd14_general_threshold, service.wd14_character_threshold),
+                (0.25, 0.75),
+            )
+            tags = service.generate_tags(str(self.image_path))
+        self.assertEqual(tags, ["1girl", "hatsune_miku", "long_hair", "smile"])
 
 
 class TestGgufNormalisation(EngineTestCase):
@@ -299,6 +334,162 @@ class TestGgufNormalisation(EngineTestCase):
         self.assertEqual(
             self.model.calls[0]["messages"][1]["content"][0]["text"], "one-off"
         )
+
+
+SCORED_TAGS = [
+    {"name": "desert", "category": "0"},
+    {"name": "sandstone", "category": "0"},
+    {"name": "Sandstone", "category": "0"},
+    {"name": "hatsune_miku", "category": "4"},
+    {"name": "rating:safe", "category": "9"},
+] + [{"name": f"tag_{i:03d}", "category": "0"} for i in range(120)]
+SCORED_PROBABILITIES = [0.96, 0.98, 0.5, 0.9, 0.99] + [
+    0.9 - i * 0.004 for i in range(120)
+]
+
+
+class TestTagSuggestions(EngineTestCase):
+    """``generate_tag_suggestions``: scored, ordered, bounded, distinct."""
+
+    def _wd14(self, tags=SCORED_TAGS, probabilities=SCORED_PROBABILITIES):
+        _touch_model_files(self.models_dir, "wd14-vit")
+        self.session = FakeOnnxSession(probabilities)
+        service = self._service(("wd14", (self.session, tags)))
+        service.load_model("wd14-vit")
+        return service
+
+    def _gguf(self, text):
+        _touch_model_files(self.models_dir, "gguf")
+        self.model = FakeGgufModel(text)
+        service = self._service(("gguf", self.model))
+        service.load_model("gguf")
+        return service
+
+    def test_wd14_suggestions_carry_real_probabilities_sorted(self):
+        service = self._wd14()
+
+        suggestions = service.generate_tag_suggestions(
+            str(self.image_path),
+            limit=10,
+            general_threshold=0.35,
+            character_threshold=0.85,
+        )
+
+        self.assertEqual(suggestions[:2], [("sandstone", 0.98), ("desert", 0.96)])
+        # The character tag passes its own threshold; rating tags never show.
+        self.assertIn(("hatsune_miku", 0.9), suggestions)
+        self.assertNotIn("rating:safe", [name for name, _ in suggestions])
+        scores = [score for _, score in suggestions]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertTrue(all(isinstance(score, float) for score in scores))
+        # "Sandstone" (0.5) repeats "sandstone" case-insensitively: dropped.
+        self.assertEqual(
+            [name.casefold() for name, _ in suggestions].count("sandstone"), 1
+        )
+
+    def test_suggestions_keep_the_requested_limit(self):
+        service = self._wd14()
+        for limit in (1, 10, 100):
+            with self.subTest(limit=limit):
+                suggestions = service.generate_tag_suggestions(
+                    str(self.image_path),
+                    limit=limit,
+                    general_threshold=0.0,
+                    character_threshold=0.0,
+                )
+                self.assertEqual(len(suggestions), limit)
+        for bad in (0, -1, 101, 2.5, "10", True, None):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                service.generate_tag_suggestions(str(self.image_path), limit=bad)
+
+    def test_thresholds_default_to_the_service_values(self):
+        service = self._wd14()
+        with (
+            patch.object(AutotagConfig, "GENERAL_THRESHOLD", 0.95),
+            patch.object(AutotagConfig, "CHARACTER_THRESHOLD", 0.95),
+        ):
+            suggestions = service.generate_tag_suggestions(
+                str(self.image_path), limit=10
+            )
+
+        self.assertEqual(suggestions, [("sandstone", 0.98), ("desert", 0.96)])
+
+    def test_llm_suggestions_have_null_confidence_in_output_order(self):
+        service = self._gguf("Zebra, apple, ZEBRA, mango tree, kiwi, plum")
+
+        suggestions = service.generate_tag_suggestions(
+            str(self.image_path), limit=3, prompt="tags please"
+        )
+
+        self.assertEqual(
+            suggestions, [("zebra", None), ("apple", None), ("mango_tree", None)]
+        )
+
+    def test_suggestions_skip_names_save_would_reject_before_the_limit(self):
+        from database.annotations import normalize_image_tags
+
+        too_long = "x" * 60
+        service = self._gguf(f"{too_long}, sky\ncloud, zebra, apple, mango, kiwi, plum")
+
+        suggestions = service.generate_tag_suggestions(
+            str(self.image_path), limit=3, prompt="tags please"
+        )
+
+        # The 60-character part and the part holding a newline are dropped
+        # before the count, so three valid chips still come back.
+        names = [name for name, _ in suggestions]
+        self.assertEqual(names, ["zebra", "apple", "mango"])
+        self.assertEqual(normalize_image_tags(names), names)
+
+    def test_generate_tags_return_shape_unchanged(self):
+        service = self._wd14()
+        self.assertEqual(
+            service.generate_tags(
+                str(self.image_path), general_threshold=0.95, character_threshold=0.95
+            ),
+            ["sandstone", "desert"],
+        )
+        gguf = self._gguf("Smile, smile, long hair")
+        self.assertEqual(
+            gguf.generate_tags(str(self.image_path)), ["smile", "long_hair"]
+        )
+
+    def test_explicit_prompt_does_not_mutate_custom_prompt(self):
+        service = self._gguf("tag")
+        service.custom_prompt = "saved legacy prompt"
+
+        service.generate_tag_suggestions(
+            str(self.image_path), limit=10, prompt="dialog instructions"
+        )
+
+        self.assertEqual(
+            self.model.calls[0]["messages"][1]["content"][0]["text"],
+            "dialog instructions",
+        )
+        self.assertEqual(service.custom_prompt, "saved legacy prompt")
+
+    def test_suggestions_need_a_loaded_model(self):
+        service = self._service(("gguf", FakeGgufModel("x")))
+        with self.assertRaises(RuntimeError):
+            service.generate_tag_suggestions(str(self.image_path), limit=10)
+
+    def test_image_file_is_closed_after_inference(self):
+        service = self._gguf("tag")
+        opened = []
+        real_open = autotag.Image.open
+
+        def tracking_open(*args, **kwargs):
+            image = real_open(*args, **kwargs)
+            opened.append(image)
+            return image
+
+        with patch.object(autotag.Image, "open", tracking_open):
+            service.generate_tag_suggestions(str(self.image_path), limit=10)
+            service.generate_tags(str(self.image_path))
+
+        self.assertEqual(len(opened), 2)
+        for image in opened:
+            self.assertIsNone(getattr(image, "fp", None))
 
 
 class TestGenerateTagsErrors(EngineTestCase):
@@ -630,8 +821,12 @@ class TestDefaultLoaders(EngineTestCase):
         transformers, model, processor, inputs = self._fake_transformers()
         pixel = inputs["pixel_values"]
         service = AutoTagService(models_dir=self.models_dir)
+        # The 8-bit load also needs these two (#424); stand-ins satisfy the check.
+        stubs = {
+            name: types.ModuleType(name) for name in ("accelerate", "bitsandbytes")
+        }
 
-        with _patch_modules({"torch": torch, "transformers": transformers}):
+        with _patch_modules({"torch": torch, "transformers": transformers, **stubs}):
             service.load_model("hf")
             tags = service.generate_tags(str(self.image_path))
 
@@ -714,3 +909,29 @@ class TestImageConversion(EngineTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWd14Device(EngineTestCase):
+    """Where WD14 runs, for the Tag output images estimate (#379)."""
+
+    def test_loaded_session_answers_from_its_first_provider(self):
+        cpu = FakeOnnxSession([0.5] * len(WD14_TAGS))
+        service = self._service(("wd14", (cpu, WD14_TAGS)))
+        _touch_model_files(self.models_dir, "wd14-vit")
+        service.load_model("wd14-vit")
+        self.assertEqual(service.wd14_device(), "cpu")
+        cpu.get_providers = lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        self.assertEqual(service.wd14_device(), "gpu")
+
+    def test_without_a_session_the_available_providers_answer(self):
+        service = self._service(None)
+        fake = types.SimpleNamespace(
+            get_available_providers=lambda: ["CUDAExecutionProvider"]
+        )
+        with patch.dict(sys.modules, {"onnxruntime": fake}):
+            self.assertEqual(service.wd14_device(), "gpu")
+        fake.get_available_providers = lambda: ["CPUExecutionProvider"]
+        with patch.dict(sys.modules, {"onnxruntime": fake}):
+            self.assertEqual(service.wd14_device(), "cpu")
+        with patch.dict(sys.modules, {"onnxruntime": None}):
+            self.assertEqual(service.wd14_device(), "cpu")

@@ -21,9 +21,11 @@ from .pairs import pair_response
 try:
     from ...database.library import ARCHIVE_SCOPES
     from ...database.library_commands import LibraryCommandError
+    from ...database.library_folders import folder_prefixes, normalize_folder
 except ImportError:
     from database.library import ARCHIVE_SCOPES
     from database.library_commands import LibraryCommandError
+    from database.library_folders import folder_prefixes, normalize_folder
 
 _SECRET = os.urandom(32)
 
@@ -155,6 +157,13 @@ def _archive_scope(request: web.Request) -> str:
     return value
 
 
+def _shelf(request: web.Request) -> str:
+    value = request.query.get("shelf", "active")
+    if value not in ("active", "archived"):
+        raise ValueError("shelf must be active or archived")
+    return value
+
+
 def _missing() -> web.Response:
     return web.json_response(
         {"success": False, "error": "Positive prompt not found"}, status=404
@@ -234,9 +243,22 @@ class LibraryRoutesMixin:
         )
 
     def _library_media(
-        self, records: list[dict], roots: list[Path], *, linked: bool = True
+        self,
+        records: list[dict],
+        roots: list[Path],
+        *,
+        linked: bool = True,
+        outputs: int | None = None,
     ) -> list[dict]:
+        """Workspace descriptors for a prompt's linked media under ``roots``.
+
+        Roots from index ``outputs`` on are linked-only (LoRA media, #355):
+        their media keeps its rooted identity, but gets no preview file (the
+        card loads the original; a video shows its label), no favorite star
+        and is marked ``linked_only`` (no Tag action).
+        """
         page = []
+        linked_only = set()
         for record in records:
             try:
                 raw_path = Path(record["image_path"])
@@ -250,41 +272,107 @@ class LibraryRoutesMixin:
                     canonical_root = _canonical(root)
                     if path.is_relative_to(canonical_root):
                         page.append((path, 0, canonical_root, index))
+                        if outputs is not None and index >= outputs:
+                            relative = path.relative_to(canonical_root).as_posix()
+                            linked_only.add((index, relative))
                         break
             except (OSError, ValueError, RuntimeError):
                 continue
-        return self._format_workspace_page(page, linked=linked)
+        images = self._format_workspace_page(page, linked=linked)
+        for image in images:
+            if (image["root_index"], image["path"]) in linked_only:
+                image["thumbnail_url"] = None
+                image["thumbnail_ready"] = False
+                image["linked_only"] = True
+                image.pop("favorite", None)
+        return images
+
+    def _library_roots(self) -> tuple[list[Path], int]:
+        """``(roots, number of output roots)`` for a prompt's linked media."""
+        outputs = list(self._get_all_output_dirs())
+        return self._media_roots(outputs), len(outputs)
+
+    def _library_root_spellings(self) -> list[str]:
+        """Every spelling of each output root (#444 folder filter): the
+        validated, resolved root and each configured or detected path that
+        resolves to it, so images saved through a symlinked root match."""
+        from ..config import GalleryConfig
+
+        roots = [str(root) for root in self._get_all_output_dirs()]
+        candidates = [
+            *GalleryConfig.MONITORING_DIRECTORIES,
+            self._find_comfyui_output_dir(),
+            *self._comfyui_output_dir_list(),
+        ]
+        spellings = []
+        for root in roots:
+            for value in (root, *candidates):
+                if not value or not isinstance(value, (str, os.PathLike)):
+                    continue
+                value = str(value)
+                same = value == root or os.path.normcase(
+                    os.path.realpath(value)
+                ) == os.path.normcase(root)
+                if same and value not in spellings:
+                    spellings.append(value)
+        return spellings
 
     @pair_response
     async def get_library_options(self, request: web.Request) -> web.Response:
-        result = await self._run_in_executor(self.db.get_library_options)
+        include = request.query.get("include", "")
+        if include not in ("", "folders"):
+            raise ValueError("include must be empty or 'folders'")
+        if include:
+            # Folders are read only when Refine opens (a walk of linked paths).
+            roots = await self._run_in_executor(self._library_root_spellings)
+            result = await self._run_in_executor(self.db.get_library_options, roots)
+        else:
+            result = await self._run_in_executor(self.db.get_library_options)
         return web.json_response({"success": True, **result})
 
     @pair_response
     async def list_library(self, request: web.Request) -> web.Response:
+        folder = normalize_folder(request.query.get("folder", ""))
         options = {
             "text": request.query.get("text", ""),
             "category": request.query.get("category"),
             "tags": sorted(set(request.query.getall("tag", []))),
+            "tag_mode": request.query.get("tag_mode", "all"),
             "sort": request.query.get("sort", "newest"),
+            # #443: which shelf; part of the cursor scope, so a cursor never
+            # crosses shelves. Not the variant ``archive`` scope of /{id}.
+            "shelf": _shelf(request),
         }
         limit = _page_limit(request)
         cursor = request.query.get("cursor")
+        roots = (
+            await self._run_in_executor(self._library_root_spellings) if folder else []
+        )
+        prefixes = folder_prefixes(roots, folder) if folder else None
 
         def read() -> tuple[dict, dict]:
             with self.db.library_snapshot(include_ceiling=True) as snapshot:
                 conn, epoch, ceiling = snapshot
+                # The folder and the roots it was resolved under join the scope.
                 scope = _scope(
-                    {"kind": "parents", "projection": 2, "epoch": epoch, **options}
+                    {
+                        "kind": "parents",
+                        "projection": 2,
+                        "epoch": epoch,
+                        **options,
+                        **({"folder": folder, "roots": roots} if folder else {}),
+                    }
                 )
                 result = self.db._list_library(
                     conn,
                     epoch,
                     ceiling,
                     **options,
+                    folder_prefixes=prefixes,
                     limit=limit,
                     after=_decode(cursor, scope),
                 )
+                result["folder"] = folder
                 records = self.db.get_library_previews(
                     [parent["id"] for parent in result["items"]]
                 )
@@ -294,13 +382,13 @@ class LibraryRoutesMixin:
             return result, records
 
         result, records = await self._run_in_executor(read)
-        roots = list(self._get_all_output_dirs())
 
         def previews() -> None:
+            roots, outputs = self._library_roots()
             for parent in result["items"]:
                 # Previews belong to their parent; a per-parent link read is N+1.
                 parent["previews"] = self._library_media(
-                    records[parent["id"]], roots, linked=False
+                    records[parent["id"]], roots, linked=False, outputs=outputs
                 )
 
         await self._run_in_executor(previews)
@@ -342,9 +430,9 @@ class LibraryRoutesMixin:
         result, records = await self._run_in_executor(read)
         if result is None:
             return _missing()
-        roots = list(self._get_all_output_dirs())
+        roots, outputs = await self._run_in_executor(self._library_roots)
         result["positive"]["previews"] = await self._run_in_executor(
-            self._library_media, records, roots
+            lambda: self._library_media(records, roots, outputs=outputs)
         )
         return web.json_response({"success": True, **result})
 
@@ -358,7 +446,7 @@ class LibraryRoutesMixin:
         archive = _archive_scope(request)
         limit = _page_limit(request)
         cursor = request.query.get("cursor")
-        roots = list(self._get_all_output_dirs())
+        roots, outputs = await self._run_in_executor(self._library_roots)
         canonical_roots = [str(_canonical(root)) for root in roots]
 
         def read() -> dict | None:
@@ -391,7 +479,7 @@ class LibraryRoutesMixin:
         if result is None:
             return _missing()
         result["images"] = await self._run_in_executor(
-            self._library_media, result["images"], roots
+            lambda: self._library_media(result["images"], roots, outputs=outputs)
         )
         return web.json_response({"success": True, **result})
 

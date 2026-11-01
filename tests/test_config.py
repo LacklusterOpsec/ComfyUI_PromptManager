@@ -19,6 +19,7 @@ sys.modules.setdefault("server", _mock_server)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from py import config as config_module
 from py.config import GalleryConfig, IntegrationConfig, PromptManagerConfig
 
 
@@ -58,6 +59,28 @@ class TestGalleryConfig(unittest.TestCase):
         self.assertFalse(GalleryConfig.MONITORING_ENABLED)
         self.assertEqual(GalleryConfig.PROCESSING_DELAY, 5.0)
 
+    def test_save_foreign_runs_defaults_on_and_only_booleans_apply(self):
+        """#247: gallery.monitoring.save_foreign_runs, default true."""
+        self.assertIs(
+            GalleryConfig.get_config()["monitoring"]["save_foreign_runs"], True
+        )
+        GalleryConfig.update_config({"monitoring": {"save_foreign_runs": False}})
+        self.assertIs(GalleryConfig.SAVE_FOREIGN_RUNS, False)
+        for junk in ("true", 1, None):
+            with self.subTest(value=junk):
+                with self.assertLogs("prompt_manager.config", "WARNING") as logs:
+                    GalleryConfig.update_config(
+                        {"monitoring": {"save_foreign_runs": junk}}
+                    )
+                self.assertIn(
+                    "Ignoring gallery monitoring save_foreign_runs: expected true "
+                    "or false",
+                    "\n".join(logs.output),
+                )
+                self.assertIs(GalleryConfig.SAVE_FOREIGN_RUNS, False)
+        GalleryConfig.update_config({"monitoring": {"save_foreign_runs": True}})
+        self.assertIs(GalleryConfig.SAVE_FOREIGN_RUNS, True)
+
     def test_update_tracking(self):
         GalleryConfig.update_config({"tracking": {"prompt_timeout": 300}})
         self.assertEqual(GalleryConfig.PROMPT_TIMEOUT, 300)
@@ -74,7 +97,8 @@ class TestGalleryConfig(unittest.TestCase):
             {"web_interface": {"images_per_page": 50, "thumbnail_size": 512}}
         )
         self.assertEqual(GalleryConfig.IMAGES_PER_PAGE, 50)
-        self.assertEqual(GalleryConfig.THUMBNAIL_SIZE, 512)
+        # #317 R1: the never-read thumbnail_size is ignored (thumbnails.edge).
+        self.assertFalse(hasattr(GalleryConfig, "THUMBNAIL_SIZE"))
 
     def test_update_performance(self):
         GalleryConfig.update_config({"performance": {"max_concurrent_processing": 5}})
@@ -402,6 +426,237 @@ class TestConfigPathOverride(unittest.TestCase):
             PromptManagerConfig.load_from_file()
 
             self.assertEqual(PromptManagerConfig.RESULT_TIMEOUT, 77)
+
+
+class TestAutotagConfig(unittest.TestCase):
+    """``autotag.defaults.suggestion_limit``: integer 1..100, default 10 (D68)."""
+
+    def setUp(self):
+        self.config_class = getattr(config_module, "AutotagConfig", None)
+        self.assertIsNotNone(self.config_class, "AutotagConfig is not implemented")
+        self._orig = PromptManagerConfig.get_config()
+        self._defaults = {
+            attr: getattr(self.config_class, attr, None)
+            for attr in (
+                "MODEL_TYPE",
+                "EXISTING",
+                "GENERAL_THRESHOLD",
+                "CHARACTER_THRESHOLD",
+                "SUGGESTION_LIMIT",
+                "SKIPPED_TAGS",
+                "INSTRUCTIONS",
+                "DEFAULT_INSTRUCTIONS",
+                "_LEGACY_TEMPLATE",
+            )
+        }
+
+    def tearDown(self):
+        for attr, value in self._defaults.items():
+            setattr(self.config_class, attr, value)
+        PromptManagerConfig.update_config(self._orig)
+
+    def _load(self, value):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "config.json")
+            with open(path, "w") as f:
+                # json writes NaN for float("nan"), which json.load reads back.
+                json.dump({"autotag": {"defaults": {"suggestion_limit": value}}}, f)
+            with self.assertLogs("prompt_manager.config", level="WARNING") as logs:
+                PromptManagerConfig.load_from_file(path)
+        return logs
+
+    def test_every_copy_of_the_tag_set_cap_is_one_value(self):
+        # A suggestion request is bounded by the image tag set cap; the
+        # copies that cannot import it (config loads before the database,
+        # the inspection envelope stays storage-free) are pinned to it here.
+        from database.annotations import MAX_IMAGE_TAGS
+        from py import autotag
+        from utils import inspection_response
+
+        self.assertEqual(autotag.MAX_SUGGESTION_LIMIT, MAX_IMAGE_TAGS)
+        self.assertEqual(config_module.MAX_SUGGESTION_LIMIT, MAX_IMAGE_TAGS)
+        self.assertEqual(inspection_response.MAX_IMAGE_TAGS, MAX_IMAGE_TAGS)
+
+    def test_default_is_ten_and_persisted_under_autotag_defaults(self):
+        self.assertEqual(config_module.DEFAULT_SUGGESTION_LIMIT, 10)
+        self.assertEqual(config_module.MAX_SUGGESTION_LIMIT, 100)
+        self.assertEqual(self.config_class.suggestion_limit(), 10)
+        self.assertEqual(
+            PromptManagerConfig.get_config()["autotag"],
+            {
+                "defaults": {
+                    "model_type": "wd14-swinv2",
+                    "existing": "skip",
+                    "general_threshold": 0.35,
+                    "character_threshold": 0.85,
+                    "suggestion_limit": 10,
+                    "skipped_tags": [],
+                    "instructions": [],
+                    "default_instructions": {"gguf": "builtin", "hf": "builtin"},
+                }
+            },
+        )
+        # #431: the old template key is written only as the GGUF default's
+        # mirror (test_saved_instructions covers it).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "config.json")
+            PromptManagerConfig.update_config(
+                {"autotag": {"defaults": {"suggestion_limit": 25}}}
+            )
+            PromptManagerConfig.save_to_file(path)
+            self.config_class.SUGGESTION_LIMIT = 10
+            PromptManagerConfig.load_from_file(path)
+        self.assertEqual(self.config_class.suggestion_limit(), 25)
+
+    def test_valid_limits_are_kept(self):
+        for value in (1, 10, 100):
+            with self.subTest(value=value):
+                PromptManagerConfig.update_config(
+                    {"autotag": {"defaults": {"suggestion_limit": value}}}
+                )
+                self.assertEqual(self.config_class.suggestion_limit(), value)
+
+    def test_autotag_defaults_fall_back_per_key_on_load(self):
+        """#328: each saved tagging default is checked alone on load; a bad
+        hand-edited value falls back to its default with one warning and
+        leaves the other keys as saved."""
+        good = {
+            "model_type": "gguf",
+            "existing": "merge",
+            "general_threshold": 0.4,
+            "character_threshold": 0.7,
+            "suggestion_limit": 15,
+            "skipped_tags": ("blurry", "closed eyes"),
+        }
+        fallback = {
+            "model_type": "wd14-swinv2",
+            "existing": "skip",
+            "general_threshold": 0.35,
+            "character_threshold": 0.85,
+            "suggestion_limit": 10,
+            "skipped_tags": (),
+        }
+        bad_values = {
+            "model_type": ["wd14-convnext", 3, None],
+            "existing": ["replace", "", True],
+            # #369: a saved threshold off the 0.05 step no page can show.
+            "general_threshold": [1.5, -0.1, float("nan"), "0.4", True, 0.37],
+            "character_threshold": [2, float("inf"), None, 0.33],
+            # 4000 characters are at most 16,000 UTF-8 bytes, so the 16 KiB
+            # byte cap can only be met past the character cap.
+            "template": ["", "   ", "x" * 4001, "\U0001f600" * 4097, "\ud800", 7],
+            # #431: the whole list falls back; entries are never dropped one by one.
+            "skipped_tags": ["blurry", ["a,b"], ["sky", "Sky"], [""], ["x"] * 201],
+        }
+        for key, values in bad_values.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    saved = dict(good, **{key: value})
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        path = os.path.join(tmpdir, "config.json")
+                        with open(path, "w") as f:
+                            json.dump({"autotag": {"defaults": saved}}, f, default=list)
+                        with self.assertLogs(
+                            "prompt_manager.config", level="WARNING"
+                        ) as logs:
+                            PromptManagerConfig.load_from_file(path)
+                    self.assertEqual(len(logs.records), 1, logs.output)
+                    self.assertIn(f"autotag.defaults.{key}", logs.output[0])
+                    loaded = {
+                        k: getattr(self.config_class, attr)
+                        for k, (attr, _v, _d) in self.config_class._KEYS.items()
+                    }
+                    # The old template is no attribute any more (#431): a bad
+                    # one is only warned about and imports nothing.
+                    expected = (
+                        dict(good, **{key: fallback[key]}) if key in fallback else good
+                    )
+                    self.assertEqual(loaded, expected)
+
+    def test_skipped_tags_load_trimmed_and_warn_once_when_damaged(self):
+        """#431: the list is kept as typed (trimmed); a damaged list is
+        replaced by no skipped tags with one warning naming the reason."""
+        PromptManagerConfig.update_config(
+            {"autotag": {"defaults": {"skipped_tags": [" blurry ", "(fate)"]}}}
+        )
+        self.assertEqual(self.config_class.SKIPPED_TAGS, ("blurry", "(fate)"))
+        with self.assertLogs("prompt_manager.config", level="WARNING") as logs:
+            PromptManagerConfig.update_config(
+                {"autotag": {"defaults": {"skipped_tags": ["sky", "a,b"]}}}
+            )
+        self.assertEqual(self.config_class.SKIPPED_TAGS, ())
+        self.assertEqual(
+            [record.getMessage() for record in logs.records],
+            [
+                "autotag.defaults.skipped_tags entry 2 must not contain a comma"
+                " or a line break; using no skipped tags"
+            ],
+        )
+
+    def test_tagging_validators_moved_with_their_messages(self):
+        validate_threshold = config_module.validate_threshold
+        validate_template = config_module.validate_template
+        self.assertEqual(validate_threshold("general_threshold", 1), 1.0)
+        for value, message in (
+            (float("nan"), "general_threshold must be a finite number"),
+            ("0.4", "general_threshold must be a finite number"),
+            (1.01, "general_threshold must be between 0 and 1"),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                validate_threshold("general_threshold", value)
+            self.assertEqual(str(caught.exception), message)
+        self.assertEqual(validate_template("Tags."), "Tags.")
+        for value, message in (
+            ("  ", "instructions must be non-empty text"),
+            ("x" * 4001, "instructions must be at most 4000 characters"),
+            ("\ud800", "instructions must be valid Unicode text"),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                validate_template(value)
+            self.assertEqual(str(caught.exception), message)
+        self.assertEqual(
+            config_module.MODEL_TYPES, {"gguf", "hf", "wd14-swinv2", "wd14-vit"}
+        )
+
+    def test_saved_threshold_is_a_multiple_of_the_step(self):
+        """#369: every page shows the thresholds in steps of 0.05, so a saved
+        one must be on that grid; it is stored exactly on it."""
+        from py.tagging_defaults import validate_saved_threshold as validate
+
+        for value in (0, 0.05, 0.15, 0.35, 0.85, 1):
+            with self.subTest(value=value):
+                self.assertEqual(validate("x", value), value)
+        self.assertEqual(validate("x", 0.1 + 0.2), 0.3)
+        for value, message in (
+            (0.37, "x must be a multiple of 0.05"),
+            (0.351, "x must be a multiple of 0.05"),
+            (0.35000000001, "x must be a multiple of 0.05"),
+            (1.5, "x must be between 0 and 1"),
+            ("0.4", "x must be a finite number"),
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as caught:
+                    validate("x", value)
+                self.assertEqual(str(caught.exception), message)
+
+    def test_suggestion_limit_setting_validated_on_load(self):
+        for value in (0, 101, "10", float("nan"), 2.5, True, None, [10]):
+            with self.subTest(value=value):
+                self.config_class.SUGGESTION_LIMIT = 42
+                logs = self._load(value)
+                self.assertEqual(self.config_class.suggestion_limit(), 10)
+                self.assertIn("suggestion_limit", "\n".join(logs.output))
+
+    def test_missing_or_malformed_sections_keep_the_current_value(self):
+        self.config_class.SUGGESTION_LIMIT = 7
+        for config in ({}, {"autotag": {}}, {"autotag": {"defaults": {}}}):
+            PromptManagerConfig.update_config(config)
+            self.assertEqual(self.config_class.suggestion_limit(), 7)
+        with self.assertLogs("prompt_manager.config", level="WARNING"):
+            PromptManagerConfig.update_config({"autotag": "nope"})
+        with self.assertLogs("prompt_manager.config", level="WARNING"):
+            PromptManagerConfig.update_config({"autotag": {"defaults": [1]}})
+        self.assertEqual(self.config_class.suggestion_limit(), 7)
 
 
 if __name__ == "__main__":

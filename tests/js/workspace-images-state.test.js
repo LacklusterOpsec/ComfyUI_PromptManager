@@ -128,6 +128,33 @@ test('all-source defaults are omitted and descending name sort remains supported
     await stream.reset({root:'all',media:'all',sort:'name-desc'});
     assert.equal(query.has('root'),false);assert.equal(query.has('media'),false);
     assert.equal(query.get('sort'),'name-desc');assert.equal(query.get('limit'),'40');
+    assert.equal(query.has('favorites'),false);
+});
+
+test('the Favorites page asks the listing for favorites only (#249 D51)', async () => {
+    const {createImageStream}=await source;let query;
+    const stream=createImageStream({api:{get:async url=>{query=new URL(url,'http://local').searchParams;return page([]);}}});
+    await stream.reset({favorites:true,q:'fog'});
+    assert.equal(query.get('favorites'),'1');assert.equal(query.get('q'),'fog');
+    await stream.reset({favorites:false});
+    assert.equal(query.has('favorites'),false);
+    for(const favorites of ['1',1,'true'])await assert.rejects(stream.reset({favorites}),/Invalid favorites filter/);
+});
+
+test('a collection page asks the listing for that collection only (#331 D137)', async () => {
+    const {createImageStream}=await source;let query;
+    const stream=createImageStream({api:{get:async url=>{query=new URL(url,'http://local').searchParams;return page([]);}}});
+    await stream.reset({collection:'12',q:'fog'});
+    assert.equal(query.get('collection'),'12');assert.equal(query.get('q'),'fog');assert.equal(query.has('favorites'),false);
+    await stream.reset({collection:7});
+    assert.equal(query.get('collection'),'7');
+    for(const collection of ['',null,undefined]) {
+        await stream.reset({collection});
+        assert.equal(query.has('collection'),false);
+    }
+    for(const collection of ['0','07','x',-1,1.5,'1234567890',true])await assert.rejects(stream.reset({collection}),/Invalid collection filter/);
+    // Favorites and a collection are never both a page's filter.
+    await assert.rejects(stream.reset({collection:'3',favorites:true}),/Invalid collection filter/);
 });
 
 test('restored browsing state resumes its cursor and filters without an initial request', async () => {
@@ -184,11 +211,12 @@ test('custom collection pages reuse image-stream cancellation, cursors and ident
     assert.throws(()=>createImageStream({api:{get:async()=>{}},fetchPage:'invalid'}),/page/i);
 });
 
-test('stream sends category, tags and the rating sort and validates them', async () => {
+test('stream sends category, tags and the sort and validates them; the rating sort is gone (D153)', async () => {
     const {createImageStream}=await source;const calls=[];
     const stream=createImageStream({api:{get:async url=>{calls.push(new URL(url,'http://local').searchParams);return page([]);}}});
-    await stream.reset({q:'cat',category:'Animals',tags:['cats','studio'],sort:'rating'});
-    assert.equal(calls[0].get('category'),'Animals');assert.equal(calls[0].get('tags'),'cats,studio');assert.equal(calls[0].get('sort'),'rating');
+    await stream.reset({q:'cat',category:'Animals',tags:['cats','studio'],sort:'name-desc'});
+    assert.equal(calls[0].get('category'),'Animals');assert.equal(calls[0].get('tags'),'cats,studio');assert.equal(calls[0].get('sort'),'name-desc');
+    await assert.rejects(stream.reset({sort:'rating'}),/sort/i);
     await stream.reset({category:'',tags:[]});
     assert.equal(calls[1].has('category'),false);assert.equal(calls[1].has('tags'),false);
     for(const filters of [{category:3},{tags:'cats'},{tags:[1]},{tags:['a,b']},{tags:['']}]) await assert.rejects(stream.reset(filters),/filter/i);
@@ -223,6 +251,23 @@ test('the count line reads N of M images and K positive prompts only when known'
     assert.equal(countLine({loaded:1200,total:3400,positiveCount:0}),'1,200 of 3,400 images · 0 positive prompts');
 });
 
+test('the count line reads as loading, never as an empty result, until a first page answers (#391)', async () => {
+    const {countLine,createImageStream}=await source;
+    assert.equal(countLine({loaded:0,total:0,positiveCount:null,loading:true,error:null}),'Loading images…');
+    // A failed first page and a settled empty one say what the server said; a later page keeps the loaded count.
+    assert.equal(countLine({loaded:0,total:0,positiveCount:null,loading:false,error:new Error('x')}),'0 of 0 images');
+    assert.equal(countLine({loaded:0,total:0,positiveCount:0,loading:false,error:null}),'0 of 0 images · 0 positive prompts');
+    assert.equal(countLine({loaded:40,total:102,positiveCount:2,loading:true,error:null}),'40 of 102 images · 2 positive prompts');
+    // While a reset's first page is in flight the line reads as loading (the cleared state before it is replaced in
+    // the same task, so it is never painted).
+    let answer;const lines=[];
+    const stream=createImageStream({api:{get:()=>new Promise(resolve=>{answer=resolve;})},onChange:state=>lines.push(countLine(state))});
+    const loading=stream.reset({tags:['cinematic']});
+    assert.equal(lines.at(-1),'Loading images…');
+    answer({images:[{path:'a.png',root_index:0}],total:1,has_more:false,next_cursor:null,positive_count:1});await loading;
+    assert.equal(lines.at(-1),'1 of 1 image · 1 positive prompt');
+});
+
 test('the caption date names the newest result day under Newest first only', async () => {
     const {captionDate}=await source;
     const now=new Date(2026,9,17,15,0);
@@ -233,7 +278,7 @@ test('the caption date names the newest result day under Newest first only', asy
     assert.equal(captionDate([at(2026,9,10),at(2026,9,16,23)],'oldest',now),'');
     assert.equal(captionDate([at(2026,9,13)],'newest',now),'Tuesday · October 13');
     assert.equal(captionDate([at(2025,2,3)],'newest',now),'Monday · March 3, 2025');
-    for(const sort of ['name','name-desc','rating']) assert.equal(captionDate([at(2026,9,17)],sort,now),'');
+    for(const sort of ['name','name-desc']) assert.equal(captionDate([at(2026,9,17)],sort,now),'');
     assert.equal(captionDate([],'newest',now),'');
     assert.equal(captionDate([{modified_time:'bad'}],'newest',now),'');
 });
@@ -246,6 +291,15 @@ test('the scope chip summarizes source and folder', async () => {
     assert.equal(scopeLabel({root:'0',subfolder:''},roots),'output · All output folders');
     assert.equal(scopeLabel({root:'all',subfolder:'bulk'},roots),'All sources · bulk');
     assert.equal(scopeLabel({root:'7',subfolder:''},roots),'Source 7 · All output folders');
+});
+
+test('the Filters count names each active Refine filter once (D44)', async () => {
+    const {activeRefinements}=await source;
+    assert.equal(activeRefinements({root:'all',subfolder:'',media:'all',tags:[]}),0);
+    assert.equal(activeRefinements({root:'',subfolder:'',media:'all',tags:[]}),0);
+    assert.equal(activeRefinements({root:'1',subfolder:'',media:'all',tags:[]}),1);
+    assert.equal(activeRefinements({root:'all',subfolder:'bulk',media:'video',tags:['a','b']}),3);
+    assert.equal(activeRefinements({root:'0',subfolder:'bulk',media:'image',tags:['a']}),4);
 });
 
 test('the card title is the confirmed linked title, else the filename (D10)', async () => {
@@ -331,4 +385,184 @@ test('selectionLabel counts the selected images as the concept bar does', async 
     assert.equal(selectionLabel(1), '1 selected');
     assert.equal(selectionLabel(2), '2 selected');
     assert.equal(selectionLabel(1234), '1,234 selected');
+});
+
+test('refresh re-reads the loaded range in place and publishes once, replacing the items', async () => {
+    const {createImageStream,imageKey}=await source;const requests=[];const states=[];
+    const stream=createImageStream({api:{get:(url,{signal})=>{const d=deferred();requests.push({...d,url,signal});return d.promise;}},onChange:(s,hint)=>states.push([s,hint]),batchSize:2});
+    assert.equal(typeof stream.refresh,'function','refresh is part of the stream');
+    const first=stream.reset({q:'tag'});requests[0].resolve(page([image('a'),image('b')],5,'c1'));await first;
+    const second=stream.loadMore();requests[1].resolve(page([image('c'),image('d')],5,'c2'));await second;
+    const before=stream.state;const published=states.length;
+    const refresh=stream.refresh();
+    // The current collection stays shown while the re-read runs; Load more waits for it.
+    assert.equal(stream.state,before);assert.equal(states.length,published);
+    assert.equal(await stream.loadMore(),0);assert.equal(requests.length,3);
+    const query=new URL(requests[2].url,'http://local').searchParams;
+    // The loaded range is re-read in pages as large as it (at most 200), not in the listing's batches (M2).
+    assert.equal(query.get('q'),'tag');assert.equal(query.has('cursor'),false);assert.equal(query.get('limit'),'4');
+    requests[2].resolve(page([image('a'),image('new'),image('c')],6,'n1'));
+    await new Promise(resolve=>setImmediate(resolve));
+    const next=new URL(requests[3].url,'http://local').searchParams;
+    assert.equal(next.get('cursor'),'n1');assert.equal(next.get('limit'),'2','the rest, at least one batch');
+    assert.equal(stream.state,before);
+    requests[3].resolve(page([image('d')],6,'n2'));
+    assert.equal(await refresh,4);
+    assert.deepEqual(stream.state.items.map(imageKey),['0:a','0:new','0:c','0:d']);
+    assert.deepEqual([stream.state.total,stream.state.cursor,stream.state.hasMore,stream.state.loaded,stream.state.loading],[6,'n2',true,4,false]);
+    assert.equal(states.length,published+1);assert.deepEqual(states.at(-1)[1],{replaced:true});
+    // Load more continues from the refreshed cursor.
+    const more=stream.loadMore();assert.equal(new URL(requests[4].url,'http://local').searchParams.get('cursor'),'n2');
+    requests[4].resolve(page([image('e')],6));await more;
+    assert.deepEqual(stream.state.items.map(imageKey),['0:a','0:new','0:c','0:d','0:e']);
+});
+
+test('refresh stops early when the result shrank, and a reset or failure leaves the collection as it was', async () => {
+    const {createImageStream,imageKey}=await source;const requests=[];
+    const stream=createImageStream({api:{get:(url,{signal})=>{const d=deferred();requests.push({...d,url,signal});return d.promise;}},batchSize:2});
+    assert.equal(typeof stream.refresh,'function','refresh is part of the stream');
+    const first=stream.reset({tags:['x']});requests[0].resolve(page([image('a'),image('b')],4,'c1'));await first;
+    const shrink=stream.refresh();requests[1].resolve(page([image('b')],1));
+    assert.equal(await shrink,1);assert.deepEqual(stream.state.items.map(imageKey),['0:b']);assert.equal(stream.state.hasMore,false);
+    const before=stream.state;
+    const failing=stream.refresh();requests[2].reject(new Error('offline'));
+    await assert.rejects(failing,/offline/,'a failed re-read is reported to the page');assert.equal(stream.state,before);
+    const stale=stream.refresh();const fresh=stream.reset({tags:['y']});
+    assert.equal(requests[3].signal.aborted,true);
+    requests[4].resolve(page([image('y')]));await fresh;
+    requests[3].resolve(page([image('stale')]));assert.equal(await stale,0);
+    assert.deepEqual(stream.state.items.map(imageKey),['0:y']);
+    stream.dispose();assert.equal(await stream.refresh(),0);
+});
+
+test('a refresh asked while a page loads runs once that page settles (I6)', async () => {
+    const {createImageStream,imageKey}=await source;const requests=[];const states=[];
+    const stream=createImageStream({api:{get:(url,{signal})=>{const d=deferred();requests.push({...d,url,signal});return d.promise;}},onChange:(s,hint)=>states.push(hint),batchSize:2});
+    const first=stream.reset({tags:['x']});requests[0].resolve(page([image('a'),image('b')],4,'c1'));await first;
+    for (const settle of ['resolve','reject']) {
+        const more=stream.loadMore();const sent=requests.length;
+        assert.equal(await stream.refresh(),0,'nothing is read beside the page in flight');
+        assert.equal(await stream.refresh(),0);
+        assert.equal(requests.length,sent);
+        if (settle==='resolve') requests[sent-1].resolve(page([image('c'),image('d')],4,'c2'));
+        else requests[sent-1].reject(new Error('offline'));
+        await more;
+        await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(requests.length,sent+1,'exactly one pending refresh follows');
+        assert.equal(new URL(requests[sent].url,'http://local').searchParams.has('cursor'),false);
+        requests[sent].resolve(page([image('a'),image('b'),image('c'),image('d')],6,'r1'));
+        await new Promise(resolve=>setImmediate(resolve));
+        assert.deepEqual(states.at(-1),{replaced:true});
+        assert.equal(states.filter(hint=>hint?.replaced).length,settle==='resolve'?1:2);
+    }
+    // A reset drops a pending refresh.
+    const more=stream.loadMore();const sent=requests.length;
+    assert.equal(await stream.refresh(),0);
+    const fresh=stream.reset({tags:['y']});
+    requests[sent].resolve(page([image('y')]));await fresh;
+    requests[sent-1].resolve(page([image('late')],1));await more;
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(requests.length,sent+1);assert.deepEqual(stream.state.items.map(imageKey),['0:y']);
+    assert.equal(stream.refreshing,false);
+});
+
+test('refresh reads a long loaded range in at most 200-file pages and exposes refreshing (M2, M3)', async () => {
+    const {createImageStream}=await source;const requests=[];
+    const stream=createImageStream({api:{get:(url,{signal})=>{const d=deferred();requests.push({...d,url,signal});return d.promise;}},batchSize:150});
+    const many=(prefix,n)=>Array.from({length:n},(_,i)=>image(`${prefix}${i}`));
+    const first=stream.reset({q:'x'});requests[0].resolve(page(many('a',150),1000,'c1'));await first;
+    const second=stream.loadMore();requests[1].resolve(page(many('b',150),1000,'c2'));await second;
+    const refresh=stream.refresh();
+    assert.equal(stream.refreshing,true);
+    assert.equal(new URL(requests[2].url,'http://local').searchParams.get('limit'),'200');
+    requests[2].resolve(page(many('r',200),1000,'n1'));
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(new URL(requests[3].url,'http://local').searchParams.get('limit'),'150');
+    requests[3].resolve(page(many('s',150),1000,'n2'));
+    assert.equal(await refresh,350);assert.equal(requests.length,4);
+    assert.equal(stream.refreshing,false);
+});
+
+test('a second refresh supersedes the first, repeats in a re-read are dropped, and dispose abandons one in flight', async () => {
+    const {createImageStream,imageKey}=await source;const requests=[];const states=[];
+    const stream=createImageStream({api:{get:(url,{signal})=>{const d=deferred();requests.push({...d,url,signal});return d.promise;}},onChange:(s,hint)=>states.push(hint),batchSize:2});
+    const first=stream.reset({q:'x'});requests[0].resolve(page([image('a'),image('b')],2));await first;
+    const older=stream.refresh();const newer=stream.refresh();
+    assert.equal(requests[1].signal.aborted,true,'the older re-read is aborted');
+    requests[2].resolve(page([image('b'),image('b'),image('a')],2));
+    assert.equal(await newer,2);
+    requests[1].resolve(page([image('old')],1));assert.equal(await older,0);
+    assert.deepEqual(stream.state.items.map(imageKey),['0:b','0:a']);
+    assert.equal(states.filter(hint=>hint?.replaced).length,1);
+    const pending=stream.refresh();
+    stream.dispose();
+    assert.equal(requests[3].signal.aborted,true);
+    requests[3].resolve(page([image('late')],1));
+    assert.equal(await pending,0);assert.deepEqual(stream.state.items.map(imageKey),['0:b','0:a']);
+});
+
+test('a refresh deferred behind a page load is dropped when the stream is disposed meanwhile', async () => {
+    const {createImageStream}=await source;const requests=[];
+    const stream=createImageStream({api:{get:(url,{signal})=>{const d=deferred();requests.push({...d,url,signal});return d.promise;}},batchSize:2});
+    const first=stream.reset({q:'x'});requests[0].resolve(page([image('a'),image('b')],4,'c1'));await first;
+    const more=stream.loadMore();
+    assert.equal(await stream.refresh(),0);
+    stream.dispose();
+    requests[1].resolve(page([image('c')],4,'c2'));await more;
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(requests.length,2,'no refresh runs after dispose');
+});
+
+test('defaults apply to a new visit but not to the current view or a saved view', async () => {
+    const { initialImagesView } = await source;
+    assert.equal(typeof initialImagesView, 'function', 'initialImagesView is exported');
+    const preferences = { workspaceLayout: 'masonry', workspaceDensity: 'compact' };
+    // A new visit starts from System › Appearance.
+    assert.deepEqual(initialImagesView({ preferences }), { layout: 'masonry', density: 'compact' });
+    // The current view (the last visit) keeps its own toolbar choices.
+    assert.deepEqual(initialImagesView({ prior: { layout: 'list', density: 'large' }, preferences }), { layout: 'list', density: 'large' });
+    assert.deepEqual(initialImagesView({ prior: {}, preferences }), { layout: 'grid', density: 'comfortable' });
+    // A saved view opens as it always did.
+    assert.deepEqual(initialImagesView({ saved: { q: '' }, preferences }), { layout: 'grid', density: 'comfortable' });
+    // Without readable preferences nothing changes.
+    assert.deepEqual(initialImagesView({}), { layout: 'grid', density: 'comfortable' });
+    // #451: a preference object without a layout falls back to the default layout, Masonry.
+    assert.deepEqual(initialImagesView({ preferences: {} }), { layout: 'masonry', density: 'comfortable' });
+});
+
+test('a default saved after the last visit started reaches the next visit unless the toolbar changed it (#451)', async () => {
+    const { initialImagesView } = await source;
+    const preferences = { workspaceLayout: 'masonry', workspaceDensity: 'compact' };
+    const started = { layout: 'grid', density: 'comfortable' };
+    // The visit kept the defaults it started from: the newer defaults win.
+    assert.deepEqual(initialImagesView({ prior: { layout: 'grid', density: 'comfortable', defaults: started }, preferences }),
+        { layout: 'masonry', density: 'compact' });
+    // A toolbar choice is the current view's own, whatever the defaults became; each value on its own.
+    assert.deepEqual(initialImagesView({ prior: { layout: 'list', density: 'comfortable', defaults: started }, preferences }),
+        { layout: 'list', density: 'compact' });
+    assert.deepEqual(initialImagesView({ prior: { layout: 'grid', density: 'large', defaults: started }, preferences }),
+        { layout: 'masonry', density: 'large' });
+    // Unchanged defaults: the visit returns as it was.
+    assert.deepEqual(initialImagesView({ prior: { layout: 'masonry', density: 'compact', defaults: { layout: 'masonry', density: 'compact' } }, preferences }),
+        { layout: 'masonry', density: 'compact' });
+    // A saved view and an embedded gallery never get a prior; without preferences the prior is kept.
+    assert.deepEqual(initialImagesView({ prior: { layout: 'grid', density: 'comfortable', defaults: started } }),
+        { layout: 'grid', density: 'comfortable' });
+});
+
+test('the defaults a visit starts from are the fresh-visit defaults (#451)', async () => {
+    const { visitDefaults } = await source;
+    assert.deepEqual(visitDefaults({ workspaceLayout: 'list', workspaceDensity: 'large' }), { layout: 'list', density: 'large' });
+    assert.deepEqual(visitDefaults({}), { layout: 'masonry', density: 'comfortable' });
+    assert.deepEqual(visitDefaults(null), { layout: 'grid', density: 'comfortable' });
+});
+
+test('listingFilter is the listing query as an object, without paging (#392)', async () => {
+    const { listingFilter } = await source;
+    assert.deepEqual(listingFilter({q:'cat', root:'1', subfolder:'a/b', category:'Animals', tags:[' x ','y'], media:'video', sort:'oldest', favorites:true}),
+        {q:'cat', root:'1', subfolder:'a/b', category:'Animals', tags:'x,y', media:'video', sort:'oldest', favorites:'1'});
+    assert.deepEqual(listingFilter({root:'all', q:'', tags:[], media:'all'}), {sort:'newest'});
+    // #331: "Select all N matching" on a collection page acts on that collection's listing.
+    assert.deepEqual(listingFilter({collection:'4', q:'cat'}), {q:'cat', sort:'newest', collection:'4'});
+    assert.throws(() => listingFilter({sort:'sideways'}), TypeError);
 });

@@ -1,5 +1,5 @@
 import { startCoverage, saveCoverage } from '../../tools/vendor/browser-coverage.mjs';
-import { test, expect } from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import { test, expect } from './fixtures.mjs';
 
 test.beforeEach(async ({ request, page, browserName }) => {
     await startCoverage(page, browserName);
@@ -19,6 +19,13 @@ test.afterEach(async ({ page, browserName }) => {
     expect(page.workflowErrors).toEqual([]);
 });
 
+// #249 S6b: the legacy admin page says where the library lives (the fixture's database is configured explicitly).
+test('the admin page names the library location', async ({ page }) => {
+    await page.goto('/prompt_manager/admin');
+    await expect(page.locator('#libraryLocation')).toHaveText('Library: browser.db (set in config.json)');
+    await expect(page.locator('#totalPrompts')).not.toHaveText('-');
+});
+
 test('actual gallery form saves a prompt that the admin page can edit and reload', async ({ page, request }) => {
     await page.goto('/prompt_manager/gallery');
     await page.locator('#addPromptBtn').click();
@@ -35,15 +42,71 @@ test('actual gallery form saves a prompt that the admin page can edit and reload
     await page.locator(`[data-action="edit"][data-prompt-id="${id}"]`).click();
     const editor = page.locator(`.prompt-text[data-id="${id}"]`);
     await editor.fill('Browser edited portrait');
+    // The page shows the edit at once and saves it after: reload only once the save answered (a reload that wins the
+    // race abandons the PUT, as seen on WebKit in CI).
+    const savedEdit = page.waitForResponse(item => item.request().method() === 'PUT'
+        && item.url().endsWith(`/prompt_manager/prompts/${id}`));
     await editor.press('Enter');
     await expect(page.locator('.prompt-text').filter({ hasText: 'Browser edited portrait' })).toBeVisible();
+    expect((await savedEdit).ok()).toBe(true);
     await page.reload();
     await expect(page.locator('.prompt-text').filter({ hasText: 'Browser edited portrait' })).toBeVisible();
     const saved = await request.post('/prompt_manager/save', { data: { text: 'Browser saved landscape' } });
     expect((await saved.json()).prompt_id).not.toBe(Number(id));
 });
 
-test('actual gallery review generates and persists tags for the selected root', async ({ page, request }) => {
+// WebKit fails a fetch that a leaving page starts ("Fetch API cannot load … due to access control checks."), and
+// Playwright reports that console error as a page error. A save's follow-up reads must not start once the page hides:
+// here the statistics read after an in-place edit is held at the server while the page reloads.
+test('an in-place edit whose follow-up reads outlive the page starts no read while it leaves', async ({ page, request }) => {
+    await page.goto('/prompt_manager/admin');
+    const text = page.locator('.prompt-text').filter({ hasText: 'Cat portrait' });
+    const id = await text.getAttribute('data-id');
+    await expect(await request.post('/__test__/hold', { data: { path: '/prompt_manager/stats' } })).toBeOK();
+    await page.locator(`[data-action="edit"][data-prompt-id="${id}"]`).click();
+    const editor = page.locator(`.prompt-text[data-id="${id}"]`);
+    await editor.fill('Cat portrait at dusk');
+    await editor.press('Enter');
+    const held = async () => (await (await request.get('/__test__/hold')).json()).held['/prompt_manager/stats'];
+    await expect.poll(held).toBe(1);
+    await page.reload({ waitUntil: 'commit' });
+    await expect(await request.post('/__test__/release')).toBeOK();
+    await expect(page.locator('.prompt-text').filter({ hasText: 'Cat portrait at dusk' })).toBeVisible();
+});
+
+// A leave that never happens (a stopped navigation, or one answered with a download) must not leave the list dead.
+test('a page whose leave was called off reads its list again on the next input', async ({ page }) => {
+    await page.goto('/prompt_manager/admin');
+    await expect(page.locator('.prompt-text').first()).toBeVisible();
+    await page.evaluate(() => window.dispatchEvent(new Event('beforeunload')));
+    await page.mouse.click(1, 1);
+    const reread = page.waitForResponse(response => new URL(response.url()).pathname === '/prompt_manager/recent');
+    await page.locator('#sortBy').selectOption('created_asc');
+    expect(new URL((await reread).url()).searchParams.get('sort')).toBe('created_asc');
+    await expect(page.locator('#resultsTitle')).toHaveText('Recent Prompts');
+});
+
+// The gallery's startup thumbnail check runs a second after load. When that second ends while the page is leaving,
+// the check must start no read: WebKit fails it with "Fetch API cannot load … due to access control checks." and
+// Playwright reports a page error (seen in CI on PR #289). The page clock makes the second end after the leave began.
+for (const leave of ['beforeunload', 'pagehide']) {
+    test(`the gallery startup check starts no read after ${leave}`, async ({ page }) => {
+        await page.clock.install();
+        const statusReads = [];
+        page.on('request', req => { if (req.url().includes('/images/thumbnails/status')) statusReads.push(req.url()); });
+        await page.goto('/prompt_manager/gallery');
+        await expect(page.locator('#galleryGrid .image-item')).toHaveCount(2);
+        await page.evaluate(type => window.dispatchEvent(new Event(type)), leave);
+        await page.clock.runFor(1500);
+        // A read made after the clock ran is listed, so the listener saw every status read.
+        await page.evaluate(() => fetch('/prompt_manager/images/thumbnails/status?probe=1'));
+        expect(statusReads.map(url => new URL(url).search)).toEqual(['?probe=1']);
+    });
+}
+
+
+// #379: the reviewed tags are that image's own tags; no prompt changes.
+test('actual gallery review generates and persists tags for the selected root\'s image', async ({ page, request }) => {
     await page.goto('/prompt_manager/gallery');
     await expect(page.locator('#galleryGrid .image-item')).toHaveCount(2);
     await page.locator('#autoTagBtn').click();
@@ -51,24 +114,31 @@ test('actual gallery review generates and persists tags for the selected root', 
     await page.locator('#startReviewBtn').click();
     const generation = await generated;
     expect(generation.request().postDataJSON().root_index).toBe(0);
-    await expect(page.locator('#reviewTagsContainer')).toContainText('generated');
+    await expect(page.locator('#reviewTagsContainer')).toContainText('sandstone');
     const result = page.waitForResponse(response => response.url().endsWith('/prompt_manager/autotag/apply'));
     await page.locator('#applyReviewBtn').click();
     expect((await (await result).json()).success).toBe(true);
     const data = await (await request.get('/prompt_manager/recent?limit=20')).json();
-    expect(data.results.find(prompt => prompt.text === 'Cat portrait').tags).toContain('generated');
-    expect(data.results.find(prompt => prompt.text === 'Dog landscape').tags).not.toContain('generated');
+    expect(data.results.find(prompt => prompt.text === 'Cat portrait').tags).toEqual(['cats']);
+    expect(data.results.find(prompt => prompt.text === 'Dog landscape').tags).toEqual(['dogs']);
+    const tagged = await (await request.get('/prompt_manager/images/output?mode=workspace&tags=sandstone')).json();
+    expect(tagged.images.map(image => `${image.root_index}:${image.path}`)).toEqual(['0:shared/same.png']);
 });
 
 test('actual Tags page reloads the selected filter and opens its image viewer', async ({ page }) => {
     await page.goto('/prompt_manager/admin#/tags');
     await page.locator('[data-tag-name="cats"]').click();
     await expect(page.locator('#tagPromptsGrid')).toContainText('Cat portrait');
+    const dogs = page.waitForResponse(response => response.url().includes('/tags/dogs/prompts?'));
     await page.locator('[data-tag-name="dogs"]').click();
+    const [shown] = (await (await dogs).json()).prompts[0].images;
     await expect(page.locator('#tagPromptsGrid')).toContainText('Dog landscape');
     await expect(page.locator('#tagPromptsGrid')).not.toContainText('Cat portrait');
     await page.locator('#tagPromptsGrid img').first().click();
     await expect(page.locator('.viewer-canvas img')).toBeVisible();
+    // The viewer's title names the shown image through the page's title callback. ViewerJS renders it only once the
+    // image is viewed, so closing at "visible" alone left the callback unrun on slower hosts (CI coverage missed it).
+    await expect(page.locator('.viewer-title')).toHaveText(shown.filename);
     await page.locator('.viewer-container').getByRole('button', { name: 'Close', exact: true }).click();
     await expect(page.locator('.viewer-container')).toHaveCount(0);
 });
@@ -129,7 +199,7 @@ test('gallery infinite scroll appends a real backend page while retaining existi
     await expect(await request.post('/__test__/reset', { data: { extra_images: 108 } })).toBeOK();
     await page.goto('/prompt_manager/gallery');
     await expect(page.locator('#galleryGrid .image-item')).toHaveCount(100);
-    await page.locator('#settingsBtn').click();
+    await page.locator('#pageOptionsBtn').click();
     await page.locator('#infiniteScrollToggle').check();
     await page.locator('#saveSettingsBtn').click();
     await expect(page.locator('#settingsModal')).toBeHidden();
@@ -149,25 +219,6 @@ async function promptSnapshot(request) {
     })).sort((a, b) => a.id - b.id);
 }
 
-async function downloadBackup(page) {
-    const downloading = page.waitForEvent('download');
-    await page.locator('#backupBtn').click();
-    const download = await downloading;
-    expect(download.suggestedFilename()).toMatch(/^prompts_backup_.*\.db$/);
-    expect(await download.failure()).toBeNull();
-    const chunks = [];
-    for await (const chunk of await download.createReadStream()) chunks.push(chunk);
-    const buffer = Buffer.concat(chunks);
-    expect(buffer.subarray(0, 16).toString()).toBe('SQLite format 3\0');
-    return { name: download.suggestedFilename(), mimeType: 'application/octet-stream', buffer };
-}
-
-async function chooseRestore(page, file) {
-    await page.locator('#restoreBtn').click();
-    await expect(page.locator('#restoreModal')).toBeVisible();
-    await page.locator('#restoreFileInput').setInputFiles(file);
-}
-
 function confirmNextDialog(page, accept, message) {
     page.once('dialog', async dialog => {
         expect(dialog.type()).toBe('confirm');
@@ -182,95 +233,6 @@ async function deletePromptButton(page, text) {
     const id = await prompt.getAttribute('data-id');
     return page.locator(`[data-action="delete"][data-prompt-id="${id}"]`);
 }
-
-test('downloaded backup restores deleted prompts, tags, and image links through the actual upload form', async ({ page, request }) => {
-    await page.goto('/prompt_manager/admin');
-    await expect(page.locator('.prompt-text')).toHaveCount(2);
-    const before = await promptSnapshot(request);
-    expect(before.map(prompt => prompt.tags)).toEqual([['cats'], ['dogs']]);
-    expect(before.every(prompt => prompt.images.length === 1)).toBe(true);
-    const backup = await downloadBackup(page);
-    const button = await deletePromptButton(page, 'Cat portrait');
-    confirmNextDialog(page, true, 'delete this prompt');
-    await button.click();
-    await expect(page.locator('.prompt-text')).toHaveCount(1);
-    await expect(await request.post('/prompt_manager/save', { data: { text: 'Added after backup', tags: ['temporary'] } })).toBeOK();
-    expect(await promptSnapshot(request)).not.toEqual(before);
-    await chooseRestore(page, backup);
-    confirmNextDialog(page, true, backup.name);
-    const restored = page.waitForResponse(response => response.url().endsWith('/prompt_manager/restore'));
-    await page.locator('#confirmRestore').click();
-    const response = await restored;
-    expect(response.ok()).toBe(true);
-    expect(await response.json()).toMatchObject({ success: true, prompt_count: 2, backup_created: expect.any(String) });
-    await expect(page.locator('#restoreModal')).toBeHidden();
-    await expect(page.locator('.prompt-text')).toHaveCount(2);
-    await page.reload();
-    await expect(page.locator('.prompt-text').filter({ hasText: 'Cat portrait' })).toBeVisible();
-    await expect(page.locator('.prompt-text').filter({ hasText: 'Added after backup' })).toHaveCount(0);
-    expect(await promptSnapshot(request)).toEqual(before);
-    await page.goto('/prompt_manager/admin#/tags');
-    await page.locator('[data-tag-name="cats"]').click();
-    await expect(page.locator('#tagPromptsGrid')).toContainText('Cat portrait');
-    await page.locator('#tagPromptsGrid img').first().click();
-    await expect(page.locator('.viewer-canvas img')).toBeVisible();
-    await expect.poll(() => page.locator('.viewer-canvas img').evaluate(image => image.complete && image.naturalWidth > 0)).toBe(true);
-});
-
-test('restore validation and cancellation preserve live data and allow a valid retry', async ({ page, request }) => {
-    await page.goto('/prompt_manager/admin');
-    const before = await promptSnapshot(request);
-    const backup = await downloadBackup(page);
-    let uploads = 0;
-    page.on('request', request => { if (request.url().endsWith('/prompt_manager/restore')) uploads++; });
-    await page.locator('#restoreBtn').click();
-    await page.locator('#confirmRestore').click();
-    await expect(page.getByText('Please select a database file to restore', { exact: true })).toBeVisible();
-    await page.locator('#restoreFileInput').setInputFiles({ ...backup, name: 'backup.txt' });
-    await page.locator('#confirmRestore').click();
-    await expect(page.getByText('Please select a valid .db file', { exact: true })).toBeVisible();
-    expect(uploads).toBe(0);
-    await page.locator('#restoreFileInput').setInputFiles(backup);
-    confirmNextDialog(page, false, 'replace your current database');
-    await page.locator('#confirmRestore').click();
-    await expect(page.locator('#restoreModal')).toBeVisible();
-    expect(uploads).toBe(0);
-    await page.locator('#restoreFileInput').setInputFiles({ name: 'corrupt.db', mimeType: 'application/octet-stream', buffer: Buffer.from('not a SQLite database') });
-    confirmNextDialog(page, true, 'corrupt.db');
-    const rejected = page.waitForResponse(response => response.url().endsWith('/prompt_manager/restore'));
-    await page.locator('#confirmRestore').click();
-    expect((await rejected).status()).toBe(400);
-    await expect(page.getByText(/Restore failed:/)).toBeVisible();
-    await expect(page.locator('#restoreModal')).toBeVisible();
-    await expect(page.locator('#confirmRestore')).toBeEnabled();
-    expect(await promptSnapshot(request)).toEqual(before);
-    await page.locator('#restoreFileInput').setInputFiles(backup);
-    confirmNextDialog(page, true, backup.name);
-    await page.locator('#confirmRestore').click();
-    await expect(page.locator('#restoreModal')).toBeHidden();
-    expect(await promptSnapshot(request)).toEqual(before);
-});
-
-test('backup and restore recover from interrupted network requests without losing data', async ({ page, request }) => {
-    await page.goto('/prompt_manager/admin');
-    const before = await promptSnapshot(request);
-    await page.route('**/prompt_manager/backup', route => route.abort('failed'), { times: 1 });
-    await page.locator('#backupBtn').click();
-    await expect(page.getByText(/Backup failed:/)).toBeVisible();
-    const backup = await downloadBackup(page);
-    await chooseRestore(page, backup);
-    await page.route('**/prompt_manager/restore', route => route.abort('failed'), { times: 1 });
-    confirmNextDialog(page, true, backup.name);
-    await page.locator('#confirmRestore').click();
-    await expect(page.getByText(/Restore failed:/)).toBeVisible();
-    await expect(page.locator('#confirmRestore')).toBeEnabled();
-    await expect(page.locator('#restoreModal')).toBeVisible();
-    expect(await promptSnapshot(request)).toEqual(before);
-    confirmNextDialog(page, true, backup.name);
-    await page.locator('#confirmRestore').click();
-    await expect(page.locator('#restoreModal')).toBeHidden();
-    expect(await promptSnapshot(request)).toEqual(before);
-});
 
 test('prompt deletion requires confirmation and can retry after a network failure', async ({ page, request }) => {
     await page.goto('/prompt_manager/admin');
@@ -296,49 +258,6 @@ test('prompt deletion requires confirmation and can retry after a network failur
     await page.goto('/prompt_manager/gallery');
     await expect(page.locator('#galleryGrid .image-item')).toHaveCount(2);
     for (const url of await page.locator('#galleryGrid img[data-original]').evaluateAll(images => images.map(image => image.dataset.original))) {
-        await expect(await request.get(url)).toBeOK();
-    }
-});
-
-test('duplicate cleanup cancels safely and deletes only the selected file after a retry', async ({ page, request }) => {
-    await expect(await request.post('/__test__/reset', { data: { extra_images: 2 } })).toBeOK();
-    await page.goto('/prompt_manager/gallery');
-    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(4);
-    const originals = await page.locator('#galleryGrid img[data-original]').evaluateAll(images => images.map(image => image.dataset.original));
-    await page.locator('#settingsBtn').click();
-    await page.locator('#scanDuplicatesBtn').click();
-    await expect(page.locator('#duplicatesCount')).toHaveText('1');
-    const candidates = page.locator('.duplicate-checkbox');
-    await expect(candidates).toHaveCount(2);
-    const selected = await candidates.first().getAttribute('data-image-path');
-    const retained = await candidates.last().getAttribute('data-image-path');
-    const serve = path => `/prompt_manager/images/serve/${path.split(/[\\/]/).map(encodeURIComponent).join('/')}`;
-    await candidates.first().check();
-    let deletes = 0;
-    page.on('request', request => { if (request.url().endsWith('/delete_duplicate_images')) deletes++; });
-    confirmNextDialog(page, false, 'permanently delete 1 duplicate image files');
-    await page.locator('#removeDuplicatesBtn').click();
-    expect(deletes).toBe(0);
-    await expect(await request.get(serve(selected))).toBeOK();
-    await page.route('**/prompt_manager/delete_duplicate_images', route => route.abort('failed'), { times: 1 });
-    confirmNextDialog(page, true, 'permanently delete 1 duplicate image files');
-    await page.locator('#removeDuplicatesBtn').click();
-    await expect(page.getByText('Failed to delete duplicate images', { exact: true })).toBeVisible();
-    await expect(page.locator('#removeDuplicatesBtn')).toBeEnabled();
-    await expect(await request.get(serve(selected))).toBeOK();
-    confirmNextDialog(page, true, 'permanently delete 1 duplicate image files');
-    const deleted = page.waitForResponse(response => response.url().endsWith('/delete_duplicate_images'));
-    await page.locator('#removeDuplicatesBtn').click();
-    expect((await (await deleted).json())).toMatchObject({ success: true, deleted_count: 1, failed_count: 0 });
-    await expect(page.locator('#duplicatesModal')).toBeHidden();
-    expect((await request.get(serve(selected))).status()).toBe(404);
-    await expect(await request.get(serve(retained))).toBeOK();
-    await page.reload();
-    await expect(page.locator('#galleryGrid .image-item')).toHaveCount(3);
-    const remaining = await page.locator('#galleryGrid img[data-original]').evaluateAll(images => images.map(image => image.dataset.original));
-    expect(remaining).toHaveLength(originals.length - 1);
-    for (const url of remaining) {
-        expect(originals).toContain(url);
         await expect(await request.get(url)).toBeOK();
     }
 });

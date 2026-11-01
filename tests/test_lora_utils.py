@@ -9,11 +9,14 @@ import email
 import json
 import os
 import shutil
+import ssl
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.response
@@ -222,6 +225,14 @@ class TestReadLoraMetadata(unittest.TestCase):
         result = read_lora_metadata(Path("/nonexistent/file.metadata.json"))
         self.assertIsNone(result)
 
+    def test_returns_none_for_a_file_that_is_not_utf8(self):
+        # #362: one malformed sidecar is skipped; it must not fail the whole
+        # trigger-word load (now logged with a traceback) or the review.
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bad.metadata.json"
+            path.write_bytes(b'{"model_name": "\xff\xfe"}')
+            self.assertIsNone(read_lora_metadata(path))
+
 
 class TestGetLoraImageCacheDir(unittest.TestCase):
     """Test get_lora_image_cache_dir — returns and creates cache path."""
@@ -294,12 +305,9 @@ class TestCivitaiUrlPolicy(unittest.TestCase):
         self.assertEqual(
             CIVITAI_HOSTS,
             frozenset(
-                {
-                    "civitai.com",
-                    "www.civitai.com",
-                    "api.civitai.com",
-                    "image.civitai.com",
-                }
+                f"{prefix}{domain}"
+                for domain in ("civitai.com", "civitai.red", "civitai.green")
+                for prefix in ("", "www.", "api.", "image.")
             ),
         )
         self.assertEqual(MAX_CIVITAI_DOWNLOAD_BYTES, 50 * 1024 * 1024)
@@ -331,6 +339,36 @@ class TestCivitaiUrlPolicy(unittest.TestCase):
 
     def test_explicit_default_port_is_allowed(self):
         self.assertTrue(is_civitai_url("https://civitai.com:443/x"))
+
+    def test_red_and_green_starting_hosts_are_allowed(self):
+        # #340: CivitAI's own .red and .green domains serve the same content.
+        for url in (
+            "https://image.civitai.red/xG1/abc/width=450/1.jpeg",
+            "https://civitai.red/api/download/1",
+            "https://civitai.green/api/download/1",
+            "https://image.civitai.green/xG1/abc/1.jpeg",
+            "https://IMAGE.CIVITAI.RED/x",
+            "https://civitai.green:443/x",
+        ):
+            self.assertTrue(is_civitai_url(url), url)
+
+    def test_red_and_green_lookalikes_are_refused(self):
+        for url in (
+            "http://image.civitai.red/x",
+            "http://civitai.green/x",
+            "https://civitai.red.evil.example/x",
+            "https://civitai.green.evil.example/x",
+            "https://evilcivitai.red/x",
+            "https://evilcivitai.green/x",
+            "https://civitai.redx/x",
+            "https://civitai.greenx/x",
+            "https://civitai.red@evil.example/x",
+            "https://user:pw@civitai.red/x",
+            "https://civitai.green:8443/x",
+            "https://blobs-b2.civitai.red/x",  # starting hosts stay a fixed list
+            "https://evil.example/civitai.red",
+        ):
+            self.assertFalse(is_civitai_url(url), url)
 
 
 class TestLoraManagerPathPolicy(unittest.TestCase):
@@ -524,6 +562,123 @@ class TestDownloadOne(unittest.TestCase):
         self.assertFalse(self.target.exists())
 
 
+class TestDownloadIsAtomic(unittest.TestCase):
+    """I2 (S10 review): a cached image is never seen half written."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.target = self.tmpdir / "out.jpg"
+
+    def test_the_image_appears_only_once_complete(self):
+        seen = []
+        real_replace = os.replace
+
+        def replace(source, destination):
+            # At the moment the name appears, the temp copy is whole and closed.
+            seen.append((Path(source).parent, self.target.exists()))
+            with open(source, "rb") as handle:
+                self.assertEqual(handle.read(2), b"\xff\xd8")
+            return real_replace(source, destination)
+
+        opener = _FakeOpener(_FakeResponse(_png_bytes()))
+        with (
+            patch.object(lora_utils, "_open_url", opener),
+            patch.object(lora_utils.os, "replace", side_effect=replace),
+        ):
+            result = lora_utils._download_one(
+                "https://civitai.com/api/download/1", self.target, ""
+            )
+        self.assertEqual(seen, [(self.tmpdir, False)])
+        self.assertEqual(os.path.realpath(result), os.path.realpath(self.target))
+        self.assertEqual(sorted(p.name for p in self.tmpdir.iterdir()), ["out.jpg"])
+
+    def test_a_failed_write_leaves_neither_the_image_nor_a_temp_file(self):
+        opener = _FakeOpener(_FakeResponse(_png_bytes()))
+        with (
+            patch.object(lora_utils, "_open_url", opener),
+            patch.object(lora_utils.os, "replace", side_effect=OSError("disk full")),
+        ):
+            result = lora_utils._download_one(
+                "https://civitai.com/api/download/1", self.target, ""
+            )
+        self.assertIsNone(result)
+        self.assertEqual(list(self.tmpdir.iterdir()), [])
+
+    def test_an_unreadable_image_leaves_no_temp_file(self):
+        opener = _FakeOpener(_FakeResponse(b"not an image"))
+        with patch.object(lora_utils, "_open_url", opener):
+            result = lora_utils._download_one(
+                "https://civitai.com/api/download/1", self.target, ""
+            )
+        self.assertIsNone(result)
+        self.assertEqual(list(self.tmpdir.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX file modes")
+    def test_the_image_gets_the_permissions_a_plain_save_gives(self):
+        # S10 re-review N7: the cached JPEG honours the umask like img.save did.
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        opener = _FakeOpener(_FakeResponse(_png_bytes()))
+        with patch.object(lora_utils, "_open_url", opener):
+            lora_utils._download_one(
+                "https://civitai.com/api/download/1", self.target, ""
+            )
+        self.assertEqual(self.target.stat().st_mode & 0o777, 0o644)
+
+
+class TestStaleDownloadSweep(unittest.TestCase):
+    """S10 re-review N7: a killed download's ``.pm-*.part`` is swept later."""
+
+    def setUp(self):
+        self.cache = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.cache, True)
+        self.lora = self.cache / "my_lora"
+        self.lora.mkdir()
+
+    def _file(self, path, age_seconds):
+        path.write_bytes(b"x")
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_only_old_temp_downloads_are_removed(self):
+        old = self._file(self.lora / ".pm-abc123.part", 2 * 3600)
+        old_top = self._file(self.cache / ".pm-top.part", 2 * 3600)
+        fresh = self._file(self.lora / ".pm-new.part", 60)
+        image = self._file(self.lora / "abc.jpg", 2 * 3600)
+        other = self._file(self.lora / "keep.part", 2 * 3600)
+        prefixed = self._file(self.lora / ".pm-keep.jpg", 2 * 3600)
+        deep = self.lora / "nested"
+        deep.mkdir()
+        nested = self._file(deep / ".pm-deep.part", 2 * 3600)
+
+        lora_utils.sweep_stale_downloads(self.cache)
+
+        self.assertFalse(old.exists())
+        self.assertFalse(old_top.exists())
+        for kept in (fresh, image, other, prefixed, nested):
+            self.assertTrue(kept.exists(), kept.name)
+
+    def test_a_missing_cache_is_fine(self):
+        lora_utils.sweep_stale_downloads(self.cache / "absent")
+
+    def test_a_file_that_cannot_be_removed_is_left(self):
+        old = self._file(self.lora / ".pm-abc.part", 2 * 3600)
+        with patch.object(lora_utils.os, "remove", side_effect=PermissionError):
+            lora_utils.sweep_stale_downloads(self.cache)
+        self.assertTrue(old.exists())
+
+
+def _unused_tls_context():
+    """A TLS context for the fake handlers, which never open a connection.
+
+    HTTPSHandler() builds a default context, and on Windows that reads the
+    system certificate store: about 0.14 s per handler (#487).
+    """
+    return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 class _FakeHTTPSHandler(urllib.request.HTTPSHandler):
     """Serves canned responses through a real urllib opener, recording requests.
 
@@ -532,7 +687,7 @@ class _FakeHTTPSHandler(urllib.request.HTTPSHandler):
     """
 
     def __init__(self, redirect_to):
-        super().__init__()
+        super().__init__(context=_unused_tls_context())
         self.redirect_to = redirect_to
         self.requests = []
 
@@ -577,7 +732,7 @@ class TestRedirectsAreRefused(unittest.TestCase):
             if host not in CIVITAI_HOSTS:
                 self.assertIsNone(req.get_header("Authorization"))
 
-    def test_redirect_to_civitai_is_not_followed_either(self):
+    def test_redirect_to_civitai_is_followed_without_the_key(self):
         handler = _FakeHTTPSHandler("https://image.civitai.com/other.png")
         opener = lora_utils._build_opener(handler)
 
@@ -586,8 +741,476 @@ class TestRedirectsAreRefused(unittest.TestCase):
                 "https://civitai.com/api/download/1", self.tmpdir / "x.jpg", "key"
             )
 
+        # image.civitai.com redirects again (the fake handler always does),
+        # so the hop limit ends this chain; the first request alone had the key.
         self.assertIsNone(result)
+        self.assertEqual(len(handler.requests), lora_utils.MAX_CIVITAI_REDIRECTS + 1)
+        self.assertEqual(handler.requests[0].get_header("Authorization"), "Bearer key")
+        for req in handler.requests[1:]:
+            self.assertIsNone(req.get_header("Authorization"))
+
+
+class _ChainHTTPSHandler(urllib.request.HTTPSHandler):
+    """Serves ``routes`` (url -> (status, Location or None)) through a real
+    urllib opener, recording every request; an unknown URL answers 404."""
+
+    def __init__(self, routes):
+        super().__init__(context=_unused_tls_context())
+        self.routes = routes
+        self.requests = []
+
+    def https_open(self, req):
+        self.requests.append(req)
+        status, location = self.routes.get(req.full_url, (404, None))
+        if location is not None:
+            headers = email.message_from_string(f"Location: {location}\n")
+            resp = urllib.response.addinfourl(
+                BytesIO(b""), headers, req.full_url, status
+            )
+            resp.msg = "Redirect"
+            return resp
+        body = _png_bytes() if status == 200 else b""
+        headers = email.message_from_string("Content-Type: image/png\n")
+        resp = urllib.response.addinfourl(BytesIO(body), headers, req.full_url, status)
+        resp.msg = "OK" if status == 200 else "Not Found"
+        return resp
+
+    def http_open(self, req):  # a plain-HTTP hop must never be requested
+        self.requests.append(req)
+        raise AssertionError(f"plain HTTP requested: {req.full_url}")
+
+
+START = "https://image.civitai.com/xG1/abc/width=450/1.jpeg"
+BLOB = "https://blobs-b2.civitai.com/file/civitai-media-cache/1/original"
+
+
+class TestCivitaiRedirects(unittest.TestCase):
+    """#337: image.civitai.com now redirects to blobs-b2.civitai.com.
+
+    A redirect is followed only over HTTPS to civitai.com or a subdomain of
+    it, at most MAX_CIVITAI_REDIRECTS hops, and never with the API key.
+    """
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.target = self.tmpdir / "x.jpg"
+
+    def _download(self, routes, url=START, api_key="secret-key"):
+        handler = _ChainHTTPSHandler(routes)
+        opener = lora_utils._build_opener(handler)
+        with patch.object(lora_utils, "_opener", opener):
+            result = lora_utils._download_one(url, self.target, api_key)
+        return result, handler.requests
+
+    def _refused(self, location, status=302):
+        result, requests = self._download({START: (status, location)})
+        self.assertIsNone(result)
+        self.assertEqual([r.full_url for r in requests], [START])
+        self.assertFalse(self.target.exists())
+
+    def test_redirect_to_an_allowed_host_succeeds_without_the_key(self):
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                if self.target.exists():
+                    os.remove(self.target)
+                result, requests = self._download(
+                    {START: (status, BLOB), BLOB: (200, None)}
+                )
+
+                self.assertIsNotNone(result)
+                self.assertTrue(self.target.exists())
+                self.assertEqual([r.full_url for r in requests], [START, BLOB])
+                self.assertEqual(
+                    requests[0].get_header("Authorization"), "Bearer secret-key"
+                )
+                self.assertIsNone(requests[1].get_header("Authorization"))
+                # urllib adds Host itself; nothing else rides along.
+                self.assertEqual(
+                    [h for h in requests[1].header_items() if h[0] != "Host"],
+                    [("User-agent", "ComfyUI-PromptManager/1.0")],
+                )
+
+    def test_a_relative_location_resolves_on_the_same_host(self):
+        follow = "https://image.civitai.com/elsewhere/1.jpeg"
+        result, requests = self._download(
+            {START: (302, "/elsewhere/1.jpeg"), follow: (200, None)}
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual([r.full_url for r in requests], [START, follow])
+        self.assertIsNone(requests[1].get_header("Authorization"))
+
+    def test_a_plain_http_redirect_is_refused(self):
+        self._refused("http://blobs-b2.civitai.com/file/1")
+
+    def test_a_redirect_to_another_host_is_refused(self):
+        self._refused("https://evil.example/steal")
+
+    def test_lookalike_hosts_are_refused(self):
+        for location in (
+            "https://civitai.com.evil.example/x",
+            "https://evilcivitai.com/x",
+            "https://civitai.com@evil.example/x",
+            "https://user:pw@blobs-b2.civitai.com/x",
+            "https://blobs-b2.civitai.com:8443/x",
+            "https://civitai.co/x",
+            "//evil.example/x",
+            "ftp://blobs-b2.civitai.com/x",
+            "https://[::1]/x",
+        ):
+            with self.subTest(location=location):
+                self._refused(location)
+
+    def test_a_redirect_without_a_location_is_refused(self):
+        result, requests = self._download({START: (302, "")})
+        self.assertIsNone(result)
+        self.assertEqual(len(requests), 1)
+
+    def test_the_hop_limit_is_enforced(self):
+        limit = lora_utils.MAX_CIVITAI_REDIRECTS
+        self.assertEqual(limit, 3)
+        hops = [f"https://blobs-b2.civitai.com/hop/{i}" for i in range(limit + 1)]
+
+        # Exactly ``limit`` redirects: followed.
+        routes = {START: (302, hops[0])}
+        for i in range(limit - 1):
+            routes[hops[i]] = (302, hops[i + 1])
+        routes[hops[limit - 1]] = (200, None)
+        result, requests = self._download(routes)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(requests), limit + 1)
+        self.assertTrue(
+            all(r.get_header("Authorization") is None for r in requests[1:])
+        )
+
+        # One more redirect: refused, and the next hop is never requested.
+        os.remove(self.target)
+        routes[hops[limit - 1]] = (302, hops[limit])
+        routes[hops[limit]] = (200, None)
+        result, requests = self._download(routes)
+        self.assertIsNone(result)
+        self.assertEqual(len(requests), limit + 1)
+        self.assertNotIn(hops[limit], [r.full_url for r in requests])
+        self.assertFalse(self.target.exists())
+
+    def test_a_redirect_loop_ends_at_the_hop_limit(self):
+        result, requests = self._download({START: (302, START)})
+        self.assertIsNone(result)
+        self.assertEqual(len(requests), lora_utils.MAX_CIVITAI_REDIRECTS + 1)
+
+    def test_size_cap_applies_after_a_redirect(self):
+        with patch.object(lora_utils, "MAX_CIVITAI_DOWNLOAD_BYTES", 10):
+            result, requests = self._download({START: (302, BLOB), BLOB: (200, None)})
+        self.assertIsNone(result)
+        self.assertEqual(len(requests), 2)
+        self.assertFalse(self.target.exists())
+
+    def test_an_error_after_a_redirect_fails_cleanly(self):
+        result, requests = self._download({START: (302, BLOB)})  # BLOB is 404
+        self.assertIsNone(result)
+        self.assertEqual(len(requests), 2)
+        self.assertFalse(self.target.exists())
+
+    def test_the_opener_itself_still_refuses_every_redirect(self):
+        handler = _ChainHTTPSHandler({START: (302, BLOB), BLOB: (200, None)})
+        opener = lora_utils._build_opener(handler)
+        req = urllib.request.Request(START, headers={"Authorization": "Bearer k"})
+
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            opener.open(req, timeout=5)
+        caught.exception.close()
         self.assertEqual(len(handler.requests), 1)
+
+    def test_redirect_logs_never_carry_the_key_or_the_query(self):
+        signed = BLOB + "?X-Amz-Signature=sig123"
+        with self.assertLogs("prompt_manager.lora_utils", level="DEBUG") as logs:
+            self._download(
+                {START: (302, "https://evil.example/x?token=t0k3n")},
+                api_key="secret-key",
+            )
+            self._download({START: (302, signed), signed: (200, None)})
+        text = "\n".join(logs.output)
+        self.assertNotIn("secret-key", text)
+        self.assertNotIn("t0k3n", text)
+        self.assertNotIn("sig123", text)
+
+
+RED_BLOB = "https://blobs-b2.civitai.red/file/civitai-media-cache/1/original"
+GREEN_BLOB = "https://media.civitai.green/file/1/original"
+
+
+class TestCivitaiRedAndGreenDomains(unittest.TestCase):
+    """#340: civitai.red and civitai.green are CivitAI's own domains.
+
+    They are redirect targets under the civitai.com rules (HTTPS, default
+    port, no credentials, parsed host name, 3 hops, never the key) and
+    starting hosts whose first request may carry the key.
+    """
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.target = self.tmpdir / "x.jpg"
+
+    def _download(self, routes, url=START, api_key="secret-key"):
+        handler = _ChainHTTPSHandler(routes)
+        opener = lora_utils._build_opener(handler)
+        with patch.object(lora_utils, "_opener", opener):
+            result = lora_utils._download_one(url, self.target, api_key)
+        return result, handler.requests
+
+    def test_redirect_targets_on_red_and_green_are_allowed(self):
+        for url in (
+            "https://civitai.red/x",
+            "https://civitai.green/x",
+            RED_BLOB,
+            GREEN_BLOB,
+            "https://a.b.civitai.red:443/x",
+            "https://CIVITAI.GREEN/x",
+        ):
+            self.assertTrue(lora_utils.is_civitai_redirect_target(url), url)
+
+    def test_redirect_target_lookalikes_are_refused(self):
+        for url in (
+            "https://civitai.red.evil.example/x",
+            "https://civitai.green.evil.example/x",
+            "https://evilcivitai.red/x",
+            "https://evilcivitai.green/x",
+            "https://civitai.redx/x",
+            "https://civitai.greenx/x",
+            "https://civitai.red@evil.example/x",
+            "https://user:pw@blobs-b2.civitai.red/x",
+            "https://user@civitai.green/x",
+            "https://blobs-b2.civitai.red:8443/x",
+            "http://blobs-b2.civitai.red/x",
+            "http://civitai.green/x",
+            "ftp://civitai.red/x",
+            "https://evil.example/civitai.red",
+            "https://evil.example/?h=civitai.green",
+            "https://red/x",
+            "https://.civitai.red.evil/x",
+        ):
+            self.assertFalse(lora_utils.is_civitai_redirect_target(url), url)
+
+    def test_a_redirect_to_red_or_green_is_followed_without_the_key(self):
+        for blob in (RED_BLOB, GREEN_BLOB):
+            with self.subTest(blob=blob):
+                if self.target.exists():
+                    os.remove(self.target)
+                result, requests = self._download(
+                    {START: (302, blob), blob: (200, None)}
+                )
+
+                self.assertIsNotNone(result)
+                self.assertEqual([r.full_url for r in requests], [START, blob])
+                self.assertEqual(
+                    requests[0].get_header("Authorization"), "Bearer secret-key"
+                )
+                self.assertIsNone(requests[1].get_header("Authorization"))
+
+    def test_lookalike_and_plain_http_redirects_are_refused(self):
+        for location in (
+            "https://civitai.red.evil.example/x",
+            "https://evilcivitai.red/x",
+            "https://civitai.redx/x",
+            "https://civitai.green.evil.example/x",
+            "https://evilcivitai.green/x",
+            "https://civitai.greenx/x",
+            "http://blobs-b2.civitai.red/x",
+            "http://civitai.green/x",
+        ):
+            with self.subTest(location=location):
+                result, requests = self._download({START: (302, location)})
+                self.assertIsNone(result)
+                self.assertEqual([r.full_url for r in requests], [START])
+                self.assertFalse(self.target.exists())
+
+    def test_a_red_starting_host_gets_the_key_and_its_redirect_does_not(self):
+        start = "https://image.civitai.red/xG1/abc/width=450/1.jpeg"
+        result, requests = self._download(
+            {start: (302, BLOB), BLOB: (200, None)}, url=start
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual([r.full_url for r in requests], [start, BLOB])
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer secret-key")
+        self.assertIsNone(requests[1].get_header("Authorization"))
+
+    def test_a_green_starting_host_downloads_directly(self):
+        start = "https://civitai.green/api/download/1"
+        result, requests = self._download({start: (200, None)}, url=start)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer secret-key")
+
+    def test_the_hop_limit_spans_domains(self):
+        hops = [RED_BLOB, GREEN_BLOB, BLOB, "https://civitai.red/4"]
+        routes = {START: (302, hops[0])}
+        for here, there in zip(hops, hops[1:]):
+            routes[here] = (302, there)
+        routes[hops[-1]] = (200, None)
+
+        result, requests = self._download(routes)
+
+        self.assertIsNone(result)
+        self.assertEqual(len(requests), lora_utils.MAX_CIVITAI_REDIRECTS + 1)
+        self.assertNotIn(hops[-1], [r.full_url for r in requests])
+        for req in requests[1:]:
+            self.assertIsNone(req.get_header("Authorization"))
+
+
+class _RaisingOpener:
+    """An ``_open_url`` stand-in that raises ``error`` for every request."""
+
+    def __init__(self, error):
+        self.error = error
+        self.requests = []
+
+    def __call__(self, req, timeout=None):
+        self.requests.append(req)
+        raise self.error
+
+
+class TestDownloadFailureWarnings(unittest.TestCase):
+    """#340: each failed download logs one warning line with a short reason,
+    the URL without its query or credentials, and never the key."""
+
+    LOGGER = "prompt_manager.lora_utils"
+    SIGNED = START + "?token=t0k3n"
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+        self.target = self.tmpdir / "x.jpg"
+
+    def _warning(self, run):
+        """Run ``run`` and return its one WARNING-or-above record's text."""
+        with self.assertLogs(self.LOGGER, level="WARNING") as logs:
+            result = run()
+        self.assertIsNone(result)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(len(logs.records), 1, logs.output)
+        record = logs.records[0]
+        self.assertEqual(record.levelname, "WARNING")
+        text = record.getMessage()
+        self.assertNotIn("secret-key", text)
+        self.assertNotIn("t0k3n", text)
+        self.assertNotIn("sig123", text)
+        self.assertIn(START.split("?")[0], text)
+        return text
+
+    def _chain(self, routes, url=SIGNED):
+        handler = _ChainHTTPSHandler(routes)
+        opener = lora_utils._build_opener(handler)
+
+        def run():
+            with patch.object(lora_utils, "_opener", opener):
+                return lora_utils._download_one(url, self.target, "secret-key")
+
+        return run
+
+    def _fake(self, opener, url=SIGNED):
+        def run():
+            with patch.object(lora_utils, "_open_url", opener):
+                return lora_utils._download_one(url, self.target, "secret-key")
+
+        return run
+
+    def test_http_status(self):
+        text = self._warning(self._chain({}))  # unknown URL answers 404
+        self.assertIn("HTTP 404", text)
+
+    def test_http_status_after_a_redirect(self):
+        text = self._warning(self._chain({self.SIGNED: (302, BLOB)}))
+        self.assertIn("HTTP 404", text)
+
+    def test_refused_redirect(self):
+        text = self._warning(
+            self._chain({self.SIGNED: (302, "https://evil.example/x?sig123=1")})
+        )
+        self.assertIn("redirect refused", text)
+        self.assertIn("https://evil.example/x", text)
+
+    def test_hop_limit(self):
+        text = self._warning(self._chain({self.SIGNED: (302, self.SIGNED)}))
+        self.assertIn("more than 3 redirects", text)
+
+    def test_size_cap(self):
+        opener = _FakeOpener(
+            _FakeResponse(_png_bytes(), content_length=MAX_CIVITAI_DOWNLOAD_BYTES + 1)
+        )
+        text = self._warning(self._fake(opener))
+        self.assertIn("larger than the 50 MB cap", text)
+
+    def test_decode_error(self):
+        text = self._warning(self._fake(_FakeOpener(_FakeResponse(b"not an image"))))
+        self.assertIn("image could not be decoded", text)
+
+    def test_timeout(self):
+        for error in (
+            TimeoutError("timed out"),
+            urllib.error.URLError(TimeoutError("timed out")),
+        ):
+            with self.subTest(error=type(error).__name__):
+                text = self._warning(self._fake(_RaisingOpener(error)))
+                self.assertIn("timed out", text)
+
+    def test_network_error(self):
+        for error in (
+            urllib.error.URLError("[Errno -2] Name or service not known"),
+            ConnectionResetError(104, "Connection reset by peer"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                text = self._warning(self._fake(_RaisingOpener(error)))
+                self.assertIn("network error", text)
+
+    def test_a_timeout_while_reading_the_body(self):
+        class SlowResponse(_FakeResponse):
+            def read(self, amt=-1):
+                raise TimeoutError("timed out")
+
+        text = self._warning(self._fake(_FakeOpener(SlowResponse(b""))))
+        self.assertIn("timed out", text)
+
+    def test_a_failed_save(self):
+        opener = _FakeOpener(_FakeResponse(_png_bytes()))
+
+        def run():
+            with patch.object(
+                lora_utils.os, "replace", side_effect=OSError(28, "No space left")
+            ):
+                return self._fake(opener)()
+
+        text = self._warning(run)
+        self.assertIn("could not be saved", text)
+
+    def test_a_refused_starting_url(self):
+        def run():
+            return lora_utils._download_one(
+                "http://image.civitai.com/x?token=t0k3n", self.target, "secret-key"
+            )
+
+        with self.assertLogs(self.LOGGER, level="WARNING") as logs:
+            self.assertIsNone(run())
+        self.assertEqual(len(logs.records), 1)
+        text = logs.records[0].getMessage()
+        self.assertIn("not an allowed CivitAI URL", text)
+        self.assertNotIn("t0k3n", text)
+
+    def test_an_unexpected_error_names_only_its_type(self):
+        error = ValueError("unknown url type: https://x?token=t0k3n")
+        text = self._warning(self._fake(_RaisingOpener(error)))
+        self.assertIn("unexpected ValueError", text)
+
+    def test_the_line_names_the_download(self):
+        text = self._warning(self._chain({}))
+        self.assertTrue(text.startswith("CivitAI image download failed"), text)
+
+    def test_a_successful_download_logs_no_warning(self):
+        with self.assertNoLogs(self.LOGGER, level="WARNING"):
+            result = self._fake(_FakeOpener(_FakeResponse(_png_bytes())))()
+        self.assertIsNotNone(result)
 
 
 class TestDownloadCivitaiImages(unittest.TestCase):
@@ -658,11 +1281,12 @@ class TestTriggerWordCache(unittest.TestCase):
                 "file_name": "my_lora.safetensors",
                 "civitai": {"trainedWords": ["trigger1", "trigger2"]},
             }
-            meta_path = Path(tmpdir) / "my_lora.safetensors.metadata.json"
+            meta_path = Path(tmpdir) / "my_lora.metadata.json"
             meta_path.write_text(json.dumps(meta))
+            (Path(tmpdir) / "my_lora.safetensors").write_bytes(b"m")
 
-            # Patch find_lora_directories to return our temp dir
-            with patch("py.lora_utils.find_lora_directories", return_value=[tmpdir]):
+            # No LoraManager install: the default LoRA folders, alongside.
+            with patch("py.lora_utils.default_lora_roots", return_value=[tmpdir]):
                 count = self.cache.load(tmpdir)
 
             self.assertTrue(self.cache.is_loaded)
@@ -678,11 +1302,10 @@ class TestTriggerWordCache(unittest.TestCase):
                 "file_name": "MyLoRA.safetensors",
                 "civitai": {"trainedWords": ["word1"]},
             }
-            (Path(tmpdir) / "MyLoRA.safetensors.metadata.json").write_text(
-                json.dumps(meta)
-            )
+            (Path(tmpdir) / "MyLoRA.metadata.json").write_text(json.dumps(meta))
+            (Path(tmpdir) / "MyLoRA.safetensors").write_bytes(b"m")
 
-            with patch("py.lora_utils.find_lora_directories", return_value=[tmpdir]):
+            with patch("py.lora_utils.default_lora_roots", return_value=[tmpdir]):
                 self.cache.load(tmpdir)
 
             self.assertEqual(self.cache.get_trigger_words("mylora"), ["word1"])
@@ -817,11 +1440,97 @@ class TestDetectLoraManager(unittest.TestCase):
         self.assertTrue(lora_utils._looks_like_lora_manager(lm))
 
     def test_nothing_found(self):
-        with patch.object(lora_utils, "find_comfyui_root", return_value=None):
+        with (
+            patch.object(lora_utils, "find_comfyui_root", return_value=None),
+            patch.object(lora_utils, "custom_nodes_directories", return_value=[]),
+        ):
             self.assertIsNone(lora_utils.detect_lora_manager())
 
+    def test_auto_detects_in_an_extra_custom_nodes_folder(self):
+        # #144: ComfyUI's main custom_nodes has no LoraManager; an extra
+        # custom_nodes path registered through folder_paths (extra model
+        # paths, --base-directory) has it.
+        root = _make_comfy_root(self.tmp)
+        extra = self.tmp / "shared_nodes"
+        extra.mkdir()
+        lm = _make_lora_manager(extra, "ComfyUI-Lora-Manager")
+        fake = types.SimpleNamespace(
+            base_path=str(root),
+            get_folder_paths=lambda name: (
+                [str(root / "custom_nodes"), str(extra)]
+                if name == "custom_nodes"
+                else []
+            ),
+        )
+        with (
+            patch.dict(sys.modules, {"folder_paths": fake}),
+            patch.object(lora_utils, "find_comfyui_root", return_value=root),
+        ):
+            self.assertEqual(lora_utils.detect_lora_manager(), str(lm.resolve()))
 
-class TestFindLoraDirectories(unittest.TestCase):
+    def test_main_custom_nodes_wins_over_an_extra_folder(self):
+        root = _make_comfy_root(self.tmp)
+        main = _make_lora_manager(root / "custom_nodes")
+        extra = self.tmp / "shared_nodes"
+        extra.mkdir()
+        _make_lora_manager(extra)
+        with (
+            patch.object(lora_utils, "find_comfyui_root", return_value=root),
+            patch.object(
+                lora_utils,
+                "custom_nodes_directories",
+                return_value=[(root / "custom_nodes").resolve(), extra.resolve()],
+            ),
+        ):
+            self.assertEqual(lora_utils.detect_lora_manager(), str(main.resolve()))
+
+    def test_an_entry_that_cannot_be_checked_is_skipped(self):
+        # S10 review N5: a permission error on one entry, not a missing folder.
+        root = _make_comfy_root(self.tmp)
+        blocked = root / "custom_nodes" / "a-lora-manager"
+        blocked.mkdir()
+        lm = _make_lora_manager(root / "custom_nodes", "b-Lora-Manager")
+        real_is_dir = Path.is_dir
+
+        def is_dir(path):
+            if path == blocked:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_is_dir(path)
+
+        with (
+            patch.object(lora_utils, "find_comfyui_root", return_value=root),
+            patch.object(lora_utils, "custom_nodes_directories", return_value=[]),
+            patch.object(Path, "is_dir", is_dir),
+        ):
+            self.assertEqual(lora_utils.detect_lora_manager(), str(lm.resolve()))
+
+    def test_a_folder_that_cannot_be_listed_is_skipped(self):
+        root = _make_comfy_root(self.tmp)
+        with (
+            patch.object(lora_utils, "find_comfyui_root", return_value=root),
+            patch.object(lora_utils, "custom_nodes_directories", return_value=[]),
+            patch.object(Path, "iterdir", side_effect=PermissionError(13, "denied")),
+        ):
+            self.assertIsNone(lora_utils.detect_lora_manager())
+
+    def test_an_unreadable_extra_folder_is_skipped(self):
+        root = _make_comfy_root(self.tmp)
+        missing = self.tmp / "gone"
+        extra = self.tmp / "shared_nodes"
+        extra.mkdir()
+        lm = _make_lora_manager(extra)
+        with (
+            patch.object(lora_utils, "find_comfyui_root", return_value=root),
+            patch.object(
+                lora_utils,
+                "custom_nodes_directories",
+                return_value=[missing, extra.resolve()],
+            ),
+        ):
+            self.assertEqual(lora_utils.detect_lora_manager(), str(lm.resolve()))
+
+
+class TestDefaultLoraRoots(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -829,7 +1538,7 @@ class TestFindLoraDirectories(unittest.TestCase):
         self.root = _make_comfy_root(self.tmp)
         self.lm = _make_lora_manager(self.root / "custom_nodes")
 
-    def test_collects_default_extra_runtime_and_metadata_dirs(self):
+    def test_collects_default_extra_and_runtime_dirs_only(self):
         extra_abs = self.tmp / "extra_abs"
         extra_abs.mkdir()
         (self.root / "rel_loras").mkdir()
@@ -851,14 +1560,14 @@ class TestFindLoraDirectories(unittest.TestCase):
                 {"folder_paths": _FakeFolderPaths(str(self.root), [str(runtime)])},
             ),
         ):
-            dirs = lora_utils.find_lora_directories(str(self.lm))
+            dirs = lora_utils.default_lora_roots()
 
+        # #355: folders inside the LoraManager install are no longer roots.
         expected = {
             str((self.root / "models" / "loras").resolve()),
             str((self.root / "rel_loras").resolve()),
             str(extra_abs.resolve()),
             str(runtime.resolve()),
-            str(nested.resolve()),
         }
         self.assertEqual(set(dirs), expected)
         self.assertEqual(dirs, sorted(dirs))
@@ -869,12 +1578,21 @@ class TestFindLoraDirectories(unittest.TestCase):
         (self.root / "extra_model_paths.yml").write_text("a: [unclosed\n")
         self.assertEqual(lora_utils._get_extra_lora_paths(self.root), [])
 
-    def test_without_root_only_metadata_dirs_are_found(self):
+    def test_without_root_nothing_is_found(self):
         with (
             patch.object(lora_utils, "find_comfyui_root", return_value=None),
             patch.dict(sys.modules, {"folder_paths": None}),
         ):
-            self.assertEqual(lora_utils.find_lora_directories(str(self.lm)), [])
+            self.assertEqual(lora_utils.default_lora_roots(), [])
+
+    def test_the_removed_helpers_are_gone(self):
+        for name in (
+            "find_lora_directories",
+            "get_preview_images_from_metadata",
+            "get_preview_image_from_metadata",
+            "get_example_images_dir",
+        ):
+            self.assertFalse(hasattr(lora_utils, name), name)
 
 
 class TestModelNameAndPreviews(unittest.TestCase):
@@ -889,44 +1607,6 @@ class TestModelNameAndPreviews(unittest.TestCase):
         self.assertEqual(get_name({"civitai": {"model": {"name": "civ"}}}), "civ")
         self.assertEqual(get_name({"file_name": "f.safetensors"}), "f.safetensors")
         self.assertEqual(get_name({}), "unknown")
-
-    def test_preview_images_found_by_stem(self):
-        meta_path = self.tmp / "mylora.safetensors.metadata.json"
-        meta_path.write_text("{}")
-        (self.tmp / "mylora.png").write_bytes(b"x")
-        (self.tmp / "mylora.preview.jpg").write_bytes(b"x")
-
-        found = lora_utils.get_preview_images_from_metadata({}, meta_path)
-
-        self.assertEqual(
-            sorted(os.path.basename(f) for f in found),
-            ["mylora.png", "mylora.preview.jpg"],
-        )
-        self.assertEqual(
-            lora_utils.get_preview_image_from_metadata({}, meta_path), found[0]
-        )
-
-    def test_preview_uses_file_name_from_metadata(self):
-        meta_path = self.tmp / "other.metadata.json"
-        (self.tmp / "named.webp").write_bytes(b"x")
-        found = lora_utils.get_preview_images_from_metadata(
-            {"file_name": "named.safetensors"}, meta_path
-        )
-        self.assertEqual([os.path.basename(f) for f in found], ["named.webp"])
-        self.assertIsNone(lora_utils.get_preview_image_from_metadata({}, meta_path))
-
-    def test_example_images_dir(self):
-        self.assertIsNone(lora_utils.get_example_images_dir(str(self.tmp)))
-        nested = self.tmp / "user" / "example_images"
-        nested.mkdir(parents=True)
-        self.assertEqual(
-            lora_utils.get_example_images_dir(str(self.tmp)), str(nested.resolve())
-        )
-        direct = self.tmp / "example_images"
-        direct.mkdir()
-        self.assertEqual(
-            lora_utils.get_example_images_dir(str(self.tmp)), str(direct.resolve())
-        )
 
 
 class TestDownloadEdgeCases(unittest.TestCase):
@@ -1012,10 +1692,188 @@ class TestInjectTriggerWords(unittest.TestCase):
         (tmp / "named.metadata.json").write_text(
             json.dumps({"civitai": {"trainedWords": ["w"]}})
         )
+        for stem in ("bad", "nowords", "named"):
+            (tmp / f"{stem}.safetensors").write_bytes(b"m")
         cache = TriggerWordCache()
-        with patch.object(lora_utils, "find_lora_directories", return_value=[str(tmp)]):
+        with patch.object(lora_utils, "default_lora_roots", return_value=[str(tmp)]):
             self.assertEqual(cache.load(str(tmp)), 1)
         self.assertEqual(cache.get_trigger_words("named"), ["w"])
+
+
+class TestTriggerWordCacheLayout(unittest.TestCase):
+    """#355: trigger words come from the sidecars LoraManager really uses."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.custom_nodes = self.tmp / "custom_nodes"
+        self.lm = _make_lora_manager(self.custom_nodes)
+        self.loras = self.tmp / "loras"
+        self.loras.mkdir()
+        self.sidecars = self.tmp / "sidecars"
+        self.settings = self.tmp / "settings"
+        self.settings.mkdir()
+        patchers = [
+            patch.object(
+                lora_utils, "custom_nodes_directories", return_value=[self.custom_nodes]
+            ),
+            patch.object(lora_utils, "default_lora_roots", return_value=[]),
+            patch.dict(os.environ, {"LORA_MANAGER_SETTINGS_DIR": str(self.settings)}),
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def centralized(self):
+        self.sidecars.mkdir(exist_ok=True)
+        (self.settings / "settings.json").write_text(
+            json.dumps(
+                {
+                    "sidecar_storage_mode": "centralized",
+                    "sidecar_storage_path": str(self.sidecars),
+                    "folder_paths": {"loras": [str(self.loras)]},
+                }
+            )
+        )
+
+    def sidecar(self, folder, stem, model, words):
+        folder.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "file_name": stem,
+            "file_path": str(model),
+            "civitai": {"trainedWords": words},
+        }
+        (folder / f"{stem}.metadata.json").write_text(json.dumps(meta))
+
+    def test_centralized_sidecars_are_read(self):
+        self.centralized()
+        model = self.loras / "neon.safetensors"
+        model.write_bytes(b"m")
+        self.sidecar(self.sidecars / "loras-0a1b2c3d", "neon", model, ["glow"])
+        # A leftover sidecar beside the model is not what LoraManager reads.
+        self.sidecar(self.loras, "neon", model, ["stale"])
+        cache = TriggerWordCache()
+        self.assertEqual(cache.load(str(self.lm)), 1)
+        self.assertEqual(cache.get_trigger_words("neon"), ["glow"])
+
+    def test_both_the_model_and_the_sidecar_name_are_keys(self):
+        self.centralized()
+        model = self.loras / "model_name.safetensors"
+        model.write_bytes(b"m")
+        self.sidecar(self.sidecars / "c", "sidecar_name", model, ["w"])
+        cache = TriggerWordCache()
+        self.assertEqual(cache.load(str(self.lm)), 2)
+        self.assertEqual(cache.get_trigger_words("model_name"), ["w"])
+        self.assertEqual(cache.get_trigger_words("sidecar_name"), ["w"])
+
+    def test_an_empty_path_means_auto_detection(self):
+        self.centralized()
+        model = self.loras / "neon.safetensors"
+        model.write_bytes(b"m")
+        self.sidecar(self.sidecars / "c", "neon", model, ["glow"])
+        cache = TriggerWordCache()
+        with patch.object(lora_utils, "detect_lora_manager", return_value=str(self.lm)):
+            self.assertEqual(cache.load(""), 1)
+
+    def test_an_unlistable_folder_keeps_the_previous_map(self):
+        cache = TriggerWordCache()
+        cache._cache = {"old": ["word"]}
+        cache._loaded = True
+        with (
+            patch.object(
+                lora_utils, "discover_sidecars", side_effect=OSError("share gone")
+            ),
+            self.assertLogs("prompt_manager.lora_utils", level="WARNING") as logs,
+        ):
+            self.assertEqual(cache.load(str(self.lm)), 1)
+        self.assertEqual(cache.get_trigger_words("old"), ["word"])
+        self.assertIn("share gone", "\n".join(logs.output))
+
+    def test_a_failed_load_waits_before_a_node_retries(self):
+        # Review finding: a node calls load while the cache is not loaded; a
+        # failing discovery must not rescan on every prompt run.
+        cache = TriggerWordCache()
+        self.assertTrue(cache.retry_due())
+        clock = [100.0]
+        with (
+            patch.object(lora_utils.time, "monotonic", lambda: clock[0]),
+            patch.object(lora_utils, "discover_sidecars", side_effect=OSError("x")),
+            self.assertLogs("prompt_manager.lora_utils", level="WARNING"),
+        ):
+            cache.load(str(self.lm))
+            self.assertFalse(cache.is_loaded)
+            self.assertFalse(cache.retry_due())
+            clock[0] += lora_utils.TRIGGER_RETRY_SECONDS
+            self.assertTrue(cache.retry_due())
+        cache.load(str(self.lm))
+        self.assertTrue(cache.is_loaded)
+        self.assertTrue(cache.retry_due())
+
+    def test_an_os_error_is_a_warning_without_a_traceback(self):
+        cache = TriggerWordCache()
+        cache._cache = {"old": ["word"]}
+        with (
+            patch.object(TriggerWordCache, "_build", side_effect=OSError("denied")),
+            self.assertLogs("prompt_manager.lora_utils", level="WARNING") as logs,
+        ):
+            self.assertEqual(cache.load(str(self.lm)), 1)
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertIsNone(logs.records[0].exc_info)
+        self.assertEqual(cache.get_trigger_words("old"), ["word"])
+        self.assertFalse(cache.retry_due())
+
+    def test_an_unexpected_failure_logs_its_traceback(self):
+        # #362: a programming error must not look like a disk error.
+        cache = TriggerWordCache()
+        cache._cache = {"old": ["word"]}
+        with (
+            patch.object(TriggerWordCache, "_build", side_effect=ValueError("bug")),
+            self.assertLogs("prompt_manager.lora_utils", level="WARNING") as logs,
+        ):
+            self.assertEqual(cache.load(str(self.lm)), 1)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIsNotNone(logs.records[0].exc_info)
+        self.assertIs(logs.records[0].exc_info[0], ValueError)
+        self.assertEqual(cache.get_trigger_words("old"), ["word"])
+        self.assertFalse(cache.retry_due())
+
+    def test_any_other_failure_never_raises(self):
+        cache = TriggerWordCache()
+        with (
+            patch.object(lora_utils, "load_layout", side_effect=RuntimeError("bad")),
+            self.assertLogs("prompt_manager.lora_utils", level="WARNING"),
+        ):
+            self.assertEqual(cache.load(str(self.lm)), 0)
+        self.assertFalse(cache.is_loaded)
+
+    def test_an_unusable_layout_falls_back_to_the_default_roots(self):
+        (self.settings / "settings.json").write_text("{not json")
+        model = self.loras / "neon.safetensors"
+        model.write_bytes(b"m")
+        self.sidecar(self.loras, "neon", model, ["glow"])
+        cache = TriggerWordCache()
+        with (
+            patch.object(
+                lora_utils, "default_lora_roots", return_value=[str(self.loras)]
+            ),
+            self.assertLogs("prompt_manager.lora_utils", level="WARNING") as logs,
+        ):
+            self.assertEqual(cache.load(str(self.lm)), 1)
+        self.assertEqual(cache.get_trigger_words("neon"), ["glow"])
+        self.assertIn("not valid JSON", "\n".join(logs.output))
+
+    def test_layout_wraps_the_install_and_the_default_roots(self):
+        with patch.object(
+            lora_utils, "default_lora_roots", return_value=[str(self.loras)]
+        ):
+            layout = lora_utils.lora_manager_layout(str(self.lm))
+        self.assertIsNone(layout.error)
+        self.assertEqual(layout.source, "environment")
+        self.assertIn(os.path.normcase(str(self.loras)), layout.lora_roots)
+        self.assertEqual(
+            lora_utils.lora_manager_layout(str(self.tmp)).error,
+            "no LoraManager install found",
+        )
 
 
 if __name__ == "__main__":

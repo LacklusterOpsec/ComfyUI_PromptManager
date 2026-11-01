@@ -17,11 +17,29 @@ from utils.execution_contexts import MAX_ATTEMPT_BYTES
 from utils.execution_output_capture import seal_outputs
 from utils.execution_outputs import snapshot_output_roots
 from utils.execution_history_writer import HistoryWriter
+from tests.history_waits import drain_writer
+from tests.disk_waits import DISK_BOUND_SECONDS
 
 try:
     from tests import test_execution_history_writer as fixtures
 except ImportError:
     import test_execution_history_writer as fixtures
+
+
+# Upper bound a blocked fake write waits for its release. Tests prove ordering
+# with events, so this only caps a failing run and never decides a pass.
+BLOCK_SECONDS = 10
+
+# Saturation tests block the worker while they queue 1023 more items. The
+# block must hold until the test releases it (#346/#352): a 3 s timer let a
+# loaded runner unblock the worker mid-fill and drain it. This is only a hang
+# guard; the test, or cleanup, always sets the release.
+SATURATION_HOLD_SECONDS = 60
+
+# A restore is a full verify/migrate/backup/replace cycle and is bound by the
+# disk: a busy Windows runner took over 10 s (merge queue, #382). Waits that
+# span a restore use the shared disk-bound hang guard (tests/disk_waits.py).
+RESTORE_SECONDS = DISK_BOUND_SECONDS
 
 
 class OutputWriterTests(fixtures.unittest.TestCase):
@@ -156,6 +174,8 @@ class OutputWriterTests(fixtures.unittest.TestCase):
         start = replace(self.start_command(), run_id=str(fixtures.uuid4()))
         self.assertTrue(writer.submit(start))
         self.finalization(writer, start)
+        # Drain first: the 2 s bound is not under test here (#370).
+        drain_writer(writer)
         self.assertTrue(writer.close(2))
         self.assertEqual(
             self.db.get_execution_run(start.run_id)["outcome"], "succeeded"
@@ -294,45 +314,126 @@ class OutputWriterTests(fixtures.unittest.TestCase):
         )
         self.assertEqual(writer.context_budget.charged_bytes, 0)
 
+    def isolated_writer(self) -> HistoryWriter:
+        """A ready writer whose budget no other writer or test can charge."""
+        writer = HistoryWriter(
+            lambda: self.db, clock=self.clock, context_budget=ContextBudget()
+        )
+        self.writers.append(writer)
+        writer.start()
+        self.wait_for(lambda: writer.status().accepting)
+        return writer
+
+    def rotate_between_transactions(self, writer, start, after, restore, hold=None):
+        """Wrap ``after`` so a restore or invalidation lands right after it.
+
+        Returns the patch and an event set once that rotation has returned on
+        the worker. A restore is a full verify/migrate/backup/replace cycle, so
+        the handoff waits on this event with the ``RESTORE_SECONDS`` ceiling
+        instead of the short worker-behavior deadline (TESTING.md,
+        Windows portability preflight).
+        """
+        backup = os.path.join(self.directory.name, f"restore-{start.run_id}.db")
+        self.assertTrue(self.db.model.backup_database(backup))
+        original = getattr(self.db, after)
+        rotated = threading.Event()
+
+        def write(*args, **kwargs):
+            result = original(*args, **kwargs)
+            try:
+                if hold is not None:
+                    entered, release = hold
+                    entered.set()
+                    release.wait(BLOCK_SECONDS)
+                if restore:
+                    self.db.model.restore_from_file(backup)
+                else:
+                    writer.invalidate()
+            finally:
+                rotated.set()
+            return result
+
+        return patch.object(self.db, after, write), rotated
+
     def test_restore_or_generation_rotation_between_transactions_discards_evidence(
         self,
     ):
         for after in ("write_execution_finish", "write_execution_contexts_for_finish"):
             for restore in (False, True):
                 with self.subTest(after=after, restore=restore):
-                    writer = self.writer()
-                    start = self.start_command(len(self.writers))
-                    self.db.write_execution_start(start)
-                    backup = os.path.join(self.directory.name, "restore.db")
-                    self.assertTrue(self.db.model.backup_database(backup))
-                    original = getattr(self.db, after)
+                    # Each subtest owns its writer and budget and retires them
+                    # before the next starts, so one slow restore cannot leave
+                    # in-flight charges or an epoch rotation for the next.
+                    writer = self.isolated_writer()
+                    try:
+                        start = self.start_command(len(self.writers))
+                        self.db.write_execution_start(start)
+                        rotation, rotated = self.rotate_between_transactions(
+                            writer, start, after, restore
+                        )
+                        with rotation:
+                            self.finalization(writer, start)
+                            self.assertTrue(rotated.wait(RESTORE_SECONDS))
+                            self.wait_for(lambda: writer.status().pending == 0)
+                        self.assertEqual(
+                            self.db.get_execution_outputs(start.run_id)["state"],
+                            "not_captured",
+                        )
+                        self.assertEqual(
+                            self.db.get_execution_contexts(start.run_id)["state"],
+                            (
+                                "complete"
+                                if after == "write_execution_contexts_for_finish"
+                                and not restore
+                                else "not_captured"
+                            ),
+                        )
+                        self.assertEqual(writer.context_budget.charged_bytes, 0)
+                    finally:
+                        self.assertTrue(writer.close(BLOCK_SECONDS))
 
-                    def write(*args, **kwargs):
-                        result = original(*args, **kwargs)
-                        if restore:
-                            self.db.model.restore_from_file(backup)
-                        else:
-                            writer.invalidate()
-                        return result
-
-                    with patch.object(self.db, after, write):
-                        self.finalization(writer, start)
-                        self.wait_for(lambda: writer.status().pending == 0)
-                    self.assertEqual(
-                        self.db.get_execution_outputs(start.run_id)["state"],
-                        "not_captured",
-                    )
-                    self.assertEqual(
-                        self.db.get_execution_contexts(start.run_id)["state"],
-                        (
-                            "complete"
-                            if after == "write_execution_contexts_for_finish"
-                            and not restore
-                            else "not_captured"
-                        ),
-                    )
-                    self.assertEqual(writer.context_budget.charged_bytes, 0)
-                    self.assertTrue(writer.close())
+    def test_slow_restore_between_transactions_holds_charge_only_while_in_flight(
+        self,
+    ):
+        writer = self.isolated_writer()
+        start = self.start_command()
+        self.db.write_execution_start(start)
+        entered, release = self.block()
+        rotation, rotated = self.rotate_between_transactions(
+            writer, start, "write_execution_finish", True, (entered, release)
+        )
+        with rotation:
+            context = self.sealed(writer)
+            outputs = self.outputs(writer, context.lease.byte_count)
+            charge = writer.context_budget.charged_bytes
+            self.assertGreater(charge, 0)
+            self.assertTrue(
+                writer.submit_finalization(self.finish_command(start), context, outputs)
+            )
+            self.assertTrue(entered.wait(BLOCK_SECONDS))
+            # The worker is between transactions: the payload is owned, not leaked.
+            self.assertEqual(writer.status().pending, 1)
+            self.assertEqual(writer.context_budget.charged_bytes, charge)
+            release.set()
+            self.assertTrue(rotated.wait(RESTORE_SECONDS))
+            self.wait_for(lambda: writer.status().pending == 0)
+        self.assertEqual(writer.context_budget.charged_bytes, 0)
+        self.assertFalse(writer.status().accepting)
+        self.assertEqual(
+            self.db.get_execution_outputs(start.run_id)["state"], "not_captured"
+        )
+        # The restored epoch is probed again and new evidence is accepted.
+        self.clock.advance(5)
+        self.wait_for(lambda: writer.status().accepting)
+        restored = self.start_command(2)
+        self.db.write_execution_start(restored)
+        self.finalization(writer, restored)
+        self.wait_for(lambda: writer.status().pending == 0)
+        self.assertEqual(
+            self.db.get_execution_outputs(restored.run_id)["state"], "complete"
+        )
+        self.assertEqual(writer.context_budget.charged_bytes, 0)
+        self.assertTrue(writer.close(BLOCK_SECONDS))
 
     def test_invalidation_during_output_preparation_rechecks_actual_commit(self):
         import database.execution_outputs as outputs_db
@@ -408,59 +509,83 @@ class OutputWriterTests(fixtures.unittest.TestCase):
     def test_bounded_close_and_early_native_join_keep_inflight_combined_charge(self):
         for early in (False, True):
             with self.subTest(early_join=early):
-                writer = self.writer()
-                start = self.start_command(len(self.writers))
-                self.db.write_execution_start(start)
-                entered, release = self.block()
-                original = self.db.write_execution_outputs_for_finish
+                self.assert_bounded_close_keeps_inflight_charge(early)
 
-                def write(*args, **kwargs):
-                    entered.set()
-                    release.wait(3)
-                    return original(*args, **kwargs)
+    def assert_bounded_close_keeps_inflight_charge(self, early):
+        # Every writer in this test charges the process-wide budget, so a
+        # failing subtest must not leave its worker blocked (and charged) for
+        # the next one: release and join it before the next subtest starts.
+        writer = self.writer()
+        self.assertEqual(writer.context_budget.charged_bytes, 0)
+        start = self.start_command(len(self.writers))
+        self.db.write_execution_start(start)
+        entered, release = self.block()
+        left = threading.Event()
+        original = self.db.write_execution_outputs_for_finish
 
-                with patch.object(self.db, "write_execution_outputs_for_finish", write):
-                    self.finalization(writer, start)
-                    self.assertTrue(entered.wait(1))
-                    charge = writer.context_budget.charged_bytes
-                    self.finalization(writer, start)
-                    clock = fixtures.ManualClock()
-                    native_join = writer._thread.join
+        def write(*args, **kwargs):
+            entered.set()
+            release.wait(BLOCK_SECONDS)
+            left.set()
+            return original(*args, **kwargs)
 
-                    def return_early(timeout):
-                        native_join(0)
-                        clock.advance(min(timeout, 0.004))
+        try:
+            with patch.object(self.db, "write_execution_outputs_for_finish", write):
+                self.finalization(writer, start)
+                self.assertTrue(entered.wait(BLOCK_SECONDS))
+                charge = writer.context_budget.charged_bytes
+                self.finalization(writer, start)
+                clock = fixtures.ManualClock()
+                native_join = writer._thread.join
 
-                    def sleep(delay):
-                        clock.advance(delay)
+                def return_early(timeout):
+                    native_join(0)
+                    clock.advance(min(timeout, 0.004))
 
-                    clock_patch = (
-                        patch(
-                            "utils.execution_history_writer.time",
-                            SimpleNamespace(monotonic=clock, sleep=sleep),
-                        )
-                        if early
-                        else nullcontext()
+                def sleep(delay):
+                    clock.advance(delay)
+
+                clock_patch = (
+                    patch(
+                        "utils.execution_history_writer.time",
+                        SimpleNamespace(monotonic=clock, sleep=sleep),
                     )
-                    join_patch = (
-                        patch.object(writer._thread, "join", return_early)
-                        if early
-                        else nullcontext()
-                    )
-                    with clock_patch, join_patch:
-                        before = clock() if early else time.monotonic()
-                        self.assertFalse(writer.close(0.02))
-                        elapsed = (clock() if early else time.monotonic()) - before
-                    self.assertGreaterEqual(elapsed, 0.02)
+                    if early
+                    else nullcontext()
+                )
+                join_patch = (
+                    patch.object(writer._thread, "join", return_early)
+                    if early
+                    else nullcontext()
+                )
+                with clock_patch, join_patch:
+                    before = clock() if early else time.monotonic()
+                    self.assertFalse(writer.close(0.02))
+                    elapsed = (clock() if early else time.monotonic()) - before
+                # close() waits until its own monotonic deadline, so the lower
+                # bound holds on any runner.
+                self.assertGreaterEqual(elapsed, 0.02)
+                if early:
+                    # Manual clock: only the patched join/sleep advance it, so
+                    # this exact bound proves early joins do not spin forever.
                     self.assertLess(elapsed, 0.2)
-                    self.assertEqual(writer.context_budget.charged_bytes, charge)
-                    replacement = HistoryWriter(lambda: self.db)
-                    self.writers.append(replacement)
-                    self.assertIs(replacement.context_budget, writer.context_budget)
-                    self.assertIsNone(replacement.context_budget.reserve(8388608))
-                    release.set()
-                    self.assertTrue(writer.close(2))
-                self.assertEqual(writer.context_budget.charged_bytes, 0)
+                # Bounded, not unbounded: close() gave up while the in-flight
+                # write was still blocked, instead of waiting it out.
+                self.assertFalse(left.is_set())
+                self.assertTrue(writer._thread.is_alive())
+                self.assertEqual(writer.context_budget.charged_bytes, charge)
+                replacement = HistoryWriter(lambda: self.db)
+                self.writers.append(replacement)
+                self.assertIs(replacement.context_budget, writer.context_budget)
+                self.assertIsNone(replacement.context_budget.reserve(8388608))
+                release.set()
+                # Drain first: the 2 s bound is not under test here (#370).
+                drain_writer(writer)
+                self.assertTrue(writer.close(2))
+        finally:
+            release.set()
+            writer.close(BLOCK_SECONDS)
+        self.assertEqual(writer.context_budget.charged_bytes, 0)
 
     def test_pending_saturation_and_invalid_command_release_both_payloads(self):
         writer = self.writer()
@@ -473,7 +598,7 @@ class OutputWriterTests(fixtures.unittest.TestCase):
 
         def write(command):
             entered.set()
-            release.wait(3)
+            release.wait(SATURATION_HOLD_SECONDS)
             return original(command)
 
         with patch.object(self.db, "write_execution_start", write):
@@ -497,6 +622,8 @@ class OutputWriterTests(fixtures.unittest.TestCase):
             writer.invalidate()
             self.assertEqual(writer.context_budget.charged_bytes, 0)
             release.set()
+        # Drain first: the 2 s bound is not under test here (#370).
+        drain_writer(writer)
         self.assertTrue(writer.close(2))
 
     def test_malformed_context_omission_preserves_independent_valid_output(self):
@@ -552,11 +679,13 @@ class OutputWriterTests(fixtures.unittest.TestCase):
         self.db.write_execution_start(start)
         entered, release = self.block()
         invalidating, invalidated = threading.Event(), threading.Event()
+        committed = threading.Event()
         original = outputs_db._capture
 
         def capture(*args, **kwargs):
             entered.set()
-            release.wait(3)
+            release.wait(BLOCK_SECONDS)
+            committed.set()
             return original(*args, **kwargs)
 
         def invalidate():
@@ -566,21 +695,27 @@ class OutputWriterTests(fixtures.unittest.TestCase):
 
         with patch.object(outputs_db, "_capture", capture):
             self.finalization(writer, start)
-            self.assertTrue(entered.wait(1))
+            self.assertTrue(entered.wait(BLOCK_SECONDS))
             invalidator = threading.Thread(target=invalidate)
             invalidator.start()
             try:
-                self.assertTrue(invalidating.wait(1))
+                self.assertTrue(invalidating.wait(BLOCK_SECONDS))
                 self.assertFalse(invalidated.wait(0.03))
-                before = time.monotonic()
                 self.assertTrue(writer.submit(self.finish_command(start)))
                 self.assertFalse(writer.close(0))
-                self.assertLess(time.monotonic() - before, 0.1)
+                # submit() and close() returned while the commit still held the
+                # gate: the blocked invalidation has not finished and the
+                # commit is still waiting for its release. Had either call
+                # queued behind the gate, it could only return after both.
+                self.assertFalse(invalidated.is_set())
+                self.assertFalse(committed.is_set())
                 self.assertGreater(writer.context_budget.charged_bytes, 0)
             finally:
                 release.set()
-                invalidator.join(3)
+                invalidator.join(BLOCK_SECONDS)
             self.assertFalse(invalidator.is_alive())
+            # Drain first: the 2 s bound is not under test here (#370).
+            drain_writer(writer)
             self.assertTrue(writer.close(2))
         self.assertEqual(
             self.db.get_execution_outputs(start.run_id)["state"], "complete"

@@ -26,13 +26,13 @@ except ImportError:
     InputTypeDict = dict
 
 try:
-    from .prompt_manager_base import PromptManagerBase
+    from .prompt_manager_base import SAVE_TO_LIBRARY_INPUT, PromptManagerBase
 except ImportError:
     import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from prompt_manager_base import PromptManagerBase
+    from prompt_manager_base import SAVE_TO_LIBRARY_INPUT, PromptManagerBase
 
 
 class PromptManager(PromptManagerBase, ComfyNodeABC):
@@ -117,6 +117,7 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
                         )
                     },
                 ),
+                "save_to_library": SAVE_TO_LIBRARY_INPUT,
             },
             "hidden": {
                 # The queued graph and this node's id: used to tell the positive
@@ -154,6 +155,7 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
         append_text: str = "",
         prompt: Optional[Dict[str, Any]] = None,
         unique_id: Optional[str] = None,
+        save_to_library: bool = True,
     ) -> Tuple[Any]:
         """
         Encode the text prompt and save it to the database.
@@ -166,6 +168,7 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
             search_text: Text to search for in past prompts
             prepend_text: Text to prepend to the main prompt
             append_text: Text to append to the main prompt
+            save_to_library: Off: nothing is saved, counted or tracked (#90)
 
         Returns:
             Tuple containing the conditioning for the diffusion model and the final
@@ -207,7 +210,9 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
         # Save prompt to database and set execution context for gallery tracking
         prompt_id = None
         extended_tags = []
-        if storage_text and storage_text.strip():
+        if not save_to_library:
+            self._skip_not_saved(prompt, unique_id)
+        elif storage_text and storage_text.strip():
             self.logger.debug(f"Processing prompt text: {storage_text[:100]}...")
 
             # Add prepend/append info to tags if they exist
@@ -240,6 +245,9 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
             except Exception as e:
                 # Log error but don't fail the encoding
                 self.logger.warning(f"Failed to save prompt to database: {e}")
+                self._mark_untracked(prompt, unique_id)
+        else:
+            self._skip_empty_prompt(prompt, unique_id)
 
         # Perform standard CLIP text encoding using the combined text
         self.logger.debug(
@@ -247,6 +255,11 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
         )
         tokens = clip.tokenize(encoding_text)
         conditioning = clip.encode_from_tokens_scheduled(tokens)
+
+        self.logger.info(f"CLIP encoding completed, text: {repr(encoding_text)[:80]}")
+        result = (conditioning, encoding_text)
+        if not save_to_library:
+            return result  # #90: no metadata registration, no history text
 
         # Register with ComfyUI integration for standard metadata compatibility
         node_id = f"promptmanager_{int(time.time() * 1000)}"
@@ -261,11 +274,14 @@ class PromptManager(PromptManagerBase, ComfyNodeABC):
                 "append_text": append_text.strip() if append_text else None,
             },
         )
-
-        self.logger.info(f"CLIP encoding completed, text: {repr(encoding_text)[:80]}")
-        result = (conditioning, encoding_text)
         record_runtime_context(
             type(self).__name__, text, prepend_text, append_text, encoding_text
+        )
+        self._record_cached_item(
+            unique_id,
+            (encoding_text,),
+            storage_text,
+            fields=((text, prepend_text, append_text),),
         )
         return result
 

@@ -18,11 +18,14 @@ from unittest.mock import patch
 
 from aiohttp import FormData, web
 
+from utils.hashing import generate_prompt_hash
+
 try:
     from test_api_images import ImageAPITestCase
 except ImportError:
     from tests.test_api_images import ImageAPITestCase
 
+from database import restore_stage
 from database.operations import PromptDatabase
 from py.api.library import _encode, _scope
 from tests.test_execution_context_database import bundle, snapshot
@@ -39,6 +42,21 @@ HANDOFF_TIMEOUT_SECONDS = 60
 
 OTHER_SESSION = "aaaaaaaa-3333-4333-8333-333333333333"
 MISSING_RUN = "bbbbbbbb-4444-4444-8444-444444444444"
+
+
+@contextmanager
+def no_wal_truncate_wait():
+    """Restore with the restore notification held back, as these tests need.
+
+    The read under test keeps its snapshot open across the restore, so the
+    publish's WAL truncate can never succeed; without the short wait it would
+    sit out the full CHECKPOINT_BUSY_MS (30 s) each time (#487).
+    """
+    with (
+        patch("database.execution_history.notify_history_restore"),
+        patch.object(restore_stage, "CHECKPOINT_BUSY_MS", 50),
+    ):
+        yield
 
 
 class HistoryAPITests(ImageAPITestCase):
@@ -191,7 +209,11 @@ class HistoryAPITests(ImageAPITestCase):
             context["evidence"]["positive"]["raw"]["provenance"], "recorded"
         )
         with self.api.db.model.get_connection() as conn:
-            conn.execute("UPDATE prompts SET text='edited' WHERE id=?", (positive,))
+            # An edit changes the text and its dedup hash together (#460)
+            conn.execute(
+                "UPDATE prompts SET text='edited',hash=? WHERE id=?",
+                (generate_prompt_hash("edited"), positive),
+            )
         _, changed = await self.detail(start.run_id)
         self.assertEqual(changed["contexts"][0]["positive"], context["positive"])
         self.assertFalse(changed["contexts"][0]["navigation"]["positive_available"])
@@ -278,6 +300,86 @@ class HistoryAPITests(ImageAPITestCase):
         self.assert_error(
             response, body, 409, "history-changed", {"action": "refresh-history"}
         )
+
+    async def test_newest_pair_run_route_names_the_run_or_none(self):
+        pair = self.api.db.save_prompt_pair("positive", "negative")
+        quiet = self.api.db.save_prompt_pair("positive", "quiet")
+        foreign = self.api.db.save_prompt_pair("elsewhere", "negative")
+        positive = self.api.db.get_prompt_pair(pair)["positive_prompt_id"]
+        self.capture(0, 100)
+        newest = self.capture(1, 200)
+        base = f"/prompt_manager/library/{positive}/history/pairs"
+        response = await self.client.get(f"{base}/{pair}/newest")
+        body = await response.json()
+        self.assertEqual(response.status, 200, body)
+        self.assertEqual(response.headers.get("Cache-Control"), "no-store")
+        self.assertEqual(body["history_version"], 1)
+        self.assertEqual(body["history_epoch"], newest.storage_epoch)
+        self.assertEqual(body["run"]["run_id"], newest.run_id)
+        self.assertEqual(body["run"]["anchor_id"], "4")
+        response = await self.client.get(f"{base}/{quiet}/newest")
+        self.assertEqual((await response.json())["run"], None)
+        response = await self.client.get(f"{base}/{foreign}/newest")
+        self.assert_error(response, await response.json(), 404, "not-found")
+        response = await self.client.get(
+            f"/prompt_manager/library/999999/history/pairs/{pair}/newest"
+        )
+        self.assert_error(response, await response.json(), 404, "not-found")
+        for path in (f"{base}/0/newest", f"{base}/01/newest", f"{base}/true/newest"):
+            response = await self.client.get(path)
+            self.assert_error(response, await response.json(), 400, "invalid-request")
+        response = await self.client.get(f"{base}/{pair}/newest", params={"x": "1"})
+        self.assert_error(response, await response.json(), 400, "invalid-request")
+
+    async def test_newest_pair_run_route_reports_storage_and_epoch_failures(self):
+        pair = self.api.db.save_prompt_pair("positive", "negative")
+        saved = self.api.db.get_prompt_pair(pair)
+        self.capture(0, 100)
+        url = (
+            f"/prompt_manager/library/{saved['positive_prompt_id']}"
+            f"/history/pairs/{pair}/newest"
+        )
+        # A prompt saved only as a negative is not a Library positive.
+        response = await self.client.get(
+            f"/prompt_manager/library/{saved['negative_prompt_id']}"
+            f"/history/pairs/{pair}/newest"
+        )
+        self.assert_error(response, await response.json(), 404, "not-found")
+        private = "SECRET_PROMPT /private/data/secret.db"
+        for exc in (sqlite3.OperationalError("busy " + private), OSError(private)):
+            with patch.object(self.api.db, "get_newest_pair_run", side_effect=exc):
+                with self.assertLogs("prompt_manager.api", "WARNING") as logs:
+                    response = await self.client.get(url)
+                body = await response.json()
+            self.assert_error(
+                response, body, 503, "storage-unavailable", {"action": "retry-read"}
+            )
+            self.assertNotIn(private, json.dumps(body) + " ".join(logs.output))
+        source = str(self.comfy_dir / "source.db")
+        self.assertTrue(self.api.db.model.backup_database(source))
+        writer = PromptDatabase(self.api.db.model.db_path)
+        original = self.api.db.get_newest_pair_run
+
+        def during_snapshot(*args, **kwargs):
+            result = original(*args, **kwargs)
+            with no_wal_truncate_wait():
+                writer.model.restore_from_file(source)
+            return result
+
+        try:
+            with patch.object(
+                self.api.db, "get_newest_pair_run", side_effect=during_snapshot
+            ):
+                response = await self.client.get(url)
+            self.assert_error(
+                response,
+                await response.json(),
+                409,
+                "history-changed",
+                {"action": "refresh-history"},
+            )
+        finally:
+            writer.close_all()
 
     async def test_nullable_frozen_fields_and_every_recorded_time_remain_exact(self):
         start = make_start(
@@ -804,7 +906,7 @@ class HistoryAPITests(ImageAPITestCase):
 
                 def during_snapshot(*args, **kwargs):
                     result = original(*args, **kwargs)
-                    with patch("database.execution_history.notify_history_restore"):
+                    with no_wal_truncate_wait():
                         writer.model.restore_from_file(source)
                     return result
 
@@ -1089,3 +1191,47 @@ class HistoryHostCleanupTests(unittest.IsolatedAsyncioTestCase):
                     fence.validate(epoch, generation)
                 with self.assertRaises(sqlite3.Error):
                     api._history_fence()
+
+
+class SharedTempFolderRestoreTests(ImageAPITestCase):
+    """#346: a restore survives another suite starting in the shared temp folder.
+
+    Every ``PromptManagerAPI`` sweeps its database's folder for stages and
+    uploads an interrupted restore left. A fixture database directly in the
+    shared temp folder let any other test process (another worktree's suite,
+    a pre-push hook) delete this restore's files mid-request. The shared
+    folder here is a scratch stand-in for the system temp folder, so the test
+    never sweeps the real one.
+    """
+
+    async def get_application(self):
+        shared = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        # Cleanups run last-in first-out: this one after the fixture's own.
+        self.addCleanup(shared.cleanup)
+        self.shared_tmp = shared.name
+        with patch.object(tempfile, "tempdir", shared.name):
+            return await super().get_application()
+
+    async def test_restore_survives_another_suite_sweeping_the_shared_folder(self):
+        from database import restore_stage
+        from database.models import PromptModel
+
+        self.api.db.save_prompt("kept by the upload")
+        source = self.comfy_dir / "upload.db"
+        self.assertTrue(self.api.db.model.backup_database(str(source)))
+        stage = PromptModel.stage_restore
+        swept = []
+
+        def stage_then_other_suite_starts(model, src_path):
+            staged = stage(model, src_path)
+            # What another suite's PromptManagerAPI does at startup.
+            other = os.path.join(self.shared_tmp, "other-suite.db")
+            swept.extend(restore_stage.sweep_restore_temps(other))
+            return staged
+
+        form = FormData()
+        form.add_field("database_file", source.read_bytes(), filename="upload.db")
+        with patch.object(PromptModel, "stage_restore", stage_then_other_suite_starts):
+            response = await self.client.post("/prompt_manager/restore", data=form)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(swept, [], "another suite's sweep reached this restore")

@@ -1,8 +1,10 @@
 import {startCoverage,saveCoverage} from '../../tools/vendor/browser-coverage.mjs';
 import {writeFile} from 'node:fs/promises';
-import {test,expect} from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import {test,expect} from './fixtures.mjs';
+import {mapConceptLayout} from './concept-inventory.mjs';
+import {armUnseenRestores,unseenRestore,followRestore,SEEN_RESTORE_PILL,SEEN_RESTORE_TOAST} from './unseen-restore.mjs';
 import {captureCanonicalState} from './history-canonical-comparison.mjs';
-import {pageInventoryOf,inventoryOf,diffInventory,mapVocabularyConcept,mapVocabularyDialog} from './vocabulary-canonical-comparison.mjs';
+import {pageInventoryOf,inventoryOf,diffInventory,mapVocabularyConcept,mapVocabularyDialog,d149Of,toolbarInventoryOf} from './vocabulary-canonical-comparison.mjs';
 
 const route='/prompt_manager/workspace#/tags';
 // Prompts per concept tag (app.js:71-165): first appearance order, Library Browse counts.
@@ -24,18 +26,23 @@ async function expectLibrary(page,{tags='',category='',count}) {
     await expect(page).toHaveURL(/#\/library$/);
     await expect(main(page).getByRole('heading',{level:1})).toHaveText('Prompt library');
     await expect(main(page).getByRole('heading',{level:1})).toBeFocused();
-    await expect(page.getByRole('searchbox',{name:'Search prompts',exact:true})).toHaveValue('');
-    await expect(page.getByRole('textbox',{name:'Tags',exact:true})).toHaveValue(tags);
-    const select=page.getByRole('combobox',{name:'Category',exact:true});
+    await expect(page.getByRole('searchbox',{name:'Search workspace',exact:true})).toHaveValue('');
+    const select=page.getByRole('combobox',{name:'Filter by category',exact:true});
     await expect(select).toHaveValue(category);
     if(!category) await expect(select.locator('option:checked')).toHaveText('All categories');
-    await expect(page.locator('.library-caption')).toHaveText(`${count} of ${count} positive prompts · Images are grouped by positive prompt`);
+    await expect(page.locator('#workspace-main .section-caption > span').first()).toHaveText(new RegExp(`^${count} positive prompts? · \\d+ negative variants?$`));
     await expect(page.locator('article[data-prompt-id]')).toHaveCount(count);
+    // Browse sets exactly this Tags filter, which lives in "Refine this view" (#249 D14); Filters counts it (D44).
+    const filters=page.locator('#workspace-main search.toolbar').getByRole('button',{name:tags?'Filters · 1':'Filters',exact:true});
+    await expect(filters).toBeVisible();await filters.click();
+    const refine=page.getByRole('dialog',{name:'Refine this view',exact:true});
+    await expect(refine.getByRole('textbox',{name:'Tags',exact:true})).toHaveValue(tags);
+    await refine.getByRole('button',{name:'Close dialog',exact:true}).click();await expect(refine).toHaveCount(0);
 }
 
 let manifest;
 test.beforeEach(async({page,request,browserName})=>{
-    await startCoverage(page,browserName);manifest=await seed(request);
+    await startCoverage(page,browserName);await armUnseenRestores(page);manifest=await seed(request);
     page.vocabularyErrors=[];page.on('pageerror',error=>page.vocabularyErrors.push(error.message));
 });
 test.afterEach(async({page,browserName})=>{await saveCoverage(page,browserName);expect(page.vocabularyErrors).toEqual([]);});
@@ -45,9 +52,12 @@ test('tags route renders the concept composition without a legacy handoff',async
     await expect(main(page).getByRole('heading',{level:1})).toHaveText('Tags & categories');
     await expect(main(page).locator(':scope > .heading p.muted')).toHaveText('Organize once. Reuse everywhere.');
     const actions=main(page).locator(':scope > .heading > .heading-actions button');
-    await expect(actions).toHaveText(['+ Create tag']);
+    // The concept's heading actions (#249 C2 retired #245 D2): Auto-tag images is primary; with no image selected in
+    // Images it is aria-disabled (D115).
+    await expect(actions).toHaveText(['+ Create tag','Auto-tag images']);
     await expect(actions.first()).not.toHaveClass(/ca-primary/);
-    await expect(main(page).getByRole('button',{name:'Auto-tag images'})).toHaveCount(0);
+    await expect(actions.last()).toHaveClass(/ca-primary/);
+    await expect(actions.last()).toHaveAttribute('aria-disabled','true');
     await expect(surfaces(page)).toHaveCount(2);
     await expect(surfaces(page).locator('h2')).toHaveText(['Tag vocabulary','Categories']);
     await expect(surfaces(page).locator(':scope > p:visible')).toHaveText(['Category/tag autocomplete uses this same vocabulary across nodes and dialogs.',
@@ -60,9 +70,9 @@ test('tags route renders the concept composition without a legacy handoff',async
     expect(manifest.tags).toEqual(expected.map(([name])=>name));
     await expect(rows(page).locator('td:nth-child(1)')).toHaveText(expected.map(([name])=>name));
     await expect(rows(page).locator('td:nth-child(2)')).toHaveText(expected.map(([,count])=>String(count)));
-    const images=await rows(page).locator('td:nth-child(3)').evaluateAll(cells=>cells.map(cell=>[cell.querySelector('[aria-hidden="true"]')?.textContent,cell.querySelector('.ca-visually-hidden')?.textContent]));
-    expect(images).toEqual(expected.map(()=>['—','Not available yet']));
-    await expect(rows(page).first().locator('td:nth-child(3)')).toHaveAccessibleName('Not available yet');
+    // Images counts the files carrying each tag (#249 C2 retired #245 D3); this fixture tags no image.
+    await expect(rows(page).locator('td:nth-child(3)')).toHaveText(expected.map(()=>'0'));
+    await expect(rows(page).locator('td:nth-child(3) .ca-visually-hidden')).toHaveCount(0);
     const labels=await rows(page).evaluateAll(nodes=>nodes.map(row=>[...row.querySelectorAll('td:nth-child(4) .row-actions button')].map(button=>button.textContent)));
     expect(labels).toEqual(expected.map(()=>['Browse','Rename / merge']));
     const operations=surfaces(page).nth(1).locator('.operation');
@@ -85,9 +95,31 @@ test('prompt counts equal Library Browse results',async({page})=>{
     }
 });
 
+// #249 D44: a Browse-set Tags filter is visible on the shelf as "Filters · 1", and Clear filters returns the full shelf.
+test('a tag Browse shows Filters · 1 until its filter is cleared',async({page})=>{
+    await page.goto('/prompt_manager/workspace#/library');
+    const shelf=page.locator('article[data-prompt-id]');await expect(shelf.first()).toBeVisible();const total=await shelf.count();
+    const toolbar=page.locator('#workspace-main search.toolbar');
+    await expect(toolbar.getByRole('button')).toHaveText(['Save view','Filters']);
+    await page.goto(route);
+    const row=tagRow(page,'cinematic');await row.getByRole('button',{name:'Browse',exact:true}).click();
+    await expectLibrary(page,{tags:'cinematic',count:2});
+    await expect(toolbar.getByRole('button')).toHaveText(['Save view','Filters · 1']);
+    await toolbar.getByRole('button',{name:'Filters · 1',exact:true}).click();
+    const refine=page.getByRole('dialog',{name:'Refine this view',exact:true});
+    await refine.getByRole('button',{name:'Clear filters',exact:true}).click();await expect(refine).toHaveCount(0);
+    await expect(toolbar.getByRole('button',{name:'Filters',exact:true})).toBeFocused();
+    await expect(shelf).toHaveCount(total);
+    // The cleared filter stays cleared on the next in-app visit (the shelf remembers its filters).
+    const nav=page.getByRole('navigation',{name:'Workspace',exact:true});
+    await nav.getByRole('link',{name:/^Tags & categories(?:\s*[\d,]+)?$/}).click();await expect(main(page).getByRole('heading',{level:1})).toHaveText('Tags & categories');
+    await nav.getByRole('link',{name:/^Prompt library(?:\s*[\d,]+)?$/}).click();
+    await expect(shelf).toHaveCount(total);await expect(toolbar.getByRole('button')).toHaveText(['Save view','Filters']);
+});
+
 test('category Browse sets only the category constraint',async({page})=>{
     await page.goto('/prompt_manager/workspace#/library');
-    const search=page.getByRole('searchbox',{name:'Search prompts',exact:true});
+    const search=page.getByRole('searchbox',{name:'Search workspace',exact:true});
     await search.fill('observatory');await expect(page.locator('article[data-prompt-id]')).toHaveCount(1);
     await page.getByRole('navigation',{name:'Workspace',exact:true}).getByRole('link',{name: /^Tags & categories(?:\s*[\d,]+)?$/}).click();
     const row=categoryRow(page,'Landscapes');await expect(row.locator('p')).toHaveText('3 positive prompts');
@@ -103,7 +135,9 @@ test('long vocabularies append and Load more is keyboard reachable',async({page,
     await rows(page).last().getByRole('button',{name:'Rename / merge',exact:true}).evaluate(button=>button.focus({preventScroll:true}));
     await page.keyboard.press('Tab');
     await expect(loadMore(page)).toBeFocused();
-    // Focus scrolled the end of the list into view, which appends the next page.
+    // D183: Load more sits below the tag window, so reaching it does not move the window's end into view.
+    await expect(rows(page)).toHaveCount(100);
+    await page.keyboard.press('Enter');
     await expect(rows(page)).toHaveCount(200);
     await expect(loadMore(page)).toBeFocused();
     await page.keyboard.press('Enter');
@@ -111,11 +145,13 @@ test('long vocabularies append and Load more is keyboard reachable',async({page,
     await expect(loadMore(page)).toHaveCount(0);
     await expect(rows(page).nth(200).getByRole('button',{name:'Browse',exact:true})).toBeFocused();
     await expect(rows(page).locator('td:nth-child(1)')).toHaveText(manifest.tags);
-    // Reload at the top so restored scroll does not append before the check.
-    await page.evaluate(()=>window.scrollTo(0,0));
-    await page.reload();
+    // Open the screen as a new history entry, not a reload: Firefox restores a reloaded page's scrolled tag window, and
+    // its end then appends a page before the check (#567). Scrolling the window to its top first does not always stick.
+    await page.goto('about:blank');
+    await page.goto(route);
     await expect(rows(page)).toHaveCount(100);
-    const scroll=top=>page.evaluate(y=>new Promise(resolve=>{window.scrollTo(0,y ?? document.documentElement.scrollHeight);requestAnimationFrame(()=>requestAnimationFrame(resolve));}),top);
+    // D183: the end of the list arrives inside the tag window.
+    const scroll=top=>main(page).locator('.two-col .table-wrap').evaluate((node,y)=>new Promise(resolve=>{node.scrollTop=y ?? node.scrollHeight;requestAnimationFrame(()=>requestAnimationFrame(resolve));}),top);
     for(const count of [200,230]) {
         // Each new arrival of the end of the list appends one page.
         await scroll(0);await scroll(null);
@@ -175,12 +211,12 @@ test('route disposal aborts requests and removes observers',async({page})=>{
     await page.route('**/prompt_manager/vocabulary/**',route=>{held.push(route);});
     await page.goto(route);
     await expect.poll(()=>page.evaluate(()=>window.__vocabularySignals.length)).toBe(2);
-    expect(await page.evaluate(()=>window.__vocabularyObservers.filter(item=>item.targets.some(name=>name.includes('vocabulary-continuation'))).length)).toBe(2);
+    expect(await page.evaluate(()=>window.__vocabularyObservers.filter(item=>item.targets.some(name=>/vocabulary-(continuation|end)/.test(name))).length)).toBe(2);
     await expect(main(page).getByText('Loading…',{exact:true})).toHaveCount(2);
     await page.getByRole('navigation',{name:'Workspace',exact:true}).getByRole('link',{name: /^Prompt library(?:\s*[\d,]+)?$/}).click();
     await expect(main(page).getByRole('heading',{level:1})).toHaveText('Prompt library');
     expect(await page.evaluate(()=>window.__vocabularySignals.map(signal=>signal.aborted))).toEqual([true,true]);
-    expect(await page.evaluate(()=>window.__vocabularyObservers.filter(item=>item.targets.some(name=>name.includes('vocabulary-continuation'))).map(item=>item.disconnected))).toEqual([true,true]);
+    expect(await page.evaluate(()=>window.__vocabularyObservers.filter(item=>item.targets.some(name=>/vocabulary-(continuation|end)/.test(name))).map(item=>item.disconnected))).toEqual([true,true]);
     await expect(main(page).locator('.two-col')).toHaveCount(0);
     expect(await page.evaluate(()=>document.getElementById('workspace-main').classList.contains('vocabulary-main'))).toBe(false);
     await page.unroute('**/prompt_manager/vocabulary/**');
@@ -234,7 +270,8 @@ const toast=page=>page.locator('#workspace-toast');
 const actionNames=scope=>scope.locator('.dialog-actions button').evaluateAll(nodes=>nodes.map(node=>node.textContent.trim()));
 const snapshot=async request=>{const response=await request.get('/__test__/vocabulary/snapshot');await expect(response).toBeOK();return response.json();};
 const backup=async request=>{const response=await request.get('/__test__/vocabulary/backup');await expect(response).toBeOK();return response.body();};
-const restore=async(request,buffer)=>expect(await request.post('/prompt_manager/restore',{multipart:{database_file:{name:'vocabulary.db',mimeType:'application/octet-stream',buffer}}})).toBeOK();
+// A restore the open page has not seen, so its dialog stays to report it (#413).
+const restore=async(page,request,buffer)=>expect(await unseenRestore(page,()=>request.post('/prompt_manager/restore',{multipart:{database_file:{name:'vocabulary.db',mimeType:'application/octet-stream',buffer}}}))).toBeOK();
 const tagNames=rows=>rows.tags.map(([,name])=>name);
 function trackWrites(page) {
     const writes=[];page.on('request',item=>{if(item.method()!=='GET')writes.push({method:item.method(),url:new URL(item.url()).pathname,body:item.postDataJSON()});});return writes;
@@ -351,6 +388,62 @@ test('manage categories previews real impact before applying',async({page,reques
     expect(after.prompts.filter(row=>row[2]==='Scenery')).toHaveLength(3);
 });
 
+// #332 MC9, MC10: image categories (their own, set on Images) count beside the prompts. The vocabulary fixture has no
+// image files, so these tests add two committed files to the output folder and set their categories through the API.
+async function imageCategories(request,category) {
+    for(const name of ['f02.png','f03.png']) await expect(await request.post('/__test__/add-local-inspect-file',{data:{name}})).toBeOK();
+    const listing=await(await request.get('/prompt_manager/images/output?mode=workspace&subfolder=local-inspect&limit=40')).json();
+    const items=listing.images.map(({root_index,root_scope,path})=>({root_index,root_scope,path}));expect(items).toHaveLength(2);
+    const response=await request.put('/prompt_manager/images/category',{data:{items,category}});await expect(response).toBeOK();
+    expect((await response.json()).updated).toBe(2);
+}
+const ownCategories=async request=>(await(await request.get('/prompt_manager/images/categories')).json()).categories;
+const IMAGE_KEYS=['0:local-inspect/f02.png','0:local-inspect/f03.png'];
+
+test('manage categories renames the images\' own categories too and the preview counts them (#332 CUJ 6)',async({page,request})=>{
+    await imageCategories(request,'Landscapes');
+    const writes=trackWrites(page);await openPage(page);
+    await expect(categoryRow(page,'Landscapes').locator('p')).toHaveText('3 positive prompts · 2 images');
+    const box=await openManage(page);
+    await expect(field(box,'Category')).toHaveValue('Landscapes');
+    await field(box,'Proposed new category name').fill('Landscape');await button(box,'Preview').click();
+    await expect(box.locator('p.small')).toHaveText('“Landscapes” is used by 3 positive prompts and 2 images. Apply renames it to “Landscape”.');
+    await button(box,'Apply').click();
+    await expect(box).toHaveCount(0);await expect(toast(page)).toHaveText('Category renamed.');
+    expect(writes.at(-1)).toMatchObject({url:'/prompt_manager/vocabulary/categories/apply',body:{source:'Landscapes',target:'Landscape'}});
+    await expect(categoryRow(page,'Landscapes')).toHaveCount(0);
+    await expect(categoryRow(page,'Landscape').locator('p')).toHaveText('3 positive prompts · 2 images');
+    // The prompts and both images carry the new name; nothing keeps the old one.
+    expect((await snapshot(request)).prompts.filter(row=>row[2]==='Landscape')).toHaveLength(3);
+    expect(await ownCategories(request)).toEqual(['Landscape']);
+    for(const [category,total] of [['Landscape',2],['Landscapes',0]]) {
+        const listing=await(await request.get(`/prompt_manager/images/output?mode=workspace&limit=40&category=${category}`)).json();
+        expect(listing.images.map(image=>`${image.root_index}:${image.path}`).sort()).toEqual(total?IMAGE_KEYS:[]);
+    }
+});
+
+test('a category only images hold is listed after the prompt-backed ones and Browse opens Images (#332 CUJ 7)',async({page,request})=>{
+    await imageCategories(request,'Scans');
+    await openPage(page);
+    const operations=surfaces(page).nth(1).locator('.operation');
+    await expect(operations.locator('h3')).toHaveText([...CATEGORIES.map(([name])=>name),'Scans','Manage category']);
+    await expect(categoryRow(page,'Scans').locator('p')).toHaveText('2 images');
+    for(const [name,count] of CATEGORIES) await expect(categoryRow(page,name).locator('p')).toHaveText(`${count} positive prompt${count===1?'':'s'}`);
+    // Manage category can rename it: its select lists it last.
+    const box=await openManage(page);
+    await expect(field(box,'Category').locator('option')).toHaveText([...CATEGORIES.map(([name])=>name),'Scans']);
+    await button(box,'Cancel').click();await expect(box).toHaveCount(0);
+    // Browse opens Images filtered by it (its Library would be empty).
+    await categoryRow(page,'Scans').getByRole('button',{name:'Browse',exact:true}).click();
+    await expect(page).toHaveURL(/#\/images$/);
+    await expect(main(page).getByRole('heading',{level:1})).toHaveText('Images');
+    await expect(page.getByRole('combobox',{name:'Filter by category',exact:true})).toHaveValue('Scans');
+    const cards=page.locator('article[data-image-key]');await expect(cards).toHaveCount(2);
+    expect((await cards.evaluateAll(nodes=>nodes.map(node=>node.dataset.imageKey))).sort()).toEqual(IMAGE_KEYS);
+    await expect(page.getByRole('searchbox',{name:'Search workspace',exact:true})).toHaveValue('');
+    await expect(page.locator('#workspace-main search.toolbar').getByRole('button',{name:'Filters',exact:true})).toBeVisible();
+});
+
 test('an edit during a pending preview needs a new Preview; Apply never sends the old values',async({page,request})=>{
     const writes=trackWrites(page);await openPage(page);const before=await snapshot(request);
     let release;const held=new Promise(resolve=>{release=resolve;});
@@ -401,8 +494,8 @@ test('delete tag confirms real impact and removes only the vocabulary name',asyn
     expect(after.prompts.map(([id,text,category])=>[id,text,category])).toEqual(before.prompts.map(([id,text,category])=>[id,text,category]));
     await page.goto('/prompt_manager/workspace#/library');
     await expect(page.locator('article[data-prompt-id]')).toHaveCount(6);
-    await expect(page.locator('.library-chip').filter({hasText:/^cinematic$/})).toHaveCount(0);
-    await expect(page.locator('.library-chip').filter({hasText:/^blue_hour$/})).toHaveCount(1);
+    await expect(page.locator('article[data-prompt-id] .tags .chip').filter({hasText:/^cinematic$/})).toHaveCount(0);
+    await expect(page.locator('article[data-prompt-id] .tags .chip').filter({hasText:/^blue_hour$/})).toHaveCount(1);
 });
 
 test('cancel and escape write nothing and restore focus',async({page,request})=>{
@@ -452,7 +545,7 @@ test('conflict and restore states keep the dialog and write nothing',async({page
 
     const before=await snapshot(request);
     box=await openDialog(page,main(page).getByRole('button',{name:'+ Create tag',exact:true}),'Create tag');
-    await restore(request,saved);
+    await restore(page,request,saved);
     await field(box,'Tag name').fill('sunrise');await button(box,'Apply').click();
     await expect(note(box)).toHaveText('Prompt storage was restored since this dialog opened. Nothing was changed.');
     await expect(button(box,'Apply')).toBeDisabled();
@@ -461,6 +554,31 @@ test('conflict and restore states keep the dialog and write nothing',async({page
     await button(box,'Reload').click();await expect(box).toHaveCount(0);
     await expect(main(page).getByRole('heading',{level:1})).toBeFocused();
     await expect(tagRow(page,'mist')).toHaveCount(1);await expect(tagRow(page,'fog')).toHaveCount(0);
+    expect(writes.filter(write=>write.url==='/prompt_manager/vocabulary/tags')).toHaveLength(1);
+});
+
+// #415: a restore the page sees finish while Create tag is open keeps the dialog and its entries; the page is shown
+// again from the restored data only once the dialog has closed.
+test('a restore seen finishing keeps an open dialog and reloads the page after it closes',async({page,request})=>{
+    const saved=await backup(request);
+    await expect(await request.put('/prompt_manager/tags/mist',{data:{new_name:'fog'}})).toBeOK();
+    const restoreRun=await followRestore(page);const writes=trackWrites(page);await openPage(page);
+    await expect(page.locator('#activity-pill')).toHaveAttribute('href',SEEN_RESTORE_PILL);
+    await expect(tagRow(page,'fog')).toHaveCount(1);
+    const box=await openDialog(page,main(page).getByRole('button',{name:'+ Create tag',exact:true}),'Create tag');
+    await field(box,'Tag name').fill('sunrise');
+    await expect(await request.post('/prompt_manager/restore',{multipart:{database_file:{name:'vocabulary.db',mimeType:'application/octet-stream',buffer:saved}}})).toBeOK();
+    await restoreRun.finish();
+    await expect(toast(page)).toHaveText(SEEN_RESTORE_TOAST);
+    await expect(box).toBeVisible();await expect(field(box,'Tag name')).toHaveValue('sunrise');
+    await expect(tagRow(page,'fog')).toHaveCount(1);
+    await button(box,'Apply').click();
+    await expect(note(box)).toHaveText('Prompt storage was restored since this dialog opened. Nothing was changed.');
+    expect(await actionNames(box)).toEqual(['Reload','Cancel','Apply']);
+    expect(tagNames(await snapshot(request))).not.toContain('sunrise');
+    await button(box,'Cancel').click();await expect(box).toHaveCount(0);
+    await expect(tagRow(page,'mist')).toHaveCount(1);await expect(tagRow(page,'fog')).toHaveCount(0);
+    await expect(main(page).getByRole('heading',{level:1})).toBeFocused();
     expect(writes.filter(write=>write.url==='/prompt_manager/vocabulary/tags')).toHaveLength(1);
 });
 
@@ -486,7 +604,7 @@ test('lost response is outcome-unknown',async({page,request})=>{
 
 // Concept nav links end in their real `.nav-count` once it loads.
 const nav=(page,name)=>page.locator('aside.sidebar nav').getByRole('link',{name:new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?:\\s*[\\d,]+)?$`)});
-const chips=(page,name)=>main(page).locator('article[data-prompt-id] .library-chip').filter({hasText:new RegExp(`^${name}$`)});
+const chips=(page,name)=>main(page).locator('article[data-prompt-id] :is(.card-title, .tags) > .chip').filter({hasText:new RegExp(`^${name}$`)});
 /** Visit the Library so its shelf is cached, then open Rename on blue_hour and start a rename whose PATCH is held. */
 async function heldRename(page) {
     await page.goto('/prompt_manager/workspace#/library');await expect(chips(page,'blue_hour')).toHaveCount(1);
@@ -592,7 +710,7 @@ test('delete confirmation read failure, missing tag and restore keep Delete disa
     await expect(button(box,'Delete')).toBeDisabled();await expect(tagRow(page,'calm').locator('td:nth-child(2)')).toHaveText('2');
     await button(box,'Cancel').click();
 
-    box=await openRename(page,'mist');await restore(request,saved);
+    box=await openRename(page,'mist');await restore(page,request,saved);
     await button(box,'Delete tag…').click();
     await expect(note(box)).toHaveText('Prompt storage was restored since this dialog opened. Nothing was changed.');
     await expect(button(box,'Delete')).toBeDisabled();expect(await actionNames(box)).toEqual(['Reload','Cancel','Delete']);
@@ -662,7 +780,7 @@ const SIZES=[[1600,1100],[390,844]];
 const MOTIONS=['no-preference','reduce'];
 async function openConceptTags(page,theme,motion) {
     await page.emulateMedia({reducedMotion:motion});
-    await page.goto('about:blank');await page.goto(`${concept}#tags`);
+    await page.goto('about:blank');await page.goto(`${concept}#tags`);await mapConceptLayout(page);
     await page.getByRole('combobox',{name:'Theme',exact:true}).selectOption(theme);
     await expect(page.locator('#main h1')).toHaveText('Tags & categories');
 }
@@ -673,6 +791,15 @@ async function openProductionTags(page,theme,motion) {
     await expect(rows(page)).toHaveCount(manifest.tags.length);await expect(categoryRow(page,'Landscapes')).toHaveCount(1);
 }
 const pageOf=(page,production)=>page.locator(production?'#workspace-main':'#main').evaluate(pageInventoryOf);
+/** D149 donor: the concept's own page toolbar (Prompt library), whose search field and select the tag search reuses. */
+async function conceptToolbar(page,theme) {
+    await page.goto('about:blank');await page.goto(`${concept}#library`);
+    await page.getByRole('combobox',{name:'Theme',exact:true}).selectOption(theme);
+    const inventory=await page.locator('#main search.toolbar').evaluate(toolbarInventoryOf);
+    await page.goto('about:blank');await page.goto(`${concept}#tags`);await mapConceptLayout(page);await page.getByRole('combobox',{name:'Theme',exact:true}).selectOption(theme);
+    return inventory;
+}
+const tagToolbar=page=>page.locator('#workspace-main .two-col > section.surface:first-child > search.toolbar').evaluate(toolbarInventoryOf);
 /** Breadcrumb, document title (D7: "Tags", only the concept suffix differs) and the keyboard focus ring on a row action. */
 async function chromeOf(page,production) {
     const scope=page.locator(production?'#workspace-main':'#main');
@@ -692,7 +819,7 @@ async function chromeOf(page,production) {
 }
 /** Concept rows are the concept's own sample tags; production appends the fixture-only tags after them (D4 creation order). */
 function comparePage(reference,actual) {
-    const expected=mapVocabularyConcept(reference);
+    const expected=mapVocabularyConcept(reference,{},d149Of(actual));
     const shared=expected.table.rows.length;
     return {diff:diffInventory(expected,{...actual,table:{...actual.table,rows:actual.table.rows.slice(0,shared)}}),
         extra:actual.table.rows.slice(shared).map(row=>row.tag)};
@@ -705,13 +832,18 @@ for(const [width,height] of SIZES)for(const theme of ['dark','light'])test(`tags
         await openConceptTags(page,theme,motion);const reference=await pageOf(page,false);
         if(motion==='no-preference')await captureCanonicalState(page,testInfo,`concept-tags-${width}-${theme}`,'#main');
         const referenceChrome=await chromeOf(page,false);
+        const referenceTools=await conceptToolbar(page,theme);
         await openProductionTags(page,theme,motion);const actual=await pageOf(page,true);
+        const actualTools=await tagToolbar(page);
         if(motion==='no-preference')await captureCanonicalState(page,testInfo,`production-tags-${width}-${theme}`,'#workspace-main');
-        result[motion]={reference,actual,...comparePage(reference,actual),referenceChrome,actualChrome:await chromeOf(page,true)};
+        result[motion]={reference,actual,...comparePage(reference,actual),referenceChrome,actualChrome:await chromeOf(page,true),
+            toolbarDiff:diffInventory(referenceTools,actualTools)};
     }
     const path=testInfo.outputPath('tags-geometry.json');await writeFile(path,JSON.stringify(result,null,2));
     await testInfo.attach('tags-geometry',{path,contentType:'application/json'});
-    for(const [motion,{reference,diff,extra,referenceChrome,actualChrome}] of Object.entries(result)) {
+    for(const [motion,{reference,diff,extra,referenceChrome,actualChrome,toolbarDiff}] of Object.entries(result)) {
+        // D149 (#444): the tag search and sort carry the concept page toolbar's tokens.
+        expect.soft(toolbarDiff,`${motion} tag search and sort against the concept toolbar`).toEqual([]);
         expect.soft(referenceChrome,`${motion} concept chrome`).toMatchObject({breadcrumb:'Tags',title:'Tags',ring:{visible:true},linkRing:{outlineOffset:'3px'}});
         expect.soft(actualChrome,`${motion} breadcrumb, title and focus ring`).toEqual(referenceChrome);
         expect.soft(reference.heading.actions.buttons.map(item=>item.text),`${motion} concept heading actions`).toEqual(['+ Create tag','Auto-tag images']);
@@ -781,6 +913,13 @@ test('mutation check: the comparison reports a changed surface padding and a cha
     expect(paths).toContain('surfaces.1.paddingLeft');
     expect(paths).toContain('table.rows.0.actions.0');
     expect(paths).toContain('table.rowActions.buttons.0.text');
+    // D149: a moved Untagged prompts row and a restyled tag search are reported too.
+    await page.addStyleTag({content:'.vocabulary-main .surface > .operation{margin-top:6px!important}.vocabulary-tools .search-field{border-radius:9px!important}'});
+    const moved=comparePage(reference,await pageOf(page,true)).diff.map(item=>item.path);
+    expect(moved).toContain('d149.offset');
+    const tools=await conceptToolbar(page,'dark');await openProductionTags(page,'dark','no-preference');
+    await page.addStyleTag({content:'.vocabulary-tools .search-field{border-radius:9px!important}'});
+    expect(diffInventory(tools,await tagToolbar(page)).map(item=>item.path)).toContain('field.borderTopLeftRadius');
     // The dialog comparison is not vacuous either: a removed Cancel and a recolored field are reported.
     const donors=await conceptDonors(page,'dark');
     await openConceptTags(page,'dark','no-preference');await conceptDialogs.create(page);
@@ -798,7 +937,7 @@ test('mutation check: the comparison reports a changed surface padding and a cha
 // Task A2: the workspace loads the verbatim concept stylesheet as its base and one overlay last; the screen and its
 // dialogs must stay equal to the concept with the retired vocabulary and editor sheets gone.
 const CONCEPT_BASE=['js/shared/toolkit/controls.css','lib/viewerjs/viewer.min.css','js/workspace/concept.css',
-    'js/workspace/images.css','js/workspace/library.css','js/workspace/inspector.css','js/workspace/workspace.css'];
+    'js/workspace/workspace.css'];
 const loadedSheets=page=>page.evaluate(()=>[...document.styleSheets].filter(sheet=>sheet.href).map(sheet=>new URL(sheet.href).pathname.replace(/^\/prompt_manager\//,'')));
 for(const [width,height,theme] of [[1600,1100,'dark'],[390,844,'light']])test(`concept base keeps the tags screen and editor dialogs equal to the concept ${width} ${theme}`,async({page})=>{
     await page.setViewportSize({width,height});

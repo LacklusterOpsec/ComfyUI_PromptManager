@@ -9,18 +9,53 @@ import math
 import sqlite3
 import os
 import threading
-import tempfile
 import weakref
 from contextlib import closing
 from pathlib import Path
 from typing import Optional, Set, Tuple
 
+from .managed_connection import (
+    ManagedConnection,
+    await_closed,
+    retire_connections,
+)
+from . import restore_stage
 from .library_schema import library_schema_error, migrate_library_state
 from .image_favorites import image_favorites_schema_error, migrate_image_favorites
+from .image_collections import (
+    image_collections_schema_error,
+    migrate_image_collections,
+)
+from .annotation_schema import annotation_schema_error, migrate_annotation_state
+from .autotag_schema import (
+    autotag_schema_error,
+    autotag_without_annotations_error,
+    migrate_autotag_state,
+)
+from .review_schema import (
+    migrate_review_state,
+    review_schema_error,
+    review_without_annotations_error,
+)
+from .saved_views import migrate_saved_views, saved_views_schema_error
+
+try:
+    from ..utils.hashing import register_prompt_functions
+except ImportError:
+    from utils.hashing import register_prompt_functions
+from .image_categories import image_categories_schema_error, migrate_image_categories
+from .image_removal_schema import image_removals_schema_error, migrate_image_removals
+from .prompt_archive import migrate_prompt_archive, prompt_archive_schema_error
+from .workflow_documents import (
+    DOCUMENT_ID_COLUMNS,
+    migrate_workflow_documents,
+    workflow_documents_schema_error,
+)
+
+
 from .execution_history_schema import (
     history_schema_error,
     migrate_execution_history,
-    rotate_history_epoch,
 )
 
 # Import logging system
@@ -41,6 +76,19 @@ ISO_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%f+00:00"
 
 MAX_PAIR_PROVENANCE_LENGTH = 4_000_000
 MAX_PAIR_PROVENANCE_DEPTH = 64
+
+
+def _refuse_rebuild_with_documents(columns) -> None:
+    """The legacy generated_images rebuilds copy a fixed column list.
+
+    A file that needs one (``prompt_id`` TEXT, no ``file_path``) but already
+    has the workflow document ids would lose them, so it is refused.
+    """
+    if any(column in columns for column in DOCUMENT_ID_COLUMNS):
+        raise sqlite3.DatabaseError(
+            "This database needs an old image table rebuild but already has "
+            "workflow document references; the rebuild would drop them"
+        )
 
 
 def pair_provenance_error(encoded: object) -> Optional[str]:
@@ -112,12 +160,15 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     (common on Windows) let other writers' polling busy handlers starve past
     BUSY_TIMEOUT_SECONDS and fail with "database is locked" (#242). Without
     WAL (for example an in-memory database) SQLite's FULL default is kept.
+    It also registers the prompt-key SQL functions (register_prompt_functions).
     """
     journal_mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_SECONDS * 1000}")
     if str(journal_mode).lower() == "wal":
         conn.execute("PRAGMA synchronous = NORMAL")
+    # History reads and the live-hint rule call Python's prompt key (#460)
+    register_prompt_functions(conn)
 
 
 class PromptModel:
@@ -300,6 +351,29 @@ class PromptModel:
         migrate_execution_history(conn)
         migrate_library_state(conn)
         migrate_image_favorites(conn)
+        migrate_saved_views(conn)
+        migrate_image_collections(conn)
+        # A review group without its annotation group is refused before the
+        # annotation install could make it look valid (catalog only; the rows
+        # are validated once, in migrate_review_state).
+        review_error = review_without_annotations_error(conn)
+        if review_error:
+            raise sqlite3.DatabaseError(review_error)
+        # The auto-tag marks cite annotation bytes the same way (#379).
+        autotag_error = autotag_without_annotations_error(conn)
+        if autotag_error:
+            raise sqlite3.DatabaseError(autotag_error)
+        migrate_annotation_state(conn)
+        migrate_review_state(conn)
+        migrate_autotag_state(conn)
+        # Image categories (#332): independent of every table above.
+        migrate_image_categories(conn)
+        # The Library parent archive (#443): independent of every table above.
+        migrate_prompt_archive(conn)
+        # Removal marks (#480): independent of every table above.
+        migrate_image_removals(conn)
+        # Last: the older generated_images rebuilds run only before file_path.
+        migrate_workflow_documents(conn)
 
     def _migrate_prompt_pairs(self, conn: sqlite3.Connection) -> None:
         conn.execute("SAVEPOINT prompt_pair_schema")
@@ -512,7 +586,10 @@ class PromptModel:
             "WHERE pp.positive_prompt_id IS NOT gi.prompt_id LIMIT 1"
         ).fetchone():
             return "Image pair association has a different positive prompt owner"
-        for row in conn.execute("SELECT provenance FROM image_prompt_pairs"):
+        # fetchone, not iteration: a managed connection's cursor prefetches
+        # ITER_CHUNK rows when iterated, and each provenance may be ~4 MB.
+        cursor = conn.execute("SELECT provenance FROM image_prompt_pairs")
+        while (row := cursor.fetchone()) is not None:
             error = pair_provenance_error(row[0])
             if error:
                 return error
@@ -571,18 +648,41 @@ class PromptModel:
         if conn is not None and self._local.generation == self._generation:
             return conn
 
-        # check_same_thread=False only so close_all can clean up other
-        # threads' connections; each connection is still used by one thread.
-        conn = sqlite3.connect(
-            self.db_path, check_same_thread=False, timeout=BUSY_TIMEOUT_SECONDS
-        )
-        conn.row_factory = sqlite3.Row
-        configure_connection(conn)
+        while True:
+            # The path and generation are read together, and the new
+            # connection is kept only if no Move library repointed the model
+            # meanwhile: otherwise it would write to the old file.
+            with self._conn_lock:
+                path, generation = self.db_path, self._generation
+            # check_same_thread=False only so close_all and Move library can
+            # retire other threads' connections; each connection is still
+            # used by one thread, and ManagedConnection never closes it under
+            # a running statement (see managed_connection).
+            conn = sqlite3.connect(
+                path,
+                check_same_thread=False,
+                timeout=BUSY_TIMEOUT_SECONDS,
+                factory=ManagedConnection,
+            )
+            try:
+                conn.row_factory = sqlite3.Row
+                configure_connection(conn)
+            except BaseException:
+                conn.close()
+                raise
+            with self._conn_lock:
+                if generation == self._generation:
+                    self._connections.add(conn)
+                    break
+            conn.close()
         self._local.conn = conn
-        self._local.generation = self._generation
-        with self._conn_lock:
-            self._connections.add(conn)
+        self._local.generation = generation
         return conn
+
+    @property
+    def generation(self) -> int:
+        """Bumped whenever every connection is closed or the model repointed."""
+        return self._generation
 
     @classmethod
     def close_all_instances(cls) -> None:
@@ -592,22 +692,76 @@ class PromptModel:
         for model in models:
             model.close_all()
 
+    @classmethod
+    def repoint_instances(cls, old_path: str, new_path: str) -> list:
+        """Point every model of ``old_path`` at ``new_path`` (Move library).
+
+        Every thread opens the new file on its next ``get_connection``. The
+        old connections are detached, not closed, and returned: the caller
+        retires them (``retire_detached``) while it still holds the old
+        file's write lock. A write waiting on that lock is then interrupted
+        and can never commit, so it fails (and, through
+        ``PromptDatabase.survive_library_switch``, runs again on the new file).
+        """
+        old_key = os.path.normcase(os.path.realpath(old_path))
+        with cls._instances_lock:
+            models = list(cls._instances)
+        with cls._init_lock:
+            cls._initialized_paths.add(os.path.normcase(os.path.realpath(new_path)))
+        detached = []
+        for model in models:
+            if model._schema_key() == old_key:
+                detached.extend(model._detach_connections(new_path))
+        return detached
+
+    @staticmethod
+    def retire_detached(connections, logger=None) -> list:
+        """Retire detached connections without waiting for their owners.
+
+        Idle ones close now. One whose owner thread is inside a statement is
+        never closed from here (that frees memory the owner is using: an
+        access violation on Windows); it is interrupted, refuses to commit and
+        is closed by its owner as the statement ends. Returns those still
+        open, for ``await_detached`` once no lock the owners wait on is held.
+        """
+        return retire_connections(connections, logger)
+
+    @staticmethod
+    def await_detached(connections, logger=None) -> bool:
+        """Wait until retired connections are closed; False if some are not."""
+        return await_closed(connections, BUSY_TIMEOUT_SECONDS, logger)
+
+    @staticmethod
+    def close_detached(connections, logger=None) -> bool:
+        """Retire connections ``repoint_instances`` detached and await them.
+
+        Do not call it while holding a lock their owners may wait on; retire
+        them there (``retire_detached``) and await them after releasing it.
+        """
+        pending = retire_connections(connections, logger)
+        return await_closed(pending, BUSY_TIMEOUT_SECONDS, logger)
+
     def close_all(self) -> None:
         """Close every thread's connection; they reopen lazily on next use.
 
         Needed before deleting the database file (Windows keeps open files
         locked) and by tests that ran queries through executor threads.
         """
+        self.close_detached(self._detach_connections(), self.logger)
+
+    def _detach_connections(self, new_path: Optional[str] = None) -> list:
+        """Forget every connection (optionally pointing the model elsewhere).
+
+        Returns them for the caller to close; threads reopen on next use.
+        """
         with self._conn_lock:
+            if new_path is not None:
+                self.db_path = new_path
             connections = list(self._connections)
             self._connections.clear()
             self._generation += 1
         self._local.conn = None
-        for conn in connections:
-            try:
-                conn.close()
-            except sqlite3.Error as e:
-                self.logger.warning(f"Error closing database connection: {e}")
+        return connections
 
     def close(self) -> None:
         """Close the calling thread's connection, if it has one.
@@ -621,10 +775,7 @@ class PromptModel:
         self._local.conn = None
         with self._conn_lock:
             self._connections.discard(conn)
-        try:
-            conn.close()
-        except sqlite3.Error as e:
-            self.logger.warning(f"Error closing database connection: {e}")
+        self.close_detached([conn], self.logger)
 
     def _migrate_workflow_name_removal(self, conn: sqlite3.Connection) -> None:
         """
@@ -695,6 +846,7 @@ class PromptModel:
             columns = {column[1]: column[2] for column in cursor.fetchall()}
             if columns.get("prompt_id") != "TEXT":
                 return
+            _refuse_rebuild_with_documents(columns)
 
             self.logger.info("Migrating foreign key types: prompt_id TEXT -> INTEGER")
             with self._table_rebuild(conn):
@@ -860,6 +1012,7 @@ class PromptModel:
             }
             if "file_path" in columns:
                 return
+            _refuse_rebuild_with_documents(columns)
 
             self.logger.info("Migrating database: image uniqueness by full path")
             with self._table_rebuild(conn):
@@ -925,6 +1078,10 @@ class PromptModel:
 
         Reclaims unused space and defragments the database file,
         improving query performance and reducing file size.
+
+        Raises:
+            Exception: whatever stopped VACUUM (logged first); the database is
+            then unchanged.
         """
         try:
             with closing(sqlite3.connect(self.db_path)) as conn:
@@ -932,6 +1089,7 @@ class PromptModel:
                 conn.commit()
         except Exception as e:
             self.logger.error(f"Error vacuuming database: {e}")
+            raise
 
     def get_database_info(self) -> dict:
         """
@@ -1008,7 +1166,7 @@ class PromptModel:
 
     @staticmethod
     def verify_database_file(
-        path: str, *, require_library_state: bool = False
+        path: str, *, require_library_state: bool = False, documents: bool = True
     ) -> Tuple[bool, str]:
         """
         Check that a file is a healthy prompts database before restoring it.
@@ -1019,8 +1177,13 @@ class PromptModel:
         Args:
             path: File to inspect
             require_library_state: Also require the tables every current
-                database has (Library state and image favorites), as a
-                migrated restore stage must; old backups may lack them.
+                database has (Library state, image favorites, image
+                categories, saved views, collections, image annotations and
+                the review queue), as a migrated
+                restore stage must; old backups may lack them.
+            documents: Read every workflow document and refuse a damaged
+                one. A restore checks its upload without it and repairs
+                damaged documents on the stage (``database/restore_stage.py``).
 
         Returns:
             (ok, reason): reason is "ok" when the file is acceptable, otherwise
@@ -1080,6 +1243,51 @@ class PromptModel:
             )
             if favorites_error:
                 return False, favorites_error
+            categories_error = image_categories_schema_error(
+                conn, allow_missing=not require_library_state
+            )
+            if categories_error:
+                return False, categories_error
+            archive_error = prompt_archive_schema_error(
+                conn, allow_missing=not require_library_state
+            )
+            if archive_error:
+                return False, archive_error
+            removals_error = image_removals_schema_error(
+                conn, allow_missing=not require_library_state
+            )
+            if removals_error:
+                return False, removals_error
+            views_error = saved_views_schema_error(
+                conn, allow_missing=not require_library_state
+            )
+            if views_error:
+                return False, views_error
+            collections_error = image_collections_schema_error(
+                conn, allow_missing=not require_library_state
+            )
+            if collections_error:
+                return False, collections_error
+            annotation_error = annotation_schema_error(
+                conn, allow_missing=not require_library_state
+            )
+            if annotation_error:
+                return False, annotation_error
+            review_error = review_schema_error(
+                conn, allow_missing=not require_library_state
+            )
+            if review_error:
+                return False, review_error
+            autotag_error = autotag_schema_error(
+                conn, allow_missing=not require_library_state
+            )
+            if autotag_error:
+                return False, autotag_error
+            documents_error = workflow_documents_schema_error(
+                conn, allow_missing=not require_library_state, documents=documents
+            )
+            if documents_error:
+                return False, documents_error
             return True, "ok"
         except sqlite3.Error as e:
             return False, f"Invalid SQLite database: {e}"
@@ -1102,21 +1310,51 @@ class PromptModel:
             Path(src_path).resolve().as_uri() + "?mode=ro", uri=True
         )
         try:
-            source.backup(self.get_connection())
+            target = self.get_connection()
+            # The target is written under backup's step too: mark it in use
+            # so a concurrent close_all retires it instead of closing it.
+            with target.using():
+                source.backup(target)
         finally:
             source.close()
+
+    def stage_restore(self, src_path: str):
+        """Stage ``src_path`` beside this database for a restore (blocking).
+
+        Returns a ``StagedRestore`` (``database/restore_stage.py``): a
+        migrated, repaired and verified copy in the library's folder, its
+        digest and what it holds. Neither the live database nor the source
+        is touched. Raises ValueError when either does not verify.
+        """
+        return restore_stage.stage_restore(PromptModel, self.db_path, src_path)
+
+    def publish_staged(self, staged) -> str:
+        """Replace the live database with ``staged``; return the safety backup.
+
+        See ``restore_stage.publish_staged``: the staged bytes are rechecked,
+        the current database is kept as ``<db_path>.backup_<stamp>`` and the
+        WAL is truncated afterwards.
+        """
+        backup_path = restore_stage.publish_staged(self, staged)
+        self.logger.info("Database restored from a staged copy")
+        from .execution_history import notify_history_restore
+
+        notify_history_restore(self.db_path)
+        return backup_path
 
     def restore_from_file(self, src_path: str) -> str:
         """
         Replace the live database with the file at src_path.
 
-        A disposable SQLite backup of the source is migrated and verified first.
-        Only then is the current database backed up next to itself as
-        ``<db_path>.backup_<YYYYmmdd_HHMMSS>`` (WAL content included), and the
-        staged pages replace the live pages through SQLite's backup API.
-        Migration failures never replace live content or modify the source.
-        An online replacement failure leaves the live database intact and
-        propagates; the completed safety backup remains available.
+        ``stage_restore`` then ``publish_staged``: a disposable copy of the
+        source is migrated, repaired and verified in the library's folder
+        first. Only then is the current database backed up next to itself as
+        ``<db_path>.backup_<YYYYmmdd_HHMMSS_ffffff>`` (WAL content included),
+        and the staged pages replace the live pages through SQLite's backup
+        API. Staging failures never replace live content or modify the
+        source. An online replacement failure leaves the live database intact
+        and propagates; the completed safety backup remains available. The
+        stage is removed either way.
 
         Args:
             src_path: SQLite file to restore
@@ -1126,55 +1364,14 @@ class PromptModel:
             there was no database to back up.
 
         Raises:
-            RuntimeError: If the previous database could not be backed up
+            ValueError: If the source or its migrated copy does not verify
+            SafetyBackupFailed: If the previous database could not be backed up
             sqlite3.OperationalError: If SQLite refuses online replacement
         """
-        ok, reason = self.verify_database_file(src_path)
-        if not ok:
-            raise ValueError(reason)
-        with tempfile.TemporaryDirectory(prefix="prompt-manager-restore-") as directory:
-            staged_path = str(Path(directory) / "staged.db")
-            source = sqlite3.connect(
-                Path(src_path).resolve().as_uri() + "?mode=ro", uri=True
-            )
-            try:
-                with closing(sqlite3.connect(staged_path)) as destination:
-                    source.backup(destination)
-            finally:
-                source.close()
-            staged = None
-            try:
-                staged = PromptModel(staged_path)
-                rotate_history_epoch(staged.get_connection())
-                ok, reason = self.verify_database_file(
-                    staged_path, require_library_state=True
-                )
-                if not ok:
-                    raise ValueError(reason)
-                staged.close_all()
-                backup_path = ""
-                if os.path.exists(self.db_path):
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    backup_path = f"{self.db_path}.backup_{timestamp}"
-                    if not self.backup_database(backup_path):
-                        raise RuntimeError("Could not back up the current database")
-                    self.logger.info(f"Current database backed up to: {backup_path}")
-                try:
-                    self._replace_contents_from(staged_path)
-                except sqlite3.OperationalError as exc:
-                    exc._prompt_manager_restore_backup_created = bool(backup_path)
-                    raise
-                with PromptModel._init_lock:
-                    PromptModel._initialized_paths.add(self._schema_key())
-                self.logger.info(f"Database restored from {src_path}")
-                from .execution_history import notify_history_restore
-
-                notify_history_restore(self.db_path)
-                return backup_path
-            finally:
-                if staged is not None:
-                    staged.close_all()
-                with PromptModel._init_lock:
-                    PromptModel._initialized_paths.discard(
-                        os.path.normcase(os.path.realpath(staged_path))
-                    )
+        staged = self.stage_restore(src_path)
+        try:
+            backup_path = self.publish_staged(staged)
+        finally:
+            staged.discard()
+        self.logger.info(f"Database restored from {src_path}")
+        return backup_path

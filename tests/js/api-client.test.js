@@ -236,6 +236,35 @@ test("latestOnly: errors from the current call propagate, errors from superseded
     assert.equal(await first, STALE);
 });
 
+test("latestOnly with a lifetime: once it ends, no request starts and the call is STALE", async () => {
+    const fetch = fakeFetch();
+    const api = createApiClient(fetch);
+    const page = new AbortController();
+    const latest = latestOnly({ lifetime: page.signal });
+    page.abort();
+    assert.equal(await latest((signal) => api.get("/recent", { signal })), STALE);
+    assert.equal(fetch.calls.length, 0, "a leaving page starts no read");
+});
+
+test("latestOnly with a lifetime: its end aborts the request in flight, which is STALE, not an error", async () => {
+    const fetch = fakeFetch();
+    const api = createApiClient(fetch);
+    const page = new AbortController();
+    const latest = latestOnly({ lifetime: page.signal });
+    const call = latest((signal) => api.get("/recent", { signal }));
+    page.abort();
+    assert.equal(fetch.calls[0].aborted, true, "the read in flight is aborted");
+    fetch.calls[0].reject(new DOMException("The operation was aborted.", "AbortError"));
+    assert.equal(await call, STALE);
+});
+
+test("latestOnly with a lifetime: real errors still propagate while the page lives", async () => {
+    const page = new AbortController();
+    const latest = latestOnly({ lifetime: page.signal });
+    await assert.rejects(latest(async () => { throw new Error("server down"); }), /server down/);
+    assert.equal(await latest(async () => "fine"), "fine");
+});
+
 test("ApiError exposes only validated history recovery actions on all error paths", async () => {
     const permitted = [null, { action: "refresh-history" }, { action: "reload-outputs" },
         { action: "retry-read" }, { action: "smaller-limit", limit: 1 },
@@ -295,4 +324,85 @@ test("get forwards an explicit cache mode and keeps the default request otherwis
     assert.equal("cache" in fetch.calls[2].init, false, "only reads take a cache mode");
     fetch.calls[2].resolve(jsonResponse(200, { success: true }));
     await writes;
+});
+
+test("ApiError exposes only a validated current tag set from a tag-conflict body", async () => {
+    const permitted = [{ tags: [], tag_revision: 0 }, { tags: ["warm", "Dune"], tag_revision: 7 }];
+    const denied = [undefined, null, { tags: ["a"] }, { tag_revision: 1 }, { tags: "a", tag_revision: 1 },
+        { tags: [1], tag_revision: 1 }, { tags: ["a"], tag_revision: -1 }, { tags: ["a"], tag_revision: 1.5 },
+        { tags: ["a"], tag_revision: true }, { tags: Array(101).fill("a"), tag_revision: 1 }];
+    assert.equal(new ApiError(409, "old caller").current, null);
+    for (const current of permitted.concat(denied)) {
+        const api = createApiClient(async () => jsonResponse(409, {
+            success: false, error: "changed", code: "tag-conflict", ...(current || {}),
+        }));
+        await assert.rejects(api.put("/x", {}), error => {
+            assert.ok(error instanceof ApiError);
+            assert.deepEqual(error.current, permitted.includes(current) ? current : null);
+            if (permitted.includes(current)) assert.notEqual(error.current.tags, current.tags, "server arrays must be copied");
+            return true;
+        });
+    }
+});
+
+test("keepalive is forwarded only when asked, so a request can outlive its page", async () => {
+    const fetch = fakeFetch();
+    const api = createApiClient(fetch);
+    const writes = [api.del("/x", { keepalive: true }), api.put("/x", {}, { keepalive: true }), api.post("/x", {}, { keepalive: true }),
+        api.del("/x"), api.put("/x", {}), api.get("/x")];
+    assert.deepEqual(fetch.calls.map(call => call.init.keepalive), [true, true, true, undefined, undefined, undefined]);
+    assert.equal("keepalive" in fetch.calls[3].init, false);
+    for (const call of fetch.calls) call.resolve(jsonResponse(200, { success: true }));
+    await Promise.all(writes);
+});
+
+test("ApiError keeps the job that applied a used plan (plan-used, System S7)", () => {
+    const body = { job: { id: "b".repeat(32), title: "Optimize database" } };
+    const used = new ApiError(409, "This plan was already applied.", "plan-used", null, body);
+    assert.deepEqual(used.job, { id: "b".repeat(32), title: "Optimize database" });
+    assert.notEqual(used.job, body.job, "server objects must be copied");
+    // The applying job may already be pruned: its title is null, its id still links Activity.
+    assert.deepEqual(new ApiError(409, "used", "plan-used", null, { job: { id: "c".repeat(32), title: null } }).job,
+        { id: "c".repeat(32), title: null });
+    assert.equal(new ApiError(409, "busy", "busy", null, body).job, null);
+    for (const job of [null, "x", { id: 1, title: "t" }, { id: "a b", title: "t" }, { id: "a", title: 7 },
+        { id: "a", title: "x".repeat(201) }, { id: "a".repeat(65), title: "t" }]) {
+        assert.equal(new ApiError(409, "used", "plan-used", null, { job }).job, null);
+    }
+});
+
+test("ApiError keeps a validated running job on busy and a validated source on invalid-source", () => {
+    const body = { running: { id: "a".repeat(32), title: "Scan for metadata" }, source: "output/gone" };
+    const busy = new ApiError(409, "busy", "busy", null, body);
+    assert.deepEqual([busy.running, busy.source], [{ id: "a".repeat(32), title: "Scan for metadata" }, null]);
+    assert.notEqual(busy.running, body.running, "server objects must be copied");
+    const invalid = new ApiError(400, "refused", "invalid-source", null, body);
+    assert.deepEqual([invalid.running, invalid.source], [null, "output/gone"]);
+    for (const running of [null, "x", { id: 1, title: "t" }, { id: "a b", title: "t" }, { id: "a", title: "" },
+        { id: "a", title: "x".repeat(201) }, { id: "a".repeat(65), title: "t" }]) {
+        assert.equal(new ApiError(409, "busy", "busy", null, { running }).running, null);
+    }
+    for (const source of [null, 7, "", "x".repeat(4097)]) {
+        assert.equal(new ApiError(400, "refused", "invalid-source", null, { source }).source, null);
+    }
+    assert.deepEqual([new ApiError(409, "old caller").running, new ApiError(409, "old caller").source], [null, null]);
+});
+
+test("ApiError keeps a validated operation on model-busy only (#328)", () => {
+    const body = { operation: "Tagging model download · WD14 ViT" };
+    assert.equal(new ApiError(409, "busy", "model-busy", null, body).operation, "Tagging model download · WD14 ViT");
+    assert.equal(new ApiError(409, "busy", "busy", null, body).operation, null);
+    for (const operation of [null, 7, "", "x".repeat(201)]) {
+        assert.equal(new ApiError(409, "busy", "model-busy", null, { operation }).operation, null);
+    }
+    assert.equal(new ApiError(409, "busy", "model-busy").operation, null);
+});
+
+test("ApiError says whether the server itself refused (a parsed success:false body; S7 review I1)", () => {
+    assert.equal(new ApiError(400, "bad", null, null, { success: false, error: "bad" }).refused, true);
+    assert.equal(new ApiError(409, "busy", "busy", null, { success: false, code: "busy" }).refused, true);
+    // A proxy's page, a body that was not JSON, or no body at all: nothing says the server refused.
+    for (const body of [null, undefined, "<html>", { success: true }, [], { error: "x" }]) {
+        assert.equal(new ApiError(504, "Gateway Timeout", null, null, body).refused, false);
+    }
 });

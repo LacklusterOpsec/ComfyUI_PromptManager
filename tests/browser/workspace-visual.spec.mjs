@@ -3,12 +3,13 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { captureCanonicalState, historyGeometry, compareCanonicalHistory, nativeDialogState, exerciseCurrentPairSend, assertRecordedHistory } from './history-canonical-comparison.mjs';
 import { startCoverage, saveCoverage } from '../../tools/vendor/browser-coverage.mjs';
-import { test, expect } from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import { test, expect } from './fixtures.mjs';
+import { startInGrid } from './concept-inventory.mjs';
 
 test.use({ locale: 'en-US', timezoneId: 'UTC', reducedMotion: 'reduce' });
 const workspace = '/prompt_manager/workspace';
 const primary = ['images', 'library', 'tags', 'inspect'];
-const tools = ['system', 'overview'];
+const tools = ['activity', 'system', 'overview'];
 
 async function noOverflow(page) {
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
@@ -29,7 +30,7 @@ async function attachEvidence(page, testInfo, name, fullPage = true) {
     const screenshotPath = testInfo.outputPath(`${name}.png`);
     await page.screenshot({ path: screenshotPath, fullPage });
     await testInfo.attach(name, { path: screenshotPath, contentType: 'image/png' });
-    const geometry = await page.evaluate(() => Object.fromEntries(['.sidebar', '.topbar', '#workspace-main', '.heading', 'h1', '.image-workspace', '.image-grid', '.media-card', '.image-details', '.prompt-block-heading', '.library-toolbar', '.library-grid', '.library-card', '.library-card-art', '.library-card-content'].map(selector => {
+    const geometry = await page.evaluate(() => Object.fromEntries(['.sidebar', '.topbar', '#workspace-main', '.heading', 'h1', '.image-workspace', '.image-grid', '.media-card', '.detail-panel', '.prompt-heading', '.library-grid', '.prompt-card', '.prompt-card .card-art', '.prompt-card .card-content'].map(selector => {
         const node = document.querySelector(selector);
         if (!node) return [selector, null];
         const box = node.getBoundingClientRect(), style = getComputedStyle(node);
@@ -94,23 +95,24 @@ for (const [width, height] of [[1600, 1100], [390, 844]]) for (const theme of ['
         await page.goto(`${workspace}#/library/${fixture.canonical_id}`);
         await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption(theme);
         const details = await (await request.get(`/prompt_manager/library/${fixture.canonical_id}`)).json();
-        const index = details.variants.findIndex(variant => variant.id === fixture.canonical_pair);
-        const choice = page.getByRole('button', { name: `Select negative variant ${index + 1}`, exact: true });
+        const pairTitle = details.variants.find(variant => variant.id === fixture.canonical_pair).title;
+        const choice = page.getByRole('button', { name: `Select negative ${pairTitle}`, exact: true });
         await choice.focus();await page.keyboard.press('Enter');await expect(choice).toHaveAttribute('aria-pressed', 'true');
         const actual = await historyGeometry(page, true);
         const roles = page.getByRole('region', { name: 'Saved prompt texts', exact: true });
         const positive = roles.getByRole('region', { name: 'Positive prompt', exact: true });
         expect(await positive.evaluate(node => node.nextElementSibling?.getAttribute('aria-label'))).toBe('Negative prompt');
-        for (const name of ['Copy positive prompt', 'Send positive prompt', 'Copy negative prompt', 'Send negative prompt']) await expect(roles.getByRole('button', { name, exact: true })).toBeVisible();
+        const title = await page.locator('#workspace-main > .heading h1').textContent();
+        for (const name of ['Copy positive prompt', 'Send positive prompt to ComfyUI', 'Copy negative prompt', 'Send negative prompt to ComfyUI']) await expect(roles.getByRole('button', { name: `${name}: ${title}`, exact: true })).toBeVisible();
         // As in the concept, the selected pair's send sits in the history heading, not among the saved texts.
         await expect(roles.getByRole('button', { name: 'Send prompt pair', exact: true })).toHaveCount(0);
         await expect(page.locator('#workspace-main > .heading button.send')).toBeEnabled();
-        await expect(page.locator('.library-shared-gallery article[data-image-key]')).toHaveCount(2);
-        await page.locator('.library-shared-gallery .image-card-actions button').first().click();
-        await expect(page.getByRole('region', { name: 'Image details', exact: true })).toContainText('canonical-alt.png');
-        await page.getByRole('button', { name: 'Open full preview', exact: true }).click();
+        await expect(page.locator('.library-history .history-gallery article[data-image-key]')).toHaveCount(2);
+        await page.locator('.library-history .history-gallery .image-card-actions button:first-child').first().click();
+        await expect(page.getByRole('complementary', { name: 'Selected image details', exact: true })).toContainText('canonical-alt.png');
+        await page.locator('.library-history .history-gallery .media-card.selected .image-open').click();
         await expect(page.locator('dialog#viewer-dialog')).toBeVisible();await page.keyboard.press('Escape');
-        for (const [name, selector] of [['saved', '.library-surface'], ['branches', '.library-variants'], ['gallery', '.library-shared-gallery'], ['chronology', '.recorded-history']]) {
+        for (const [name, selector] of [['saved', '.library-history article.surface'], ['branches', '.library-history .timeline-panel'], ['gallery', '.library-history .history-gallery'], ['chronology', '.recorded-history']]) {
             await captureCanonicalState(page, testInfo, `production-${name}-${width}-${theme}`, selector);
         }
         const run = page.locator(`button[data-run-id="${fixture.canonical_run}"][data-anchor-id="10"]`);
@@ -125,11 +127,15 @@ for (const [width, height] of [[1600, 1100], [390, 844]]) for (const theme of ['
         const viewer = page.locator('dialog#viewer-dialog');await expect(viewer).toBeVisible();
         await expect(viewer.getByRole('region', { name: 'Positive prompt', exact: true })).toContainText(fixture.canonical_positive);
         await expect(viewer.getByRole('region', { name: 'Negative prompt', exact: true })).toContainText(fixture.canonical_negative);
-        for (const name of ['Copy positive prompt', 'Send positive prompt', 'Copy negative prompt', 'Send negative prompt', 'Send prompt pair']) await expect(viewer.getByRole('button', { name, exact: true })).toBeVisible();
+        for (const name of ['Copy positive prompt', 'Send positive prompt to ComfyUI', 'Copy negative prompt', 'Send negative prompt to ComfyUI']) await expect(viewer.getByRole('button', { name: new RegExp(`^${name}: `) })).toBeVisible();
+        await expect(viewer.getByRole('button', { name: /^Send current file prompt pair to ComfyUI: |^Send prompt pair to ComfyUI: / })).toBeVisible();
         await expect(viewer).toContainText('42001');await expect(viewer).toContainText('720');await expect(viewer).toContainText('480');
         const currentPositive = viewer.getByRole('region', { name: 'Positive prompt', exact: true });
-        await currentPositive.getByRole('button', { name: 'Copy positive prompt', exact: true }).click();
-        await expect(currentPositive.getByRole('status')).toContainText(/Copied\.|Copy unavailable/);
+        await currentPositive.getByRole('button', { name: /^Copy positive prompt: / }).click();
+        // The concept's copy outcome: the shared toast, or its "Copy prompt" dialog when the clipboard is refused.
+        const copyFallback = page.getByRole('dialog', { name: 'Copy prompt', exact: true });
+        await expect(page.locator('#workspace-toast').filter({ hasText: 'Prompt copied.' }).or(copyFallback)).toHaveCount(1);
+        if (await copyFallback.isVisible()) { await page.keyboard.press('Escape'); await expect(copyFallback).toBeHidden(); }
         await exerciseCurrentPairSend(page, { positive: fixture.canonical_positive, negative: fixture.canonical_negative });
         await captureCanonicalState(page, testInfo, `production-viewer-${width}-${theme}`, 'dialog#viewer-dialog');
         await page.keyboard.press('Escape');await expect(view).toBeFocused();await page.keyboard.press('Escape');await expect(run).toBeFocused();
@@ -168,7 +174,8 @@ test('visual fixture exposes real stable media and library records', async ({ re
     await expect(await request.get(image.url)).toBeOK();
     const thumbnail = await request.get(image.thumbnail_url);
     await expect(thumbnail).toBeOK();
-    expect(thumbnail.headers()['content-type']).toBe('image/png');
+    // #317: previews are written as WebP by default.
+    expect(thumbnail.headers()['content-type']).toBe('image/webp');
     const inspection = await (await request.get(`/prompt_manager/images/inspect/${encodeURIComponent(image.path)}?root=${image.root_index}`)).json();
     expect(inspection.success).toBe(true);
     expect(inspection.image.path).toBe(image.path);
@@ -242,9 +249,10 @@ test('long content and zoom keep grouped navigation reachable', async ({ page, r
     await text.scrollIntoViewIfNeeded();
     expect((await text.textContent()).length).toBeGreaterThan(1500);
     await text.focus(); await expect(text).toBeFocused();
+    // #249 D23: the card clamps the prompt to two lines; the card content itself never scrolls or overflows.
     expect(await text.evaluate(node => {
-        const scroller = node.closest('.library-card-prompts');
-        return scroller.scrollHeight <= scroller.clientHeight + 1 && node.scrollHeight <= node.clientHeight + 1;
+        const content = node.closest('.card-content');
+        return content.scrollHeight <= content.clientHeight + 1 && content.scrollWidth <= content.clientWidth + 1 && node.scrollHeight > node.clientHeight + 1;
     })).toBe(true);
     await noOverflow(page);
     await page.evaluate(() => { document.documentElement.style.zoom = ''; });
@@ -290,7 +298,7 @@ async function containedImageContent(page) {
         const failures = [];
         for (const card of nodes) {
             const outer = card.getBoundingClientRect();
-            for (const selector of ['.media-info', '.media-info h3', '.media-info p', '.image-card-actions button']) {
+            for (const selector of ['.media-info', '.media-info h3', '.media-info p', '.image-card-actions']) {
                 const node = card.querySelector(selector), box = node.getBoundingClientRect();
                 if (box.width <= 0 || box.height <= 0 || box.left < outer.left - 1 || box.right > outer.right + 1 ||
                     box.top < outer.top - 1 || box.bottom > outer.bottom + 1 ||
@@ -300,7 +308,7 @@ async function containedImageContent(page) {
                         content: { left: box.left, right: box.right, top: box.top, bottom: box.bottom } });
                 }
             }
-            const action = card.querySelector('.image-card-actions button').getBoundingClientRect();
+            const action = card.querySelector('.image-card-actions').getBoundingClientRect();
             const range = document.createRange(); range.selectNodeContents(card.querySelector('.media-info p'));
             for (const text of range.getClientRects()) {
                 if (Math.min(text.right, action.right) - Math.max(text.left, action.left) > .5 &&
@@ -345,9 +353,10 @@ for (const [width, height] of [[390, 844], [1600, 1100]]) for (const layout of [
             const filename = (await longCard.locator('.image-open').getAttribute('aria-label')).replace(/^Open /, '');
             expect(filename).toMatch(/layered-context-.*\.png/);
             // D19: Info selects into the panel; the image itself opens the viewer.
-            await longCard.locator('.image-card-actions button').focus(); await page.keyboard.press('Enter');
-            await expect(page.locator('.image-details h2')).toHaveText(filename);
-            const fullPreview = page.getByRole('button', { name: 'Open full preview', exact: true });
+            await longCard.locator('.image-card-actions button:first-child').focus(); await page.keyboard.press('Enter');
+            await expect(page.locator('.detail-panel .panel-heading h2')).toHaveText(filename);
+            // D19: the card image, not the panel, opens the viewer.
+            const fullPreview = longCard.locator('.image-open');
             await fullPreview.focus(); await expect(fullPreview).toBeFocused(); await page.keyboard.press('Enter');
             await expect(page.locator('dialog#viewer-dialog')).toBeVisible();
             await expect(page.locator('#viewer-title')).toHaveText(filename);
@@ -407,13 +416,15 @@ test('zoomed virtual Images keeps the visible real media mounted during native s
 
 test('supplemental extreme zoom grows real footers preserves the visible anchor and resets reservations', async ({ page, request }) => {
     await request.post('/__test__/reset', { data: { workspace_visual: true } });
+    // The Grid's footer reservations (D157: the default layout is Masonry).
+    await startInGrid(page);
     await page.setViewportSize({ width: 390, height: 844 }); await page.goto(`${workspace}#/images`);
     const cards = page.locator('article[data-image-key]'), grid = page.locator('.image-grid');
     await expect(cards).toHaveCount(24);
     await page.evaluate(() => { document.documentElement.style.zoom = '2'; });
     await expect.poll(() => cards.nth(1).evaluate(node => node.offsetLeft)).toBe(0);
     const selected = cards.nth(16), key = await selected.getAttribute('data-image-key');
-    await selected.locator('.image-card-actions button').click(); await selected.locator('.image-open').focus();
+    await selected.locator('.image-card-actions button:first-child').click(); await selected.locator('.image-open').focus();
     const filename = (await selected.locator('.image-open').getAttribute('aria-label')).replace(/^Open /, '');
     await selected.evaluate(node => scrollBy(0, node.getBoundingClientRect().top - 120));
     await page.evaluate(() => {
@@ -453,7 +464,7 @@ test('supplemental extreme zoom grows real footers preserves the visible anchor 
         expect(Math.abs(anchorTop - anchor.top)).toBeLessThanOrEqual(2);
         await expect(page.locator(`article[data-image-key="${key}"]`)).toHaveClass(/selected/);
         await expect(selected.locator('.image-open')).toBeFocused();
-        await expect(page.locator('.image-details h2')).toHaveText(filename);
+        await expect(page.locator('.detail-panel .panel-heading h2')).toHaveText(filename);
         const mutations = await grid.evaluate(async node => {
             let changes = 0;
             const observer = new MutationObserver(records => { changes += records.length; });
@@ -490,7 +501,7 @@ test('supplemental wrapped real footer reservation survives append without movin
     await page.setViewportSize({ width: 390, height: 844 }); await page.goto(`${workspace}#/images`);
     const cards = page.locator('article[data-image-key]'), grid = page.locator('.image-grid');
     await expect(cards).toHaveCount(40);
-    await cards.first().locator('.image-card-actions button').click();
+    await cards.first().locator('.image-card-actions button:first-child').click();
     const selectedKey = await cards.first().getAttribute('data-image-key');
     await page.evaluate(() => { document.documentElement.style.zoom = '4'; });
     await expect.poll(() => grid.evaluate(node => Number.parseFloat(node.style.getPropertyValue('--image-footer-height')))).toBeGreaterThan(54);
@@ -533,9 +544,9 @@ test('Library visual evidence keeps natural cards and returns from real history 
             await page.getByRole('combobox',{name:'Theme',exact:true}).selectOption(theme);
             await attachEvidence(page,testInfo,`after-library-${width}-${theme}`,false);
             await noOverflow(page);
-            await page.getByRole('link',{name:'Explore history',exact:true}).first().click();
+            await page.getByRole('button',{name:'Explore history',exact:true}).first().click();
             await expect(page.getByRole('region',{name:'Prompt history',exact:true})).toBeVisible();
-            await expect(page.locator('#workspace-main > .heading p.muted')).toHaveText('One positive prompt. Reusable negative variants. One shared gallery.');
+            await expect(page.locator('#workspace-main > .heading p.muted')).toHaveText('Prompt history · one positive, one shared gallery');
             await page.getByRole('button',{name:'← Prompt library',exact:true}).click();
             await expect(page.locator('article[data-prompt-id]')).toHaveCount(6);
             await expect(page.locator('#workspace-main > .heading p.muted')).toHaveText('One positive. Reusable negatives. Every experiment stays connected.');
@@ -549,7 +560,7 @@ test('approved icons are decorative safe SVGs and reject unknown vocabulary', as
     await page.goto(`${workspace}#/images`);
     const icons = await page.evaluate(async () => {
         const { createWorkspaceIcon } = await import('/prompt_manager/js/workspace/icons.mjs');
-        const names = ['images', 'library', 'tags', 'upload', 'overview', 'settings', 'grid', 'list', 'masonry', 'search', 'info', 'copy', 'branch', 'star', 'tagImage', 'folder', 'history', 'review'];
+        const names = ['images', 'library', 'tags', 'upload', 'overview', 'activity', 'settings', 'grid', 'list', 'masonry', 'search', 'info', 'copy', 'branch', 'star', 'tagImage', 'folder', 'history', 'review'];
         const otherDocument = document.implementation.createHTMLDocument();
         const rendered = names.map(name => {
             const icon = createWorkspaceIcon(name, otherDocument);
@@ -568,7 +579,8 @@ test('approved icons are decorative safe SVGs and reject unknown vocabulary', as
         expect(icon).toMatchObject({ svg: true, className: 'icon', owner: true, viewBox: '0 0 24 24', hidden: 'true', focusable: 'false', fill: 'none', stroke: 'currentColor', width: '1.65', children: 1 });
         expect(icon.path.length).toBeGreaterThan(10);
     }
-    // D28 ruling: Overview's own outline home glyph, not the concept's `activity` pulse ('M3 12h4l3-8 4 16 3-8h4').
+    // D28 ruling: Overview's own outline home glyph; the concept's `activity` pulse is the Activity row's.
+    expect(icons.rendered.find(icon => icon.name === 'activity').path).toBe('M3 12h4l3-8 4 16 3-8h4');
     expect(icons.rendered.find(icon => icon.name === 'overview').path).toBe('M3 11 12 4l9 7M5 10v10h14V10M10 20v-6h4v6');
     expect(new Set(icons.rendered.map(icon => icon.path)).size).toBe(icons.rendered.length);
 });
@@ -601,8 +613,8 @@ test('Images visual layouts retain real delayed media long filenames and loaded 
         await page.setViewportSize({width,height});
         for (const theme of ['dark','light']) {
             await page.getByRole('combobox',{name:'Theme',exact:true}).selectOption(theme);
-            await page.locator('.media-card .image-card-actions button').first().click();
-            await expect(page.locator('.image-details h2')).toHaveText('study-01.png');
+            await page.locator('.media-card .image-card-actions button:first-child').first().click();
+            await expect(page.locator('.detail-panel .panel-heading h2')).toHaveText('study-01.png');
             for (const layout of ['Grid','List','Masonry']) {
                 await page.getByRole('button',{name:layout,exact:true}).click();await page.evaluate(()=>scrollTo(0,0));
                 if(layout==='List') await expect(page.locator('.media-card').first()).toHaveCSS('height','97px');
@@ -613,34 +625,37 @@ test('Images visual layouts retain real delayed media long filenames and loaded 
             const longCard=page.locator('article[data-image-key]').filter({has:page.locator('[aria-label^="Open a-very-long-geometric-composition-"]')});
             const longName=(await longCard.locator('.image-open').getAttribute('aria-label')).replace(/^Open /,'');
             expect(longName).toMatch(/layered-context-.*\.png/);
-            await longCard.locator('.image-card-actions button').click();
-            await expect(page.locator('.image-details h2')).toHaveText(longName);
+            await longCard.locator('.image-card-actions button:first-child').click();
+            await expect(page.locator('.detail-panel .panel-heading h2')).toHaveText(longName);
             await orderedMedia(page);
             await attachEvidence(page,testInfo,`after-images-loaded-scroll-${width}-${theme}`,false);
         }
     }
     await page.evaluate(()=>{location.hash='#/overview';});
-    await expect(page.locator('.media-card,.image-details,.viewer-container,dialog[open]')).toHaveCount(0);
+    await expect(page.locator('.media-card,.detail-panel,.viewer-container,dialog[open]')).toHaveCount(0);
 });
 
 test('embedded history gallery keeps the history heading and disposes its layouts',async({page,request},testInfo)=>{
     await request.post('/__test__/reset',{data:{workspace_visual:true}});
     for (const width of [1600,390]) {
         await page.setViewportSize({width,height:width===1600?1100:844});await page.goto(`${workspace}#/library`);
-        await page.getByRole('link',{name:'Explore history',exact:true}).first().click();
+        await page.getByRole('button',{name:'Explore history',exact:true}).first().click();
         await expect(page.getByRole('region',{name:'Prompt history',exact:true})).toBeVisible();
         await expect(page.locator('h1')).not.toHaveText('Prompt library');
         const title=await page.locator('h1').textContent();expect(title).not.toBe('Images');
-        // History opens on its first negative variant (concept navigate: state.variant = 0); the layout contract uses the whole gallery.
+        // History opens on its first negative variant (concept navigate: state.variant = 0); the fixture's images are linked
+        // to the positive only, so the layout contract uses the All images dialog's embedded gallery (#249 D26).
         await page.getByRole('button',{name:'All images for this positive',exact:true}).click();
-        await expect(page.locator('article[data-image-key]').first()).toBeVisible();
+        const listing=page.getByRole('dialog',{name:'All images for this positive',exact:true});
+        await expect(listing.locator('article[data-image-key]').first()).toBeVisible();
         for (const layout of ['List','Masonry','Grid']) {
-            await page.getByRole('button',{name:layout,exact:true}).click();await orderedMedia(page);
+            await listing.getByRole('button',{name:layout,exact:true}).click();await orderedMedia(page);
             await expect(page.locator('h1')).toHaveText(title);
-            await expect(page.locator('#workspace-main > .heading p.muted')).toHaveText('One positive prompt. Reusable negative variants. One shared gallery.');
+            await expect(page.locator('#workspace-main > .heading p.muted')).toHaveText('Prompt history · one positive, one shared gallery');
         }
         await attachEvidence(page,testInfo,`after-images-embedded-history-${width}`,false);
+        await page.keyboard.press('Escape');await expect(listing).toHaveCount(0);
         await page.getByRole('button',{name:'← Prompt library',exact:true}).click();
-        await expect(page.locator('.media-card,.image-details,dialog[open]')).toHaveCount(0);
+        await expect(page.locator('.media-card,.detail-panel,dialog[open]')).toHaveCount(0);
     }
 });

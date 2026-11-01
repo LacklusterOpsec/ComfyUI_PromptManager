@@ -6,12 +6,17 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from .inspection_outcomes import MESSAGE_LENGTH, project_resolution
+from .validators import validate_tags
 
 if TYPE_CHECKING:
     from .prompt_inspector import InspectionRead
 
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_LIBRARY_BYTES = 32 * 1024
+# The image tag set cap (database/annotations.py MAX_IMAGE_TAGS; pinned equal
+# by tests/test_config.py).
+MAX_IMAGE_TAGS = 100
+_IMAGE_TAG_STATES = frozenset({"current", "none", "unavailable"})
 _MAX_SAFE_INTEGER = 2**53 - 1
 _RECORD_KEYS = frozenset(
     {"prompt", "workflow", "parameters", "comfyassets_prompt_pairs"}
@@ -289,6 +294,83 @@ def _file_projection(file: dict, inspection: "InspectionRead | None") -> dict:
     return result
 
 
+def _blank(value: str | bytes | None) -> bool:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    return value is None or not value.strip()
+
+
+def inherited_category(
+    positive_category: str | bytes | None,
+    recipe_category: str | bytes | None,
+    has_recipe: bool,
+) -> tuple:
+    """``(value, scope)`` of the category an image's link supplies (#332 MC4).
+
+    The one rule for the inspector chip, the Images category filter and
+    History (D39): a linked recipe's own category when it is not blank,
+    ``(recipe category, "pair")``; otherwise the positive's value unchanged,
+    blank or not, ``(positive category, "positive")``.
+    """
+    if has_recipe and not _blank(recipe_category):
+        return recipe_category, "pair"
+    return positive_category, "positive"
+
+
+class _OwnCategoryUnread:
+    """The own-category read failed: hide the category (#332 DC5)."""
+
+    def __repr__(self) -> str:
+        return "OWN_CATEGORY_UNREAD"
+
+
+OWN_CATEGORY_UNREAD = _OwnCategoryUnread()
+
+
+def apply_own_category(library: dict, own) -> dict:
+    """*library* with an image's own category applied (#332 §5).
+
+    ``own`` is the own category (a string, shown with scope ``"image"``
+    whatever the link status), None (the inherited values stay) or
+    OWN_CATEGORY_UNREAD (category and scope hidden rather than possibly
+    wrong). Returns a new dict.
+    """
+    result = dict(library)
+    if own is OWN_CATEGORY_UNREAD:
+        result.update(category=None, category_scope=None)
+    elif isinstance(own, str):
+        result.update(category=own, category_scope="image")
+    return result
+
+
+def library_metadata(
+    positive_category: str | bytes | None,
+    positive_tags: list,
+    recipe: tuple | None = None,
+) -> dict:
+    """The panel's saved category and tags, each with the scope it came from.
+
+    D39 (maintainer ruling, 2026-10-21): a recipe-linked image shows the recipe's
+    own category and tags when set; otherwise each field separately falls back to
+    the linked positive prompt's, the values Set category writes and the Images
+    filters match. Tag sets are never merged. ``recipe`` is (category, tags).
+    """
+    category, category_scope = inherited_category(
+        positive_category,
+        recipe[0] if recipe is not None else None,
+        recipe is not None,
+    )
+    tags, tags_scope = positive_tags, "positive"
+    if recipe is not None and recipe[1]:
+        tags, tags_scope = recipe[1], "pair"
+    return {
+        "category": category,
+        "category_scope": category_scope,
+        "tags": tags,
+        "tags_scope": tags_scope,
+    }
+
+
 def _library_projection(library: dict) -> dict:
     status = library.get("status")
     result = {
@@ -307,9 +389,14 @@ def _library_projection(library: dict) -> dict:
         value = library.get(key)
         if value is None or isinstance(value, str):
             result[key] = value
-    scope = library.get("metadata_scope")
-    if scope in ("pair", "positive", None):
-        result["metadata_scope"] = scope
+    # An image's own category (#332) has the scope "image"; tags never do.
+    for key, scopes in (
+        ("category_scope", ("pair", "positive", "image", None)),
+        ("tags_scope", ("pair", "positive", None)),
+    ):
+        scope = library.get(key)
+        if scope in scopes:
+            result[key] = scope
     tags = library.get("tags")
     result["tags"] = (
         [tag for tag in tags if isinstance(tag, str)] if isinstance(tags, list) else []
@@ -323,9 +410,39 @@ def _library_projection(library: dict) -> dict:
             "title": None,
             "category": None,
             "tags": [],
-            "metadata_scope": None,
+            "category_scope": None,
+            "tags_scope": None,
         }
     return result
+
+
+def _image_tag_name(value: object) -> bool:
+    if not isinstance(value, str) or value != value.strip() or "," in value:
+        return False
+    try:
+        return validate_tags([value])
+    except ValueError:
+        return False
+
+
+def project_image_tags(facet: object) -> dict:
+    """The ``image_tags`` facet as the client accepts it, else unavailable.
+
+    ``current`` carries the byte record's names (at most 100 valid vocabulary
+    names); ``none`` and ``unavailable`` carry no names. Anything else, extra
+    keys included, is reported as ``unavailable`` rather than passed on.
+    """
+    unavailable = {"state": "unavailable", "tags": []}
+    if not isinstance(facet, dict) or set(facet) != {"state", "tags"}:
+        return unavailable
+    state, tags = facet["state"], facet["tags"]
+    if state not in _IMAGE_TAG_STATES or not isinstance(tags, list):
+        return unavailable
+    if state != "current" and tags:
+        return unavailable
+    if len(tags) > MAX_IMAGE_TAGS or not all(_image_tag_name(tag) for tag in tags):
+        return unavailable
+    return {"state": state, "tags": list(tags)}
 
 
 def _bounded_message(value: Any) -> Optional[str]:
@@ -359,6 +476,7 @@ def _encode_inspection(
     resolution: dict,
     inspection: "InspectionRead | None",
     library: dict,
+    image_tags: dict | None = None,
 ) -> bytes:
     """Serialize exactly once per budget step, preserving identity and roles."""
     metadata = _metadata(inspection)
@@ -372,6 +490,8 @@ def _encode_inspection(
         "metadata": metadata,
         "library": _library_projection(library),
     }
+    if image_tags is not None:
+        response["image_tags"] = project_image_tags(image_tags)
     body = _bytes(response)
     # Omission order keeps prompt evidence longest: the workflow graph first,
     # then the prompt graph, then all raw records atomically.
@@ -403,8 +523,12 @@ def encode_inspection_response(
     resolution: dict,
     inspection: "InspectionRead | None",
     library: dict,
+    image_tags: dict | None = None,
 ) -> bytes:
-    """Preserve the existing rooted wire and its bounded metadata projection."""
+    """Preserve the existing rooted wire and its bounded metadata projection.
+
+    *image_tags*, when given, adds the validated ``image_tags`` facet (B3).
+    """
     return _encode_inspection(
         identity={"root_scope": root_scope, "image": image},
         file=file,
@@ -412,6 +536,7 @@ def encode_inspection_response(
         resolution=resolution,
         inspection=inspection,
         library=library,
+        image_tags=image_tags,
     )
 
 
@@ -423,8 +548,12 @@ def encode_history_inspection_response(
     resolution: dict,
     inspection: "InspectionRead | None",
     library: dict,
+    image_tags: dict | None = None,
 ) -> bytes:
-    """Use occurrence identity with the same current-file evidence projection."""
+    """Use occurrence identity with the same current-file evidence projection.
+
+    *image_tags*, when given, adds the validated ``image_tags`` facet (#457).
+    """
     return _encode_inspection(
         identity={
             "history_version": 1,
@@ -436,4 +565,5 @@ def encode_history_inspection_response(
         resolution=resolution,
         inspection=inspection,
         library=library,
+        image_tags=image_tags,
     )

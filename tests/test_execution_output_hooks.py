@@ -245,6 +245,8 @@ class OutputHooksTests(fixtures.unittest.TestCase):
         registration = self.register()
         self.dequeue(0)
         late = registration._task_done
+        # Drain first: the 2 s bound is not under test here (#370).
+        self.drain(registration)
         self.assertTrue(registration.dispose())
         thread = threading.Thread(
             target=lambda: late((0, history(), fixtures.status()), {})
@@ -397,6 +399,10 @@ class OutputHooksTests(fixtures.unittest.TestCase):
             self.queue.task_done(1, history("rejected.png"), fixtures.status())
             registration.writer.invalidate()
             release.set()
+            # Let the writer work through the 1,024 queued commands first
+            # (#370's pattern): on a busy Windows runner that took longer
+            # than dispose's 2 s bound (merge queue, #382).
+            self.drain(registration)
             self.assertTrue(registration.dispose(2))
         self.assertEqual(self.outputs(0)["state"], "not_captured")
         self.assertEqual(len(self.rows()), 1)

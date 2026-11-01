@@ -37,6 +37,12 @@ from pathlib import Path
 from typing import Dict, Any
 
 from .logging_config import get_logger
+from .media_folders import in_skipped_folder
+
+try:
+    from ..database.workflow_documents import DocumentReader, resolve_image_row
+except ImportError:  # loaded as a top-level ``utils`` package
+    from database.workflow_documents import DocumentReader, resolve_image_row
 
 
 class GalleryDiagnostics:
@@ -64,8 +70,8 @@ class GalleryDiagnostics:
 
         Args:
             db_path: Path to the SQLite database file to diagnose.
-                     If None, resolves from config.json or defaults to
-                     prompts.db in the extension root.
+                     If None, the library's database (see
+                     ``utils.library_location``).
         """
         if db_path is None:
             db_path = self._resolve_db_path()
@@ -74,18 +80,12 @@ class GalleryDiagnostics:
 
     @staticmethod
     def _resolve_db_path() -> str:
-        """Resolve database path from config, matching PromptDatabase logic."""
-        extension_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        """The library's database: the same resolver as PromptDatabase."""
         try:
-            from py.config import PromptManagerConfig
-
-            db_path = PromptManagerConfig.DEFAULT_DB_PATH
-        except Exception:
-            db_path = "prompts.db"
-
-        if not os.path.isabs(db_path):
-            db_path = os.path.normpath(os.path.join(extension_root, db_path))
-        return db_path
+            from ..database.operations import resolve_library_location
+        except ImportError:
+            from database.operations import resolve_library_location
+        return resolve_library_location().db_path
 
     def run_full_diagnostic(self) -> Dict[str, Any]:
         """Run a complete diagnostic check.
@@ -221,7 +221,8 @@ class GalleryDiagnostics:
                     ORDER BY gi.generation_time DESC
                     LIMIT 5
                 """)
-                recent_images = [dict(row) for row in cursor.fetchall()]
+                reader = DocumentReader(conn)
+                recent_images = [resolve_image_row(reader, row) for row in cursor]
 
                 self.logger.info(f"   [TIME] Recent images: {len(recent_images)}")
                 for img in recent_images:
@@ -298,7 +299,13 @@ class GalleryDiagnostics:
                 try:
                     image_files = []
                     for ext in [".png", ".jpg", ".jpeg", ".webp"]:
-                        image_files.extend(Path(abs_path).rglob(f"*{ext}"))
+                        image_files.extend(
+                            found
+                            for found in Path(abs_path).rglob(f"*{ext}")
+                            if not in_skipped_folder(
+                                found.relative_to(abs_path).parts[:-1]
+                            )
+                        )
                     self.logger.info(f"      [IMG]  Images found: {len(image_files)}")
                 except Exception as e:
                     self.logger.error(f"      [FAIL] Error scanning: {e}")
@@ -379,14 +386,9 @@ class GalleryDiagnostics:
         except ImportError:
             self.logger.error("   [FAIL] PIL (Pillow): NOT AVAILABLE")
 
-        # Check sqlite3
-        try:
-            import sqlite3
-
-            dependencies["sqlite3"] = True
-            self.logger.info(f"   [PASS] sqlite3: {sqlite3.sqlite_version}")
-        except ImportError:
-            self.logger.error("   [FAIL] sqlite3: NOT AVAILABLE")
+        # sqlite3 is imported at the top of this module, so it is always here.
+        dependencies["sqlite3"] = True
+        self.logger.info(f"   [PASS] sqlite3: {sqlite3.sqlite_version}")
 
         all_deps_ok = all(dependencies.values())
 

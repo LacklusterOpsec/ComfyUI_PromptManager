@@ -12,12 +12,29 @@ valid result. Importing this module reads nothing, and the default (ingestion)
 profile never imports it, so a missing or bad table can never break ingestion.
 An invalid table raises ``SemanticsError`` so a bad edit fails loudly instead of
 silently changing what the inspector resolves. The file is bounded in size and
-nesting before it is validated. Every class appears in exactly one category;
-classes that are not listed stay ``unsupported-node``.
+nesting before it is validated. Every class appears in exactly one prompt
+category; an unlisted output of a listed class stays ``unsupported-node``. ``lineage``
+(image and latent pass-through outputs for multi-stage chains) describes no
+prompt, so its classes are not claimed by a category.
+
+``Semantics.version`` is the SHA-256 of the table's canonical JSON (sorted
+keys, no whitespace): any change of content, never of layout, moves it.
+``class_version(doc, classes)`` is the narrower fingerprint Needs review
+folds into the version of the items it records from the inspection profile
+(``utils.review_capture``): the SHA-256 of ``class_projection``, the table
+restricted to what it says about ``classes`` (the node classes of one graph)
+plus the class-independent ``schema``, ``stage_inputs`` and ``pass_through``.
+The resolver looks the table up only by the class of a graph node, so an edit
+about other classes cannot change how that graph resolves and leaves the
+version alone. A class the table does not list at all passes text through
+(#381); that rule lives in code, so ``INSPECTION_RESOLVER_VERSION`` moves for it.
+``pass_through.skip_inputs`` names the core type inputs (model, clip, image,
+...) such a node's text is never read through.
 """
 
+import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -44,6 +61,7 @@ STRATEGIES: Mapping[str, FrozenSet[str]] = MappingProxyType(
         "encoders": frozenset({"single", "parts-equal", "pm-compose", "flag-parts"}),
         "strings": frozenset({"literal", "strip-newlines", "join-multi", "concat"}),
         "savers": frozenset({"comfy-counter", "vhs-counter"}),
+        "lineage": frozenset({"continue"}),
     }
 )
 # Shapes of the facts each sampler class provides (consumed by comfy-metadata.js).
@@ -72,7 +90,7 @@ _CATEGORIES = frozenset(
     + _CLASS_CATEGORIES
     + _SLOT_CATEGORIES
     + _SET_CATEGORIES
-    + ("stage_inputs", "facts")
+    + ("lineage", "stage_inputs", "pass_through", "facts")
 )
 # Input names that make an unlisted node a possible sampler stage in an ancestry
 # walk (``shaped``: pipes, video embeds and custom-sampler parts carry a prompt
@@ -81,6 +99,10 @@ _CATEGORIES = frozenset(
 # ``model`` alone (ModelSampling*) or with ``clip`` (LoraLoader) is a model patch.
 # The resolver and comfy-metadata.js both read these lists.
 _STAGE_INPUT_LISTS = ("shaped", "with_model")
+# Inputs of core ComfyUI types (model, clip, image, ...) that an unknown node's
+# output is never read through when the resolver passes text through it (#381):
+# a loader's lora tag reached through ``clip`` is not the prompt.
+_PASS_THROUGH_KEYS = ("skip_inputs",)
 _STRING_PARAMS = MappingProxyType(
     {
         "literal": frozenset(),
@@ -111,9 +133,15 @@ class Semantics:
     runtime: FrozenSet[str]
     savers: Mapping[str, Mapping[str, Any]]
     non_file_outputs: FrozenSet[str]
+    lineage: Mapping[Tuple[str, int], Mapping[str, Any]]
     stage_inputs: Mapping[str, Tuple[str, ...]]
+    pass_through: Mapping[str, Tuple[str, ...]]
     facts: Mapping[str, Any]
     all_classes: FrozenSet[str]
+    # SHA-256 of the canonical table JSON (set by ``load_semantics``).
+    version: str = ""
+    # The canonical table JSON itself, for ``class_version``.
+    source: str = ""
 
 
 def _freeze(value: Any) -> Frozen:
@@ -225,8 +253,12 @@ def _check_selector(entry: dict, strategy: str, where: str) -> None:
 
 
 def _check_composite(entry: dict, strategy: str, where: str) -> None:
-    _fields(entry, where, frozenset({"strategy", "inputs"}), frozenset())
+    # ``additive``: every part stays in effect (combine, concat), so a later
+    # stage that adds parts to an earlier stage's prompt keeps that prompt.
+    _fields(entry, where, frozenset({"strategy", "inputs"}), frozenset({"additive"}))
     _names(entry["inputs"], where, minimum=2)
+    if "additive" in entry and not isinstance(entry["additive"], bool):
+        raise SemanticsError(f"{where}: additive must be a boolean")
 
 
 def _check_saver(entry: dict, strategy: str, where: str) -> None:
@@ -356,6 +388,35 @@ def _slot_category(doc: dict, category: str, owners: _Owners) -> Mapping:
     return MappingProxyType(result)
 
 
+def _lineage(doc: dict) -> Mapping:
+    """``(class, slot)`` outputs whose image or latent continues one input's.
+
+    These describe an output's image or latent, never its prompt, so they are
+    not prompt categories: a class listed here is not claimed, and stays
+    unsupported (or listed elsewhere) for text. Each output is listed once.
+    """
+    rows = doc["lineage"]
+    if not isinstance(rows, list):
+        raise SemanticsError("category lineage must be a list")
+    result = {}
+    for index, row in enumerate(rows):
+        where = f"lineage[{index}]"
+        if not isinstance(row, dict):
+            raise SemanticsError(f"{where}: entry must be an object")
+        name = _name(row.get("class"), where, "class")
+        slot = _slot(row, where)
+        entry = {
+            key: value for key, value in row.items() if key not in ("class", "slot")
+        }
+        _strategy(entry, "lineage", where)
+        _fields(entry, where, frozenset({"strategy", "input"}), frozenset())
+        _name(entry["input"], where)
+        if (name, slot) in result:
+            raise SemanticsError(f"lineage: duplicate output key {(name, slot)!r}")
+        result[(name, slot)] = _freeze(entry)
+    return MappingProxyType(result)
+
+
 def _set_category(doc: dict, category: str, owners: _Owners) -> FrozenSet[str]:
     rows = doc[category]
     if not isinstance(rows, list):
@@ -392,6 +453,19 @@ def _stage_inputs(doc: dict) -> Mapping[str, Tuple[str, ...]]:
             raise SemanticsError(f"stage_inputs.{key}: model is a patch input")
     if set(table["shaped"]) & set(table["with_model"]):
         raise SemanticsError("stage_inputs: an input is listed in both lists")
+    return _freeze(table)
+
+
+def _pass_through(doc: dict) -> Mapping[str, Tuple[str, ...]]:
+    table = doc["pass_through"]
+    if not isinstance(table, dict) or set(table) != set(_PASS_THROUGH_KEYS):
+        raise SemanticsError(
+            f"pass_through must have exactly {list(_PASS_THROUGH_KEYS)}"
+        )
+    _names(table["skip_inputs"], "pass_through.skip_inputs")
+    for name in ("text", "positive", "negative", "conditioning"):
+        if name in table["skip_inputs"]:
+            raise SemanticsError(f"pass_through.skip_inputs: {name} carries text")
     return _freeze(table)
 
 
@@ -452,7 +526,9 @@ def _validate(doc: Any) -> Semantics:
     for category in _SET_CATEGORIES:
         tables[category] = _set_category(doc, category, owners)
     return Semantics(
+        lineage=_lineage(doc),
         stage_inputs=_stage_inputs(doc),
+        pass_through=_pass_through(doc),
         facts=_facts(doc),
         all_classes=owners.classes(),
         **tables,
@@ -483,7 +559,71 @@ def load_semantics(path: Optional[Union[str, Path]] = None) -> Semantics:
     except (OSError, UnicodeDecodeError, ValueError) as error:
         raise SemanticsError(f"cannot read semantics table {source.name}: {error}")
     _check_nesting(doc)
-    return _validate(doc)
+    return replace(
+        _validate(doc), version=table_version(doc), source=_canonical_json(doc)
+    )
+
+
+# Table parts that hold no class names: they apply to every graph.
+_CLASS_INDEPENDENT = frozenset({"schema", "stage_inputs", "pass_through"})
+
+
+def _canonical_json(doc: Any) -> str:
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def table_version(doc: Any) -> str:
+    """SHA-256 of ``doc`` as canonical JSON: content, not layout."""
+    return hashlib.sha256(_canonical_json(doc).encode("utf-8")).hexdigest()
+
+
+def _about(value: Any, classes: FrozenSet[str]) -> Any:
+    """The part of one category that names a class in ``classes``.
+
+    Categories are keyed by class (objects), list classes (strings) or list
+    entries that carry a ``class``.
+    """
+    if isinstance(value, dict):
+        return {key: item for key, item in value.items() if key in classes}
+    if isinstance(value, list):
+        return [
+            entry
+            for entry in value
+            if (isinstance(entry, str) and entry in classes)
+            or (isinstance(entry, dict) and entry.get("class") in classes)
+        ]
+    return value
+
+
+def class_projection(doc: Mapping[str, Any], classes) -> dict:
+    """What ``doc`` says about ``classes``, plus its class-independent parts."""
+    classes = frozenset(classes)
+    projected = {}
+    for category, value in doc.items():
+        if category in _CLASS_INDEPENDENT:
+            projected[category] = value
+        elif category == "facts" and isinstance(value, dict):
+            projected[category] = {
+                table: _about(entries, classes) for table, entries in value.items()
+            }
+        else:
+            projected[category] = _about(value, classes)
+    return projected
+
+
+def class_version(doc: Mapping[str, Any], classes) -> str:
+    """SHA-256 of ``class_projection(doc, classes)`` as canonical JSON."""
+    return table_version(class_projection(doc, classes))
+
+
+@lru_cache(maxsize=256)
+def _cached_class_version(source: str, classes: FrozenSet[str]) -> str:
+    return class_version(json.loads(source), classes)
+
+
+def semantics_class_version(semantics: Semantics, classes) -> str:
+    """``class_version`` of a loaded table (cached per table and class set)."""
+    return _cached_class_version(semantics.source, frozenset(classes))
 
 
 @lru_cache(maxsize=1)

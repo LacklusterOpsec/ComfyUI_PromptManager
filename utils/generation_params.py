@@ -28,6 +28,7 @@ __all__ = [
     "extract_generation_params",
     "extract_from_records",
     "parse_js_json",
+    "parse_page_json",
 ]
 
 PLACEHOLDERS = MappingProxyType(
@@ -761,9 +762,15 @@ def _widget_names(node):
         and _truthy(_get(item, "widget"))
         and _truthy(_get(_get(item, "widget"), "name"))
     ]
-    if from_inputs:
-        return from_inputs
     node_type = _get(node, "type")
+    if from_inputs:
+        # A known node's widget-bound inputs must line up with its widget order.
+        # Sockets that are not widget inputs (#343: the editors' text) would shift
+        # every positional value onto the wrong name; use the table then.
+        known = WIDGET_POSITIONS.get(node_type) if isinstance(node_type, str) else None
+        if known is not None and list(known[: len(from_inputs)]) != from_inputs:
+            return list(known)
+        return from_inputs
     key = _js_string(node_type)
     if key in _OBJECT_PROTOTYPE_KEYS:
         raise GenerationParamsError(f"widget positions of {key!r} are not iterable")
@@ -949,6 +956,30 @@ def parse_js_json(text):
         return json.loads(
             text, parse_constant=_reject_constant, parse_int=_double_integer
         )
+    except (ValueError, RecursionError):
+        return None
+
+
+def _nan_as_null(name):
+    """The legacy pages' NaN cleaning; Infinity still throws in ``JSON.parse``."""
+    if name == "NaN":
+        return None
+    raise ValueError(f"{name} is not JSON")
+
+
+def parse_page_json(text):
+    """A metadata record as the legacy gallery and admin pages parsed it.
+
+    They replace ``NaN`` with ``null`` and then ``JSON.parse`` (ComfyUI writes
+    ``"is_changed": [NaN]`` for nodes that always re-run, PromptManager among
+    them). Only the NaN number reads as null here: the pages' regex also
+    rewrote the word inside strings, which changed prompt text. None where the
+    parse throws.
+    """
+    if not isinstance(text, str):
+        return None
+    try:
+        return json.loads(text, parse_constant=_nan_as_null, parse_int=_double_integer)
     except (ValueError, RecursionError):
         return None
 

@@ -1,6 +1,8 @@
 """Vocabulary read routes page with signed, epoch-scoped cursors."""
 
+import hashlib
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -33,7 +35,17 @@ class TestVocabularyAPI(ImageAPITestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(
             set(first),
-            {"success", "library_epoch", "tags", "total", "has_more", "next_cursor"},
+            {
+                "success",
+                "library_epoch",
+                "tags",
+                "total",
+                "untagged_count",
+                "search",
+                "sort",
+                "has_more",
+                "next_cursor",
+            },
         )
         self.assertEqual(first["library_epoch"], epoch)
         self.assertEqual(first["total"], 3)
@@ -60,12 +72,16 @@ class TestVocabularyAPI(ImageAPITestCase):
             },
         )
         self.assertEqual(
-            categories["categories"], [{"value": "Animal", "prompt_count": 1}]
+            categories["categories"],
+            [{"value": "Animal", "prompt_count": 1, "image_count": 0}],
         )
         _, rest = await self.get(
             "categories", limit=1, cursor=categories["next_cursor"]
         )
-        self.assertEqual(rest["categories"], [{"value": "Pet", "prompt_count": 1}])
+        self.assertEqual(
+            rest["categories"],
+            [{"value": "Pet", "prompt_count": 1, "image_count": 0}],
+        )
         self.assertFalse(rest["has_more"])
 
     async def test_vocabulary_cursor_is_signed_epoch_scoped(self):
@@ -104,6 +120,41 @@ class TestVocabularyAPI(ImageAPITestCase):
         self.assertNotEqual(fresh["library_epoch"], tags["library_epoch"])
         response, _ = await self.get("tags", limit=1, cursor=fresh["next_cursor"])
         self.assertEqual(response.status, 200)
+
+    async def test_tag_search_and_sort_page_with_scoped_cursors(self):
+        self._save_prompt("One", tags=["beta", "alpha"])
+        self._save_prompt("Two", tags=["beta"])
+        self._save_prompt("Plain")
+        self.add_unused("gamma")
+        _, first = await self.get("tags", limit=1, sort="name", search="A")
+        self.assertEqual([row["name"] for row in first["tags"]], ["alpha"])
+        self.assertEqual(first["total"], 3)
+        self.assertEqual(first["untagged_count"], 1)
+        self.assertEqual((first["search"], first["sort"]), ("A", "name"))
+        _, second = await self.get(
+            "tags", limit=1, sort="name", search="A", cursor=first["next_cursor"]
+        )
+        self.assertEqual([row["name"] for row in second["tags"]], ["beta"])
+        _, ranked = await self.get("tags", sort="prompts")
+        self.assertEqual(
+            [(row["name"], row["prompt_count"]) for row in ranked["tags"]],
+            [("beta", 2), ("alpha", 1), ("gamma", 0)],
+        )
+        # A cursor belongs to one search and one sort.
+        for params in (
+            {"sort": "name-desc", "search": "A"},
+            {"sort": "name", "search": "B"},
+            {"sort": "created", "search": "A"},
+        ):
+            response, result = await self.get(
+                "tags", limit=1, cursor=first["next_cursor"], **params
+            )
+            self.assertEqual(response.status, 400, params)
+            self.assertIn("refresh", result["error"])
+        for params in ({"sort": "count"}, {"search": "x" * 201}):
+            response, result = await self.get("tags", **params)
+            self.assertEqual(response.status, 400, params)
+            self.assertEqual(result["success"], False)
 
     async def test_read_failures_keep_the_read_envelope(self):
         with patch.object(
@@ -184,6 +235,7 @@ class TestVocabularyAPI(ImageAPITestCase):
                     "id": created["tag"]["id"],
                     "name": "sunset",
                     "prompt_count": 0,
+                    "image_count": 0,
                 },
             },
         )
@@ -202,6 +254,7 @@ class TestVocabularyAPI(ImageAPITestCase):
                     "other_prompts": 0,
                     "negative_variants": 1,
                     "archived_negative_variants": 0,
+                    "images": 0,
                 },
             },
         )
@@ -221,9 +274,11 @@ class TestVocabularyAPI(ImageAPITestCase):
                     "id": created["tag"]["id"],
                     "name": "sunset",
                     "prompt_count": 2,
+                    "image_count": 0,
                 },
                 "components_changed": 1,
                 "pairs_changed": 1,
+                "images_changed": 0,
             },
         )
         self.assertEqual(self.api.db.get_prompt_by_id(parent)["tags"], ["sunset"])
@@ -242,6 +297,7 @@ class TestVocabularyAPI(ImageAPITestCase):
                 "deleted": True,
                 "components_changed": 1,
                 "pairs_changed": 1,
+                "images_changed": 0,
             },
         )
         self.assertEqual(self.api.db.get_all_tags(), [])
@@ -252,6 +308,95 @@ class TestVocabularyAPI(ImageAPITestCase):
             response, result = await self.get(f"tags/{bad}/impact")
             self.assertEqual(response.status, 400, bad)
             self.assertNotIn("code", result)
+
+    def image(self, name, tags, digest="a", mtime_ns=1):
+        """Tag the bytes ``digest`` of the file ``name``; return its locator."""
+        locator = os.path.normcase(str(self.output_dir / name))
+        self.api.db.replace_image_tags(
+            locator=locator,
+            sha256=hashlib.sha256(digest.encode()).hexdigest(),
+            size=1,
+            mtime_ns=mtime_ns,
+            expected_epoch=self.api.db.get_execution_epoch(),
+            expected_tag_revision=0,
+            tags=tags,
+        )
+        return locator
+
+    async def test_tag_rows_report_image_count_by_locator(self):
+        self._save_prompt("Prompt only", tags=["prompt-only", "shared"])
+        self.image("one.png", ["twice", "shared"], digest="old")
+        self.image("one.png", ["twice"], digest="new", mtime_ns=2)
+        self.image("two.png", ["shared"], digest="new")
+        self.image("three.png", ["prior-only"], digest="first")
+        self.image("three.png", [], digest="second", mtime_ns=2)
+        response, page = await self.get("tags")
+        self.assertEqual(response.status, 200, page)
+        rows = {row["name"]: row for row in page["tags"]}
+        self.assertEqual(
+            {
+                name: (row["prompt_count"], row["image_count"])
+                for name, row in rows.items()
+            },
+            {
+                "prompt-only": (1, 0),
+                "shared": (1, 2),
+                "twice": (0, 1),
+                "prior-only": (0, 1),
+            },
+        )
+        row = rows["shared"]
+        self.assertEqual(row["image_count"], 2)
+        self.assertEqual(set(row), {"id", "name", "prompt_count", "image_count"})
+
+    async def test_impact_and_delete_counts_include_images(self):
+        epoch = self.api.db.get_execution_epoch()
+        self._save_prompt("Parent", tags=["moody"])
+        self.image("a.png", ["moody", "keep"])
+        self.image("b.png", ["moody"])
+        _, page = await self.get("tags")
+        moody = next(row for row in page["tags"] if row["name"] == "moody")
+        self.assertEqual(moody["image_count"], 2)
+        response, impact = await self.get(f"tags/{moody['id']}/impact")
+        self.assertEqual(response.status, 200, impact)
+        self.assertEqual(
+            impact["impact"],
+            {
+                "positive_prompts": 1,
+                "other_prompts": 0,
+                "negative_variants": 0,
+                "archived_negative_variants": 0,
+                "images": 2,
+            },
+        )
+        response, deleted = await self.send(
+            "POST",
+            f"tags/{moody['id']}/delete",
+            {"expected_epoch": epoch, "name": "moody"},
+        )
+        self.assertEqual(response.status, 200, deleted)
+        self.assertEqual(
+            deleted,
+            {
+                "success": True,
+                "library_epoch": epoch,
+                "deleted": True,
+                "components_changed": 1,
+                "pairs_changed": 0,
+                "images_changed": 2,
+            },
+        )
+        keep = next(
+            row for row in (await self.get("tags"))[1]["tags"] if row["name"] == "keep"
+        )
+        response, renamed = await self.send(
+            "PATCH",
+            f"tags/{keep['id']}",
+            {"expected_epoch": epoch, "name": "keep", "new_name": "kept"},
+        )
+        self.assertEqual(response.status, 200, renamed)
+        self.assertEqual(renamed["images_changed"], 1)
+        self.assertEqual(renamed["tag"]["image_count"], 1)
 
     async def test_create_route_validates_names(self):
         epoch = self.api.db.get_execution_epoch()
@@ -392,6 +537,7 @@ class TestVocabularyAPI(ImageAPITestCase):
             "other_prompts": 0,
             "negative_variants": 1,
             "archived_negative_variants": 0,
+            "images": 0,
         }
         self.assertEqual(
             preview,
@@ -431,6 +577,73 @@ class TestVocabularyAPI(ImageAPITestCase):
         )
         self.assertEqual(response.status, 409)
         self.assertEqual(replay["code"], "vocabulary-conflict")
+
+    async def test_category_rows_report_images_and_image_only_values(self):
+        self._save_prompt("Owner", category="Prompt value")
+        _, options_before = await self.get_options()
+        self.api.db.set_image_categories(
+            [("root", "a.png"), ("root", "b.png")], "Prompt value"
+        )
+        self.api.db.set_image_categories([("root", "c.png")], "Image value")
+        response, first = await self.get("categories", limit=1)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            first["categories"],
+            [{"value": "Prompt value", "prompt_count": 1, "image_count": 2}],
+        )
+        self.assertEqual(first["total"], 2)
+        _, rest = await self.get("categories", limit=1, cursor=first["next_cursor"])
+        self.assertEqual(
+            rest["categories"],
+            [{"value": "Image value", "prompt_count": 0, "image_count": 1}],
+        )
+        self.assertFalse(rest["has_more"])
+        # The Prompt library's category list does not gain image values.
+        _, options_after = await self.get_options()
+        self.assertEqual(options_after, options_before)
+        self.assertEqual(options_after["categories"], ["Prompt value"])
+
+    async def get_options(self):
+        response = await self.client.get("/prompt_manager/library/options")
+        return response, await response.json()
+
+    async def test_category_routes_rename_image_only_value(self):
+        epoch = self.api.db.get_execution_epoch()
+        self._save_prompt("Bystander", category="Kept")
+        self.api.db.set_image_categories(
+            [("root", "a.png"), ("second", "b.png")], "Image value"
+        )
+        prompts_before = self.category_rows()
+        body = {"expected_epoch": epoch, "source": "Image value", "target": "Moved"}
+        response, preview = await self.send("POST", "categories/preview", body)
+        self.assertEqual(response.status, 200, preview)
+        impact = {
+            "positive_prompts": 0,
+            "other_prompts": 0,
+            "negative_variants": 0,
+            "archived_negative_variants": 0,
+            "images": 2,
+        }
+        self.assertEqual(preview["impact"], impact)
+        stale = preview["impact_token"]
+        self.api.db.set_image_categories([("root", "late.png")], "Image value")
+        response, refused = await self.send(
+            "POST", "categories/apply", {**body, "impact_token": stale}
+        )
+        self.assertEqual(response.status, 409)
+        self.assertEqual(refused["code"], "vocabulary-conflict")
+        self.assertEqual(self.api.db.image_category("root", "a.png"), "Image value")
+        _, preview = await self.send("POST", "categories/preview", body)
+        response, applied = await self.send(
+            "POST",
+            "categories/apply",
+            {**body, "impact_token": preview["impact_token"]},
+        )
+        self.assertEqual(response.status, 200, applied)
+        self.assertEqual(applied["impact"], {**impact, "images": 3})
+        for key in (("root", "a.png"), ("second", "b.png"), ("root", "late.png")):
+            self.assertEqual(self.api.db.image_category(*key), "Moved")
+        self.assertEqual(self.category_rows(), prompts_before)
 
     async def test_preview_validation(self):
         epoch = self.api.db.get_execution_epoch()

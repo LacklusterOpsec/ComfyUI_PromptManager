@@ -8,10 +8,12 @@ import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.background_stops import close_handler  # noqa: E402
 from database.operations import PromptDatabase
 from utils.hashing import generate_prompt_hash
 from utils.image_monitor import ImageGenerationHandler
 from utils.prompt_tracker import PromptTracker
+from utils.run_keys import prompt_node_key
 
 LOADER = {
     "class_type": "CheckpointLoaderSimple",
@@ -51,6 +53,7 @@ class LinkingTestCase(unittest.TestCase):
         )
 
     def tearDown(self):
+        close_handler(self, self.handler)  # and the tracker's cleanup thread
         self.db.close_all()  # Windows cannot unlink an open database file
         for path in (
             self.image,
@@ -103,8 +106,11 @@ class TestMetadataLinking(LinkingTestCase):
         batch_graph = graph()
         batch_graph["134"]["inputs"]["text"] = ["7", 0]
         batch_graph["7"] = {"class_type": "PromptSearchList", "inputs": {}}
-        self.tracker.set_current_prompt("item one", {"prompt_id": first})
-        self.tracker.set_current_prompt("item two", {"prompt_id": second})
+        key = prompt_node_key(batch_graph, "134")
+        for text, prompt_id in (("item one", first), ("item two", second)):
+            self.tracker.set_current_prompt(
+                text, {"prompt_id": prompt_id}, run_key=key, run_id="run-1"
+            )
 
         self.assertEqual(self._process({"prompt": batch_graph}), first)
         self.assertEqual(self._process({"prompt": batch_graph}), second)
@@ -122,9 +128,10 @@ class TestMetadataLinking(LinkingTestCase):
         self.assertEqual(
             self.handler._find_prompt_from_metadata(metadata), ("unknown", None)
         )
-        latest = self._save("most recent prompt")  # recency fallback picks this
-        self.assertEqual(self._process(metadata), latest)
-        self.assertNotEqual(latest, negative)
+        self._save("most recent prompt")  # never picked by recency (#342)
+        self.assertIsNone(self._process(metadata))
+        self.assertEqual(self.linked, [])
+        self.assertIsNotNone(negative)
 
     def test_workflow_fallback_still_used_without_an_api_graph(self):
         positive = self._save("from workflow only")
@@ -165,17 +172,40 @@ class TestForeignWorkflows(LinkingTestCase):
         self.tracker.set_current_prompt(text, {"prompt_id": prompt_id})
         return prompt_id
 
+    def _linked_text(self):
+        row = (
+            self.db.model.get_connection()
+            .execute(
+                "SELECT p.text FROM generated_images g "
+                "JOIN prompts p ON p.id = g.prompt_id WHERE g.image_path = ?",
+                (self.image,),
+            )
+            .fetchone()
+        )
+        return row[0] if row else None
+
     def test_foreign_image_leaves_the_batch_queue_aligned(self):
+        """#247: it links to its own prompt and never takes a queue entry."""
         first = self._queue_batch_item("item one")
         self.assertIsNone(self._process({"prompt": foreign_graph()}))
         self.assertEqual(self.linked, [])
         self.assertEqual(self.tracker.pop_next_prompt()["id"], first)
         self.assertIsNone(self.tracker.pop_next_prompt())
+        self.assertEqual(self._linked_text(), "a cat")
+        prompt = self.db.get_prompt_by_hash(generate_prompt_hash("a cat"))
+        self.assertEqual(prompt["run_count"] or 0, 0)
 
-    def test_foreign_image_is_not_linked_by_the_later_fallbacks_either(self):
+    def test_a_foreign_image_is_linked_only_by_the_ladder(self):
         self._queue_batch_item("item one")  # live tracker and recent prompt exist
+        untraceable = foreign_graph()
+        untraceable["9"]["inputs"]["text"] = ["30", 0]
+        untraceable["30"] = {"class_type": "VendorPromptMaker", "inputs": {}}
+        self.assertIsNone(self._process({"prompt": untraceable}))
+        self.assertEqual(self.linked, [])
+        self.assertIsNone(self._linked_text())
         self.assertIsNone(self._process({"prompt": foreign_graph()}))
         self.assertEqual(self.linked, [])
+        self.assertEqual(self._linked_text(), "a cat")
 
     def test_negative_only_workflow_is_foreign(self):
         self._save("blurry")
@@ -200,12 +230,14 @@ class TestForeignWorkflows(LinkingTestCase):
             self.handler._find_prompt_from_metadata(metadata), ("foreign", None)
         )
 
-    def test_missing_metadata_is_unknown_and_uses_the_queue(self):
+    def test_missing_metadata_is_unknown_and_left_unlinked(self):
         first = self._queue_batch_item("item one")
         self.assertEqual(
             self.handler._find_prompt_from_metadata(None), ("unknown", None)
         )
-        self.assertEqual(self._process(None), first)
+        # Nothing proves which run made it (#342): unlinked, queue untouched
+        self.assertIsNone(self._process(None))
+        self.assertEqual(self.tracker.pop_next_prompt()["id"], first)
 
     def test_tri_state_for_linked_unknown_and_foreign(self):
         positive = self._save("a cat")
@@ -224,14 +256,11 @@ class TestForeignWorkflows(LinkingTestCase):
             ("unknown", None),
         )
 
-    def test_unknown_image_without_any_context_falls_back_to_the_latest_prompt(self):
+    def test_unknown_image_is_never_given_the_latest_prompt(self):
         self._save("older")
-        latest = self._save("latest")
-        self.assertEqual(self._process(None), latest)
-
-    def test_recent_prompt_fallback_handles_an_empty_database(self):
-        self.assertIsNone(self.handler._get_fallback_prompt())
+        self._save("latest")
         self.assertIsNone(self._process(None))
+        self.assertIsNone(self._process({"prompt": graph("not saved")}))
 
     def test_metadata_lookup_errors_are_unknown(self):
         self._save("a cat")

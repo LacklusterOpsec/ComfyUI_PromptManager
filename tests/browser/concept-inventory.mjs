@@ -2,7 +2,7 @@
 // same concept selectors in the immutable concept (/__test__/canonical/workspace) and in production, which now renders
 // the concept's classes. The concept is never rewritten: each page's map<Page>Concept(reference) applies only the
 // recorded spec-§8 deviations, each commented with its D-number, and diffInventory must then report nothing.
-import {expect} from '../../tools/vendor/node_modules/@playwright/test/index.mjs';
+import {expect} from './fixtures.mjs';
 export {diffInventory} from './library-editor-canonical-comparison.mjs';
 
 export const CONCEPT_URL='/__test__/canonical/workspace';
@@ -15,6 +15,62 @@ export const MOTIONS=Object.freeze(['no-preference','reduce']);
 export const countCopy=text=>text.replace(/(^|\D)1 positive prompts\b/g,'$11 positive prompt')
     .replace(/(^|\D)1 more images\b/g,'$11 more image').replace(/(^|\D)1 images\b/g,'$11 image');
 
+/**
+ * The row's flex lines laid out again from the concept's own item boxes, in order: an item breaks to a new line when its
+ * hypothetical size (`flex-basis: 100%` → the row; a growing item → its min-width; otherwise its box) no longer fits
+ * after the line's items and gaps; a growing item (the search field, `flex: 1`) takes its line's free space; items pack
+ * from the start and centre in their line (`align-items: center`). The test proves this model on the concept rows first.
+ */
+export function reflow(row,items) {
+    const gap=parseFloat(row.columnGap)||0,rowGap=parseFloat(row.rowGap)||0;
+    // The unrounded boxes (`exact`); rounding happens once, on the result.
+    const rowWidth=row.exact?.width??row.width;
+    const exact=item=>item.exact??{left:item.left,width:item.width};
+    const grows=item=>parseFloat(item.flexGrow)>0;
+    const basis=item=>item.flexBasis==='100%'?rowWidth:grows(item)?parseFloat(item.minWidth)||0:exact(item).width;
+    const lines=[];
+    const order=row.items.filter(entry=>entry.shown);
+    for(const item of items.filter(entry=>entry.shown)) {
+        const line=lines.at(-1),used=line?line.reduce((sum,entry)=>sum+basis(entry)+gap,0):0;
+        // The slack is one layout unit (1/60px in Firefox), which float sums of the browser's boxes may exceed.
+        if(line&&used+basis(item)<=rowWidth+1/60)line.push(item);else lines.push([item]);
+    }
+    const placed=new Map();let top=0;
+    const sameLine=(a,b)=>a.top<b.top+b.height&&b.top<a.top+a.height;
+    const freeOf=line=>rowWidth-line.reduce((sum,item)=>sum+basis(item),0)-gap*(line.length-1);
+    for(const line of lines) {
+        const free=freeOf(line);
+        const growing=line.filter(grows);
+        const height=Math.max(...line.map(item=>item.height));
+        let x=0,previous=null;
+        for(const item of line) {
+            // A growing item keeps its concept width plus the space its line gained.
+            const width=growing.includes(item)?exact(item).width+(free-freeOf(order.filter(entry=>sameLine(entry,item))))/growing.length:exact(item).width;
+            // An item that followed the same neighbour on the same line in the concept keeps the concept's own spacing,
+            // moved by however much that neighbour grew; otherwise it follows the previous box and the gap.
+            const adjacent=previous&&order.indexOf(item)===order.indexOf(previous)+1&&sameLine(item,previous);
+            const before=previous&&placed.get(previous);
+            const left=line.indexOf(item)===0?0:adjacent?before.left+exact(item).left-exact(previous).left+before.width-exact(previous).width:x;
+            placed.set(item,{left,width,top:Math.round(top+(height-item.height)/2)});
+            x=left+width+gap;previous=item;
+        }
+        top+=height+rowGap;
+    }
+    const moved=item=>{
+        const box=placed.get(item);
+        if(!box)return item;
+        const grown=box.width-exact(item).width;
+        return {...item,left:Math.round(box.left),top:box.top,width:Math.round(box.width),
+            input:item.input&&{...item.input,width:Math.round((item.input.exact?.width??item.input.width)+grown)}};
+    };
+    return {...row,height:Math.round(top-rowGap),items:items.map(moved)};
+}
+
+/** A flex row without the items `isRemoved` picks; the remaining items flow again from the concept's boxes. */
+export function withoutItems(row,isRemoved) {
+    return reflow(row,row.items.filter(item=>!isRemoved(item)));
+}
+
 /** Seed the concept-shaped real fixture (tests/browser/workspace_concept_fixture.py) and return its manifest. */
 export async function seedConcept(request,data={}) {
     const response=await request.post('/__test__/concept/reset',{data});
@@ -22,25 +78,89 @@ export async function seedConcept(request,data={}) {
     return response.json();
 }
 
+/**
+ * Seed the concept fixture and fix the browser's clock at the fixture's own instant (`manifest.now`), so the page and
+ * the fixture read one "now": a prompt used now reads "Used today" and the caption names the fixture's day even when
+ * the run crosses midnight between seeding and rendering. Timers keep running; only `Date` stands still.
+ */
+export async function seedConceptAt(page,request,data={}) {
+    const manifest=await seedConcept(request,data);
+    await page.clock.setFixedTime(new Date(manifest.now*1000));
+    return manifest;
+}
+
+/**
+ * Save `tags` as the current image tag set of the listed file at `path` (root 0) through the real observe and tag
+ * routes (#249 PR C), releasing the capture afterwards; returns the receipt's saved names.
+ */
+export async function saveImageTags(request,path,tags) {
+    const listing=await (await request.get('/prompt_manager/images/output?mode=workspace&limit=40')).json();
+    const target={root_index:0,root_scope:listing.images.find(item=>item.root_index===0).root_scope,path};
+    const observed=await (await request.post('/prompt_manager/image-annotations/observe',{data:{target}})).json();
+    expect(observed.success).toBe(true);
+    try {
+        const receipt=await (await request.put('/prompt_manager/image-annotations/tags',{data:{target,capture_token:observed.capture.token,
+            sha256:observed.capture.sha256,expected_epoch:observed.library_epoch,expected_tag_revision:observed.tag_revision,tags}})).json();
+        expect(receipt.success).toBe(true);
+        return receipt.tags;
+    } finally {await request.delete(`/prompt_manager/image-annotations/capture/${observed.capture.token}`);}
+}
+
 async function selectTheme(page,theme) {
     await page.getByRole('combobox',{name:'Theme',exact:true}).selectOption(theme);
 }
 
 /** The concept at `#<route>` with its own Theme select. */
+/**
+ * The recorded layout deviations (#530), applied to the opened concept page and never to its files, so every box that
+ * follows from them (wider columns, wrapped text, row heights) is compared rather than excused path by path.
+ * Every other measurement still differs if production moves. workspace-layout-tags-system.spec.mjs pins the real values
+ * and that the concept itself still has the old ones.
+ * D182: the second `.two-col` card starts level, and a surface after a row is 18px below it. D184: no 1000px limit on System. D183: the sticky tag header's background and drawn line.
+ */
+export const CONCEPT_LAYOUT_DEVIATIONS=`.two-col > .surface + .surface { margin-top: 0; }
+.two-col + .surface { margin-top: 18px; }
+.settings-layout { max-width: none; }
+.two-col > .surface > .table-wrap thead th { background: var(--ca-surface); border-bottom-color: transparent; }`;
+export const mapConceptLayout=page=>page.addStyleTag({content:CONCEPT_LAYOUT_DEVIATIONS});
+
 export async function openConcept(page,route,theme,motion='no-preference') {
     await page.emulateMedia({reducedMotion:motion});
     await page.goto('about:blank');await page.goto(`${CONCEPT_URL}#${route}`);
+    await mapConceptLayout(page);
     await selectTheme(page,theme);
     await expect(page.locator('#main #page-title')).toBeVisible();
+}
+
+/**
+ * D157 (#451): production opens Images in Masonry when the browser has no Default layout; the concept starts at Grid.
+ * A comparison (and a test of the Grid's own geometry) starts production from the concept's state, a stored Default
+ * layout of Grid, once per tab and only while this browser stored nothing (a test's own settings win).
+ */
+export async function startInGrid(page) {
+    if (page.conceptLayoutSeeded) return;
+    page.conceptLayoutSeeded = true;
+    await page.addInitScript(() => {
+        try {
+            if (!location.pathname.startsWith('/prompt_manager/') || sessionStorage.getItem('pm-d157-seeded')) return;
+            sessionStorage.setItem('pm-d157-seeded', '1');
+            if (localStorage.getItem('gallerySettings') === null) localStorage.setItem('gallerySettings', JSON.stringify({ workspaceLayout: 'grid' }));
+        } catch { /* A page without storage keeps the production default. */ }
+    });
 }
 
 /** Production at `#/<route>` with the D4 Theme select, once the sidebar's real counts (D27) have settled. */
 export async function openProduction(page,route,theme,motion='no-preference') {
     await page.emulateMedia({reducedMotion:motion});
+    await startInGrid(page);
     await page.goto('about:blank');await page.goto(`${PRODUCTION_URL}#/${route}`);
     await selectTheme(page,theme);
     await expect(page.locator('#workspace-main #page-title')).toBeVisible();
     await expect(page.locator('#primary-nav .nav-count')).toHaveCount(3);
+    // SAVED VIEWS' Favorites count (D51), the concept's starred images in the concept fixture.
+    await expect(page.locator('#saved-nav a[data-route="favorites"] .nav-count')).toHaveCount(1);
+    // SAVED VIEWS' Needs review count (ruling R5): the exact pending count.
+    await expect(page.locator('#saved-nav a[data-route="review"] .nav-count')).toHaveCount(1);
 }
 
 /** Computed outline of the focused element, after keyboard focus so `:focus-visible` applies. */
@@ -63,10 +183,12 @@ export async function hoverStateOf(page,locator) {
 /**
  * Mutate the open page so a comparison can be shown to notice a change (the A7 mutation check): `css` is appended as
  * the last stylesheet, so it wins over equally specific concept rules, and every element matching a `remove` selector
- * is detached. Returns an async undo that restores the stylesheet and the removed elements in place.
+ * is detached; each `clone` ({selector, text}) inserts a copy of the first match after it, holding `text` and no
+ * `data-action` (a control production adds beside a concept one, D85). Returns an async undo that restores the
+ * stylesheet and the removed elements in place and drops the copies.
  */
-export async function mutate(page,{css=null,remove=[]}={}) {
-    const token=await page.evaluate(({css,remove})=>{
+export async function mutate(page,{css=null,remove=[],clone=[]}={}) {
+    const token=await page.evaluate(({css,remove,clone})=>{
         const token=`mutation-${Math.random().toString(36).slice(2)}`;
         const undo=[];
         if(css) {
@@ -81,9 +203,15 @@ export async function mutate(page,{css=null,remove=[]}={}) {
                 node.remove();undo.push(()=>parent.insertBefore(node,next));
             }
         }
+        for(const {selector,text} of clone) {
+            const node=document.querySelector(selector);
+            if(!node)throw new Error(`mutate: nothing matches ${selector}`);
+            const copy=node.cloneNode(true);copy.textContent=text;copy.removeAttribute('data-action');
+            node.after(copy);undo.push(()=>copy.remove());
+        }
         (window.__conceptMutations??=new Map()).set(token,undo);
         return token;
-    },{css,remove});
+    },{css,remove,clone});
     return ()=>page.evaluate(token=>{
         const undo=window.__conceptMutations?.get(token);
         if(!undo)throw new Error('mutate: this mutation was already undone or the page reloaded');
@@ -92,10 +220,74 @@ export async function mutate(page,{css=null,remove=[]}={}) {
 }
 
 /**
+ * #332 D146: the category chip names its origin after the category, in a muted `span.chip-source` that never splits
+ * (workspace.css `.chip .chip-source`). The concept's chip shows the bare name (app.js a402), so the recorded rule and
+ * the span are added to the concept page at runtime and the browser lays the chip out: the first `.tags` row's
+ * non-badge chip under `root`. `category` also replaces the chip's text (an own category the concept never shows).
+ * Returns the undo.
+ */
+export const D146_CHIP_SOURCE='.chip .chip-source { color: var(--ca-muted); white-space: nowrap; }';
+export async function withChipSource(page,root,origin,category=null) {
+    const restoreRule=await mutate(page,{css:D146_CHIP_SOURCE});
+    const token=await page.evaluate(({root,origin,category})=>{
+        const chip=document.querySelector(root)?.querySelector('.tags')?.querySelector(':scope > .chip:not(.blue)');
+        if(!chip)throw new Error(`withChipSource: no category chip under ${root}`);
+        const text=chip.textContent,source=document.createElement('span');
+        source.className='chip-source';source.textContent=` · ${origin}`;
+        if(category!==null)chip.textContent=category;
+        chip.append(source);
+        const token=`chip-source-${Math.random().toString(36).slice(2)}`;
+        (window.__chipSources??=new Map()).set(token,()=>{chip.textContent=text;});
+        return token;
+    },{root,origin,category});
+    return async()=>{
+        await page.evaluate(token=>{window.__chipSources.get(token)();window.__chipSources.delete(token);},token);
+        await restoreRule();
+    };
+}
+
+/**
+ * #449 D154: the inspector's tag sections in the concept's prompt-section frame (workspace.css `.tag-section`). The concept
+ * has one bare `.tags` row after its prompt blocks (app.js a402), so the recorded rule is added and that row wrapped at
+ * runtime, the browser laying out what follows: `sections` lists `[className, label, name]` per section, the first
+ * holding the concept's row and each further one a copy of it. Returns the undo.
+ */
+export const D154_TAG_SECTION=`.tag-section { border-top: 1px solid var(--line); padding-top: 15px; margin-top: 15px; }
+.tag-section .role-label { color: var(--ca-muted); }
+.tag-section > .tags { margin-top: 0; }`;
+export const PROMPT_TAGS=[['linked-tags','Prompt tags','Prompt tags']];
+export async function withTagSections(page,root,sections=PROMPT_TAGS) {
+    const restoreRule=await mutate(page,{css:D154_TAG_SECTION});
+    const token=await page.evaluate(({root,sections})=>{
+        const container=document.querySelector(root);
+        const inner=container?.querySelector(':scope > .detail-inner')??container?.querySelector(':scope > div');
+        const row=inner&&[...inner.querySelectorAll(':scope > .tags')].find(node=>node.previousElementSibling?.matches('section.prompt-section'));
+        if(!row)throw new Error(`withTagSections: no tag row after the prompt blocks under ${root}`);
+        const anchor=row.nextSibling,parent=row.parentNode,added=[];
+        sections.forEach(([className,label,name],index)=>{
+            const section=document.createElement('section');section.className=`tag-section ${className}`;section.setAttribute('aria-label',name);
+            const heading=document.createElement('div');heading.className='prompt-heading';
+            const text=document.createElement('span');text.className='role-label';text.textContent=`${label} · ${row.children.length}`;
+            heading.append(text);section.append(heading,index?row.cloneNode(true):row);
+            parent.insertBefore(section,anchor);added.push(section);
+        });
+        const token=`tag-sections-${Math.random().toString(36).slice(2)}`;
+        (window.__tagSections??=new Map()).set(token,()=>{parent.insertBefore(row,added[0]);added.forEach(section=>section.remove());});
+        return token;
+    },{root,sections});
+    return async()=>{
+        await page.evaluate(token=>{window.__tagSections.get(token)();window.__tagSections.delete(token);},token);
+        await restoreRule();
+    };
+}
+
+/**
  * Inventory sections: {chrome, heading, toolbar, filterRow, bulkbar, caption, grid, cards, continuation, panel, library,
  * history, noPageScroll}. A section is null when its element is absent. The Images sections (toolbar … panel, #249 C7)
  * measure the concept's Images markup; `cards` holds the first six; `bulkbar` is the selection bar's place and, while
- * anything is checked, its `.bulkbar` row. Library and history stay null until PRs E and F.
+ * anything is checked, its `.bulkbar` row. `library` (#249 E3) holds the Prompt library's toolbar,
+ * caption, grid, first six cards and whatever follows the grid. `history` (#249 F5) holds the Prompt history's summary,
+ * negative variants panel, comparison (while Compare negatives is pressed) and the shared gallery's heading.
  */
 export function inventoryOf(page,scope='main') {
     return page.evaluate(measureInventory,scope);
@@ -243,7 +435,8 @@ export function measureInventory(scope) {
             description:when(description,()=>({className:description.className,text:description.textContent,...font(description),...edges(description)})),
             actions:when(actions,()=>({...layout(actions),...edges(actions),
                 fullWidth:px(rect(actions).width)===px(rect(heading).width),stacked:copy?rect(actions).top>=rect(copy).bottom-0.5:null,
-                buttons:[...actions.querySelectorAll('button')].map(node=>({text:node.textContent.trim(),primary:node.classList.contains('ca-primary'),
+                // D163: a closed menu's items are not heading actions.
+                buttons:[...actions.querySelectorAll('button')].filter(node=>!node.closest('[role="menu"]')).map(node=>({text:node.textContent.trim(),primary:node.classList.contains('ca-primary'),
                     ...font(node),...edges(node),minHeight:getComputedStyle(node).minHeight,height:px(rect(node).height)}))}))};
     }
     // ---- Images (#249 C7). Every box is relative to its section, every section to `main` (vertical rhythm). ----
@@ -333,6 +526,136 @@ export function measureInventory(scope) {
     function bulkbarOf(bar) {
         return {id:bar.id||null,...relative(bar,main),children:bar.children.length,bar:when(bar.querySelector(':scope > .bulkbar'),rowOf)};
     }
+    // ---- Prompt library (#249 E3). The concept's main holds the toolbar, caption and grid; production's shelf wraps
+    // them in `section.library-shelf` and windows the cards into `.library-row`s (spec §3.4: "row windowing kept"),
+    // so every Library box is found by descendant and placed relative to `main` or its own card.
+    // A `display: contents` node has no box: its children stand in its place (the D23 prompt-block mount point).
+    const boxedChildren=node=>[...node.children].flatMap(child=>getComputedStyle(child).display==='contents'?boxedChildren(child):[child]);
+    function libraryCardOf(card,origin) {
+        const art=card.querySelector(':scope > .card-art'),content=card.querySelector(':scope > .card-content'),footer=card.querySelector(':scope > .card-footer');
+        const title=content?.querySelector(':scope > .card-title'),meta=content?.querySelector(':scope > .card-meta'),tags=content?.querySelector(':scope > .tags');
+        const section=content?.querySelector('.prompt-section'),heading=section?.querySelector(':scope > .prompt-heading');
+        const text=section?.querySelector(':scope > .prompt-text'),facts=footer?.querySelector(':scope > span'),actions=footer?.querySelector(':scope > .row-actions');
+        const lines=node=>Math.round(rect(node).height/parseFloat(getComputedStyle(node).lineHeight));
+        const spanOf=(node,parent)=>({tag:node.tagName.toLowerCase(),className:classes(node),text:textOf(node),...font(node),...edges(node),...relative(node,parent)});
+        return {tag:card.tagName.toLowerCase(),className:classes(card),...relative(card,origin),...edges(card),...css(card,'overflow','display','boxShadow'),
+            children:[...card.children].map(classes),
+            art:when(art,()=>({...relative(art,card),...css(art,'display','gridTemplateColumns','columnGap','rowGap','backgroundColor'),
+                items:[...art.children].map(node=>({tag:node.tagName.toLowerCase(),className:classes(node),alt:node.getAttribute('alt'),...relative(node,art),
+                    ...css(node,'objectFit')}))})),
+            content:when(content,()=>({...relative(content,card),...edges(content),children:boxedChildren(content).map(node=>`${node.tagName.toLowerCase()}.${classes(node)}`)})),
+            title:when(title,()=>({...layout(title),...edges(title),...relative(title,content),
+                items:[...title.children].map(node=>node.tagName==='BUTTON'?controlOf(node,title):spanOf(node,title))})),
+            section:when(section,()=>({className:classes(section),...relative(section,content),...edges(section),
+                label:when(heading?.querySelector('.role-label'),label=>({text:label.textContent,...font(label)})),
+                actions:when(heading?.querySelector('.prompt-actions'),group=>({...layout(group),...relative(group,section),
+                    buttons:[...group.children].map(node=>controlOf(node,group))})),
+                text:when(text,()=>({text:text.textContent,...font(text),...edges(text),...relative(text,section),lines:lines(text)}))})),
+            meta:when(meta,()=>({...layout(meta),...edges(meta),...font(meta),...relative(meta,content),items:[...meta.children].map(node=>spanOf(node,meta))})),
+            // A chip's unrounded place too, so a re-ordered row can be laid out again (`reflow`; `stripExact` removes it).
+            tags:when(tags,()=>({...layout(tags),...edges(tags),...relative(tags,content),exact:{width:rect(tags).width},
+                items:[...tags.children].map(node=>({...spanOf(node,tags),shown:shown(node),exact:{left:rect(node).left-rect(tags).left,width:rect(node).width}}))})),
+            footer:when(footer,()=>({...layout(footer),...edges(footer),...font(footer),...relative(footer,card),
+                // What is seen (hidden-only text left out) and what is spoken (aria-hidden text left out).
+                facts:when(facts,()=>({text:textOf(facts,'.ca-visually-hidden'),spoken:accessibleText(facts),...font(facts),...relative(facts,footer)})),
+                actions:when(actions,()=>({...layout(actions),...relative(actions,footer),buttons:[...actions.children].map(node=>controlOf(node,actions))}))}))};
+    }
+    function libraryOf() {
+        const grid=main?.querySelector('.library-grid');
+        if(!grid)return null;
+        const toolbar=main.querySelector('search.toolbar'),caption=main.querySelector('.section-caption');
+        const cards=[...grid.querySelectorAll('.prompt-card')];
+        // Whatever the page shows after the grid, in document order (the concept: nothing).
+        const trailing=[];
+        for(let node=grid;node&&node!==main;node=node.parentElement)
+            for(let next=node.nextElementSibling;next;next=next.nextElementSibling)if(shown(next))trailing.push({tag:next.tagName.toLowerCase(),className:classes(next),text:next.innerText.replace(/\s+/g,' ').trim()});
+        const style=getComputedStyle(grid);
+        return {toolbar:when(toolbar,rowOf),
+            caption:when(caption,()=>({...layout(caption),...edges(caption),...font(caption),...relative(caption,main),
+                spans:[...caption.children].filter(shown).map(span=>({tag:span.tagName.toLowerCase(),text:textOf(span),...font(span),
+                    top:relative(span,caption).top,height:relative(span,caption).height}))})),
+            grid:{columns:style.gridTemplateColumns.split(/\s+/).length,...css(grid,'columnGap','rowGap'),...relative(grid,main),cardCount:cards.length},
+            cards:cards.slice(0,6).map(card=>libraryCardOf(card,grid)),trailing};
+    }
+    // ---- Prompt history (#249 F5): renderHistory a587–622, style.css 1059–1179 and 1546–1567. The concept's main holds
+    // the summary, the variants panel, the comparison and the gallery; production's sit in `section.library-history`, so
+    // each is found by descendant and placed relative to `main` (vertical rhythm) or to its own section.
+    const spoken=node=>node.classList.contains('ca-visually-hidden');
+    const outline=node=>css(node,'outlineStyle','outlineWidth','outlineColor','outlineOffset');
+    const pseudo=(node,which)=>{const style=getComputedStyle(node,which);return Object.fromEntries(['content','position','top','left','width','height',
+        'borderLeftWidth','borderBottomWidth','borderLeftColor','borderBottomColor','borderBottomLeftRadius','backgroundColor','color'].map(key=>[key,style[key]]));};
+    // What a section shows, in order: each shown child as `tag.classes`, visually hidden statuses apart (`spoken`).
+    const structureOf=node=>({children:boxedChildren(node).filter(child=>shown(child)&&!spoken(child)).map(child=>`${child.tagName.toLowerCase()}.${classes(child)}`),
+        spoken:[...node.querySelectorAll('.ca-visually-hidden')].filter(shown).map(child=>({role:child.getAttribute('role'),text:child.textContent}))});
+    function promptSectionOf(section,origin) {
+        const heading=section.querySelector(':scope > .prompt-heading'),label=heading?.querySelector('.role-label');
+        const actions=heading?.querySelector('.prompt-actions'),text=section.querySelector(':scope > .prompt-text');
+        return {className:classes(section),...relative(section,origin),...edges(section),
+            label:when(label,()=>({text:label.textContent,...font(label)})),
+            actions:when(actions,()=>({...layout(actions),...relative(actions,section),buttons:[...actions.children].map(node=>controlOf(node,actions))})),
+            text:when(text,()=>({text:text.textContent,...font(text),...edges(text),...relative(text,section),
+                lines:Math.round(rect(text).height/parseFloat(getComputedStyle(text).lineHeight))}))};
+    }
+    function panelHeadingOf(heading,origin) {
+        const h2=heading.querySelector('h2'),note=heading.querySelector('.small'),actions=heading.querySelector(':scope > .row-actions');
+        return {...layout(heading),...edges(heading),...relative(heading,origin),
+            h2:when(h2,()=>({text:h2.textContent,...font(h2),...edges(h2),...relative(h2,heading)})),
+            note:when(note,()=>({tag:note.tagName.toLowerCase(),text:note.textContent,...font(note),...edges(note),...relative(note,heading)})),
+            actions:when(actions,()=>({...layout(actions),...relative(actions,heading),buttons:[...actions.children].filter(shown).map(node=>controlOf(node,actions))}))};
+    }
+    function laneOf(lane,timeline) {
+        const dot=lane.querySelector(':scope > .variant-dot'),label=lane.querySelector(':scope > span'),run=lane.querySelector(':scope > .run-dot');
+        return {className:classes(lane),offset:lane.style.getPropertyValue('--lane-offset'),...relative(lane,timeline),...edges(lane),...css(lane,'minWidth','position'),
+            before:pseudo(lane,'::before'),
+            dot:when(dot,()=>({...controlOf(dot,lane),...outline(dot),...css(dot,'position','top','left','width','height','color')})),
+            label:when(label,()=>({text:label.textContent,...font(label),...relative(label,lane),...css(label,'position','top','left')})),
+            run:shown(run)?{...controlOf(run,lane),...css(run,'position','top','left','width','height')}:null};
+    }
+    function timelineOf(timeline,origin) {
+        const positive=timeline.querySelector(':scope > .positive-lane'),span=positive?.querySelector('span');
+        return {...edges(timeline),...css(timeline,'overflowX','position'),...relative(timeline,origin),
+            positive:when(positive,()=>({...edges(positive),...css(positive,'height','minWidth'),...relative(positive,timeline),before:pseudo(positive,'::before'),
+                span:when(span,()=>({text:span.textContent,...font(span),...relative(span,positive)}))})),
+            lanes:[...timeline.querySelectorAll(':scope > .variant-lane')].map(lane=>laneOf(lane,timeline)),
+            structure:structureOf(timeline)};
+    }
+    function variantsOf(panel) {
+        const heading=panel.querySelector(':scope > .panel-heading'),timeline=panel.querySelector(':scope > .timeline'),lower=panel.querySelector(':scope > .timeline-lower');
+        return {className:classes(panel),...edges(panel),...relative(panel,main),structure:structureOf(panel),
+            heading:when(heading,()=>panelHeadingOf(heading,panel)),timeline:when(timeline,()=>timelineOf(timeline,panel)),
+            lower:when(lower,()=>({...layout(lower),...edges(lower),...relative(lower,panel),
+                items:[...lower.children].filter(shown).map(node=>({...controlOf(node,lower),...font(node)}))}))};
+    }
+    function compareOf(section) {
+        const h2=section.querySelector(':scope > h2'),intro=section.querySelector(':scope > p:not(.small)'),grid=section.querySelector(':scope > .compare-grid');
+        return {...edges(section),...relative(section,main),structure:structureOf(section),
+            h2:when(h2,()=>({text:h2.textContent,...font(h2),...edges(h2)})),
+            intro:when(intro,()=>({text:intro.textContent,...font(intro),...edges(intro),...relative(intro,section)})),
+            grid:when(grid,()=>({columns:getComputedStyle(grid).gridTemplateColumns.split(/\s+/).length,...css(grid,'columnGap','rowGap'),...relative(grid,section),
+                items:[...grid.children].map(item=>({className:classes(item),...edges(item),...relative(item,grid),
+                    sections:[...item.querySelectorAll('.prompt-section')].map(node=>promptSectionOf(node,item))}))})),
+            notes:[...section.querySelectorAll(':scope > p.small')].map(note=>({text:note.textContent,...font(note),...edges(note),...relative(note,section)})),
+            added:[...section.querySelectorAll(':scope > .diff-added')].map(chip=>({text:chip.textContent,...font(chip),...edges(chip),...css(chip,'display'),...relative(chip,section)}))};
+    }
+    function historyOf() {
+        const panel=main?.querySelector('section.timeline-panel');
+        if(!panel)return null;
+        const summary=main.querySelector('article.surface'),gallery=main.querySelector('section.history-gallery');
+        const compare=[...main.querySelectorAll('section.surface:not(.timeline-panel)')].find(shown);
+        const chip=summary?.querySelector(':scope > .chip'),meta=summary?.querySelector(':scope > .card-meta');
+        const galleryHeading=gallery?.querySelector(':scope > .panel-heading');
+        return {
+            summary:when(summary,()=>({...edges(summary),...relative(summary,main),structure:structureOf(summary),
+                chip:when(chip,()=>({text:chip.textContent,...font(chip),...edges(chip),...relative(chip,summary)})),
+                sections:[...summary.querySelectorAll('.prompt-section')].map(node=>promptSectionOf(node,summary)),
+                meta:when(meta,()=>({...layout(meta),...edges(meta),...font(meta),...relative(meta,summary),
+                    items:[...meta.children].filter(shown).map(node=>({text:node.textContent,...font(node),...relative(node,meta)}))}))})),
+            variants:variantsOf(panel),
+            compare:when(compare,compareOf),
+            gallery:when(gallery,()=>({...edges(gallery),...relative(gallery,main),
+                heading:when(galleryHeading,()=>panelHeadingOf(galleryHeading,gallery))})),
+        };
+    }
     return {chrome:chromeOf(),heading:headingOf(),
         toolbar:when(main?.querySelector(':scope > search.toolbar'),rowOf),
         filterRow:when(main?.querySelector(':scope > .filter-row'),rowOf),
@@ -342,5 +665,191 @@ export function measureInventory(scope) {
         cards:grid?[...grid.querySelectorAll(':scope > .media-card')].slice(0,6).map(cardOf):null,
         continuation:when(continuation,continuationOf),
         panel:when(gallery,panelOf),
-        library:null,history:null,noPageScroll:document.documentElement.scrollWidth<=innerWidth+1};
+        library:libraryOf(),history:historyOf(),noPageScroll:document.documentElement.scrollWidth<=innerWidth+1};
+}
+
+/**
+ * The inspector (#249 D4): `panel` is the Images side panel's content (`aside#image-inspector`, app.js imageDetails
+ * a400–414) and `viewerDetails` the viewer's full details (`aside#viewer-details`, imageDetails(i, true)), each null
+ * when absent. Both are measured by one in-page function with the concept's selectors in either document.
+ */
+export async function inspectorOf(page) {
+    return {panel:await page.evaluate(measureInspector,'#image-inspector'),
+        viewerDetails:await page.evaluate(measureInspector,'#viewer-details')};
+}
+
+/** Runs in the page; self-contained. Every box is relative to the measured root. */
+export function measureInspector(selector) {
+    const root=document.querySelector(selector);
+    if(!root)return null;
+    const px=value=>Math.round(value);
+    const css=(node,...keys)=>{const style=getComputedStyle(node);return Object.fromEntries(keys.map(key=>[key,style[key]]));};
+    const shown=node=>Boolean(node)&&node.getClientRects().length>0&&getComputedStyle(node).visibility!=='hidden';
+    const rect=node=>node.getBoundingClientRect();
+    const font=node=>css(node,'fontFamily','fontSize','fontWeight','lineHeight','letterSpacing','color','textTransform');
+    const edges=node=>css(node,'paddingTop','paddingRight','paddingBottom','paddingLeft','marginTop','marginRight','marginBottom','marginLeft',
+        'borderTopWidth','borderTopStyle','borderTopColor','borderRightWidth','borderBottomWidth','borderTopLeftRadius','backgroundColor');
+    const layout=node=>css(node,'display','flexDirection','flexWrap','justifyContent','alignItems','columnGap','rowGap');
+    const box=node=>{const a=rect(node),b=rect(root);return {left:px(a.left-b.left),top:px(a.top-b.top),width:px(a.width),height:px(a.height)};};
+    const classes=node=>[...node.classList].sort().join(' ');
+    const when=(node,measure)=>node?measure(node):null;
+    // Visible text: without visually hidden prefixes and aria-hidden glyphs, whitespace collapsed.
+    const textOf=(node,skip='.ca-visually-hidden, [aria-hidden="true"]')=>{const copy=node.cloneNode(true);copy.querySelectorAll(skip).forEach(item=>item.remove());
+        return copy.textContent.replace(/\s+/g,' ').trim();};
+    const hiddenOf=node=>[...node.querySelectorAll('.ca-visually-hidden')].map(item=>item.textContent).join('')||null;
+    const nameOf=node=>node.getAttribute('aria-label')??textOf(node,'[aria-hidden="true"]');
+    function iconOf(node) {
+        const svg=node.querySelector(':scope > svg.icon');
+        if(!svg)return null;
+        return {width:px(rect(svg).width),height:px(rect(svg).height),viewBox:svg.getAttribute('viewBox'),hidden:svg.getAttribute('aria-hidden'),
+            d:svg.querySelector('path')?.getAttribute('d')??null,...css(svg,'strokeWidth','color')};
+    }
+    function controlOf(node) {
+        const style=getComputedStyle(node);
+        return {tag:node.tagName.toLowerCase(),className:classes(node),text:textOf(node),name:nameOf(node),pressed:node.getAttribute('aria-pressed'),
+            primary:node.classList.contains('ca-primary'),...box(node),...font(node),...edges(node),...layout(node),
+            minHeight:style.minHeight,minWidth:style.minWidth,icon:iconOf(node)};
+    }
+    // #332 D146: a category chip's visible origin (`span.chip-source`), null on every other chip.
+    function chipOf(node) {
+        const source=node.querySelector(':scope > .chip-source');
+        return {tag:node.tagName.toLowerCase(),className:classes(node),text:textOf(node),hidden:hiddenOf(node),...box(node),...font(node),...edges(node),
+            minHeight:getComputedStyle(node).minHeight,
+            source:when(source,()=>({text:source.textContent,...font(source),...css(source,'whiteSpace'),...box(source)}))};
+    }
+    function rowOf(row) {
+        return {...layout(row),...edges(row),...box(row),chips:[...row.children].map(chipOf)};
+    }
+    function sectionOf(section) {
+        const heading=section.querySelector(':scope > .prompt-heading'),label=heading?.querySelector('.role-label');
+        const actions=heading?.querySelector('.prompt-actions'),text=section.querySelector(':scope > .prompt-text');
+        return {className:classes(section),...edges(section),...box(section),
+            heading:when(heading,()=>({...layout(heading),...edges(heading),...box(heading)})),
+            label:when(label,()=>({tag:label.tagName.toLowerCase(),text:label.textContent,...font(label),...box(label)})),
+            actions:when(actions,()=>({...layout(actions),...box(actions),buttons:[...actions.children].map(controlOf)})),
+            text:when(text,()=>({tag:text.tagName.toLowerCase(),className:classes(text),text:text.textContent,tabIndex:text.tabIndex,...font(text),...edges(text),
+                ...css(text,'whiteSpace','overflowWrap'),...box(text),lines:px(rect(text).height/parseFloat(getComputedStyle(text).lineHeight))}))};
+    }
+    function tagSectionOf(section) {
+        const heading=section.querySelector(':scope > .prompt-heading'),label=heading?.querySelector('.role-label'),row=section.querySelector(':scope > .tags');
+        return {className:classes(section),name:section.getAttribute('aria-label'),...edges(section),...box(section),
+            heading:when(heading,()=>({...layout(heading),...edges(heading),...box(heading)})),
+            label:when(label,()=>({tag:label.tagName.toLowerCase(),text:label.textContent,...font(label),...box(label)})),
+            row:when(row,rowOf)};
+    }
+    function factsOf(list) {
+        const style=getComputedStyle(list);
+        return {...css(list,'display','columnGap','rowGap','fontSize'),...edges(list),columns:style.gridTemplateColumns.split(/\s+/).length,...box(list),
+            items:[...list.children].map(item=>{const dt=item.querySelector('dt'),dd=item.querySelector('dd');
+                return {...box(item),dt:when(dt,()=>({text:dt.textContent,...font(dt),...edges(dt)})),dd:when(dd,()=>({text:dd.textContent,...font(dd),...edges(dd)}))};})};
+    }
+    const describe=item=>`${item.localName}${item.classList.length?'.'+[...item.classList].join('.'):''}`;
+    const panel=root.classList.contains('detail-panel');
+    // The panel's `.detail-inner`, the viewer's class-less wrapper (D20). A prompt-block mount point that is
+    // `display: contents` is transparent: its sections count as the wrapper's own children.
+    const inner=root.querySelector(panel?':scope > .detail-inner':':scope > div');
+    const parts=inner?[...inner.children].flatMap(item=>getComputedStyle(item).display==='contents'?[...item.children]:[item]):[];
+    const sections=parts.filter(item=>item.classList.contains('prompt-section'));
+    const firstSection=parts.indexOf(sections[0]);
+    const rows=parts.filter(item=>item.classList.contains('tags'));
+    const heading=parts.find(item=>item.classList.contains('panel-heading')),h2=heading?.querySelector('h2'),format=heading?.querySelector('.chip');
+    const filename=parts.find(item=>item.matches('p.small'));
+    const cover=root.querySelector(':scope > .detail-cover'),footer=root.querySelector(':scope > .detail-footer');
+    // What a closed disclosure holds is not offered (only its summary is), whatever boxes the engine keeps for it.
+    const offered=node=>{const closed=node.closest('details:not([open])');return !closed||node.parentElement===closed&&node.localName==='summary';};
+    const controls=[...root.querySelectorAll('button, a[href], [tabindex]:not([tabindex="-1"]), summary')].filter(node=>shown(node)&&offered(node));
+    return {
+        className:classes(root),label:root.getAttribute('aria-label'),
+        ...css(root,'position','top','overflowX','overflowY','maxHeight'),...edges(root),width:px(rect(root).width),height:px(rect(root).height),
+        structure:{outer:[...root.children].map(describe),inner:parts.map(describe)},
+        cover:when(cover,()=>({tag:cover.tagName.toLowerCase(),alt:cover.getAttribute('alt'),...box(cover),...css(cover,'objectFit','display')})),
+        inner:when(inner,()=>({...edges(inner),...box(inner)})),
+        heading:when(heading,()=>({...layout(heading),...edges(heading),...box(heading),
+            h2:when(h2,()=>({text:h2.textContent,...font(h2),...edges(h2),...box(h2)})),format:when(format,chipOf)})),
+        filename:when(filename,()=>({text:filename.textContent,...font(filename),...edges(filename),...box(filename)})),
+        badges:when(rows.find(row=>parts.indexOf(row)<firstSection),rowOf),
+        sections:sections.map(sectionOf),
+        tags:when(rows.find(row=>parts.indexOf(row)>firstSection),rowOf),
+        // #449 D154: the labelled tag sections after the prompt blocks, each with its frame, heading, label and chip row.
+        tagSections:parts.filter(item=>item.matches('section.tag-section')).map(tagSectionOf),
+        facts:when(parts.find(item=>item.matches('dl.meta-grid')),factsOf),
+        // Disclosures (viewer only) by their summary and frame; their content is the D20 production facts.
+        details:parts.filter(item=>item.localName==='details').map(item=>{const summary=item.querySelector(':scope > summary');
+            return {open:item.open,...edges(item),...box(item),summary:when(summary,()=>({text:summary.textContent,...font(summary),...box(summary)}))};}),
+        footer:when(footer,()=>({...layout(footer),...edges(footer),...box(footer),buttons:[...footer.children].map(controlOf)})),
+        // The viewer's pair send and history follow the wrapper directly (imageDetails(i, true) has no footer).
+        actions:panel?null:[...root.children].filter(item=>item.localName==='button').map(controlOf),
+        controls:controls.map(node=>({tag:node.tagName.toLowerCase(),text:textOf(node),name:nameOf(node),pressed:node.getAttribute('aria-pressed'),
+            primary:node.classList.contains('ca-primary'),minHeight:getComputedStyle(node).minHeight})),
+    };
+}
+
+// #249 System S7 Task 20, shared since S12 (#329): the maintenance plan dialog's measurement and its D100 mapping,
+// moved unchanged from system-maintenance-concept.spec.mjs so the rotated-log review uses the same ones.
+/** Runs in the page: the open review dialog (plan or duplicates): its title, body and the concept's tokens. */
+export function measureReview() {
+    const dialog = document.querySelector('dialog#modal[open]');
+    const css = (node, ...keys) => node ? Object.fromEntries(keys.map(key => [key, getComputedStyle(node)[key]])) : null;
+    const name = node => [node.localName, ...[...node.classList].sort()].join('.');
+    const text = node => node?.textContent.trim() ?? null;
+    const body = dialog.querySelector('#modal-body');
+    const grid = body.querySelector(':scope > dl.meta-grid');
+    const compare = body.querySelector('.compare-grid');
+    const item = compare?.querySelector('.compare-item');
+    const notes = [...body.querySelectorAll(':scope > p.small')];
+    const note = notes.at(-1);
+    const actions = body.querySelector(':scope > .dialog-actions');
+    return {
+        title: text(dialog.querySelector('#modal-title')),
+        tree: [...body.children].map(name),
+        heading: body.querySelector(':scope > h3') && { text: text(body.querySelector(':scope > h3')),
+            ...css(body.querySelector(':scope > h3'), 'fontSize', 'fontWeight', 'color', 'marginBottom') },
+        grid: grid && { rows: [...grid.children].map(row => [text(row.querySelector('dt')), text(row.querySelector('dd'))]),
+            ...css(grid, 'display', 'gridTemplateColumns', 'columnGap', 'rowGap'),
+            dt: css(grid.querySelector('dt'), 'fontSize', 'color', 'textTransform'), dd: css(grid.querySelector('dd'), 'fontSize', 'color') },
+        details: body.querySelector(':scope > details') && { summary: text(body.querySelector(':scope > details > summary')),
+            tree: [...body.querySelector(':scope > details').children].map(name) },
+        backup: body.querySelector(':scope > .notice') && { tree: [...body.querySelector(':scope > .notice').children].map(name),
+            text: [...body.querySelectorAll(':scope > .notice > div:first-child > *')].map(node => [node.localName, text(node)]),
+            buttons: [...body.querySelectorAll(':scope > .notice button')].map(text) },
+        compare: compare && { tree: [...compare.children].map(name), ...css(compare, 'display', 'gridTemplateColumns', 'columnGap'),
+            items: [...compare.children].map(entry => ({ tree: [...entry.children].map(name), label: text(entry.querySelector('label')),
+                checked: entry.querySelector('input[type=radio]').checked, image: entry.querySelector('img')?.className ?? null })),
+            item: css(item, 'paddingTop', 'paddingLeft', 'backgroundColor', 'borderTopWidth', 'borderTopColor', 'borderTopLeftRadius'),
+            image: css(item.querySelector('img'), 'width', 'objectFit'),
+            label: css(item.querySelector('label'), 'fontSize', 'color'),
+            radio: { name: item.querySelector('input[type=radio]').name.startsWith('keep-') ? 'keep-*' : 'other',
+                type: item.querySelector('input').type } },
+        note: note && { text: text(note), ...css(note, 'fontSize', 'color', 'marginTop') },
+        actions: { tree: [...actions.children].map(name), ...css(actions, 'display', 'justifyContent', 'columnGap', 'marginTop'),
+            buttons: [...actions.children].map(item => ({ text: text(item), className: item.className,
+                ...css(item, 'backgroundColor', 'color', 'fontSize', 'paddingTop', 'paddingLeft', 'borderTopColor') })) },
+    };
+}
+
+export const BACKUP_BOX = Object.freeze({ tree: ['div', 'div.row-actions'], text: [['h3', 'Back up the database first (recommended)'],
+    ['p', 'Downloads a copy of the prompts database before this operation changes any records.']], buttons: ['Back up now'] });
+
+/**
+ * D100: the server's plan in the concept's dialog: the operation's row title as its `h3` (the concept prints its
+ * `data-plan` name), the four rows with the plan's values, the listed records (`details`), the hold line in the
+ * concept's `p.small`, the D55 backup box before the actions, and "Apply reviewed operation". No sample note.
+ */
+export function mapPlanConcept(reference, title, plan) {
+    const backup = plan.backup.policy === 'off' ? 'No safety backup (the policy is off)'
+        : `Create and verify before changes (${plan.backup.destination_label})`;
+    const tree = ['h3', 'dl.meta-grid', ...(plan.details.length ? ['details'] : []), 'p.small', 'div.notice', 'div.dialog-actions'];
+    const [cancel, apply] = reference.actions.buttons;
+    return {
+        ...reference,
+        tree,
+        heading: { ...reference.heading, text: title },
+        grid: { ...reference.grid, rows: [['Scope', plan.scope.label],
+            ['Protected', plan.protected.reasons.length ? plan.protected.reasons.join(' · ') : 'Nothing is protected'],
+            ['Backup', backup], ['Media on disk', plan.media.label]] },
+        details: plan.details.length ? { summary: `Listed records (${plan.details.length})`, tree: ['summary', 'pre'] } : null,
+        backup: BACKUP_BOX,
+        note: { ...reference.note, text: 'Nothing changes until you apply. This review holds for 15 minutes.' },
+        actions: { ...reference.actions, buttons: [cancel, { ...apply, text: 'Apply reviewed operation' }] },
+    };
 }
