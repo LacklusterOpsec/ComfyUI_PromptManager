@@ -77,7 +77,7 @@ PM_TEST_WORKERS=8 npm run --prefix tools/vendor test:coverage            # whole
 npm run --prefix tools/vendor test:coverage:shard -- 1/4                 # node units, viewer suite, workflows 1/4
 npm run --prefix tools/vendor test:coverage:shard -- 2/4                 # workflows 2/4 (likewise 3/4, 4/4)
 npm run --prefix tools/vendor coverage:merge                             # report and baseline check of every raw file
-npm run --prefix tools/vendor test:workflows -- --project webkit --shard 2/2
+npm run --prefix tools/vendor test:workflows -- --project webkit --shard 2/3
 ```
 
 `coverage:merge` refuses an empty raw directory; it does not count shards, so run
@@ -111,8 +111,11 @@ distributions, browser system dependencies may need manual installation. For a
 quick browser run, use `test:workflows -- --project chromium`.
 
 CI runs the browser jobs inside the pinned image
-`mcr.microsoft.com/playwright:v<@playwright/test version>-noble`
+`mcr.microsoft.com/playwright:v<@playwright/test version>-noble@sha256:<digest>`
 (`tests/vendor/browser-image.test.mjs` keeps the tag in step with the lockfile).
+The digest is part of the pin, because Microsoft re-pushes tags: `v1.64.1-noble`
+moved from Node 24 to Node 26 on 2026-11-01 (#609). To bump it, change the tag and
+digest together and check the new image's Node against the Node 24 guard.
 Concept comparisons measure geometry, and geometry follows the fonts a browser
 falls back to: the concept names Inter, which neither the image nor a stock
 runner ships. On a plain `ubuntu-latest` runner the fallback is DejaVu Sans,
@@ -190,8 +193,8 @@ waiting for the `frontend coverage` jobs.
 
 The `viewerjs` check runs on every PR, including backend-only changes. It is an
 aggregate job. It requires the four `frontend coverage (shard N/4)` jobs and
-`frontend coverage (merge)` to succeed on every event. The four
-`page workflows (firefox|webkit, shard N/2)` jobs run only in the merge queue,
+`frontend coverage (merge)` to succeed on every event. The six
+`page workflows (firefox|webkit, shard N/3)` jobs run only in the merge queue,
 on `main` and on `workflow_dispatch` (see "Pull requests and the merge queue").
 `viewerjs` requires them to be skipped on a pull request and to succeed
 everywhere else. Any other failed, cancelled or skipped job fails it. Every browser job runs with `PM_TEST_WORKERS: 3` (the public
@@ -664,6 +667,10 @@ manual Refresh forgets every pair. Not found, the existing visible Refresh stays
 Browser tests: `workspace-stale-source.spec.mjs` (`/__test__/sources/reverse` and
 `/__test__/scope-key/rotate`, both undone by every reset); the manual-Refresh
 recovery specs in `workspace-images.spec.mjs` answer every rescope 409.
+
+## Registry package
+
+`comfy node publish` zips the tracked files minus `.comfyignore`, so a new development file or folder at the root ships until it is listed there. `tests/test_package_contents.py` keeps each rule anchored to the root, checks that development paths are left out and that nothing ComfyUI needs at run time is. Git clones are unaffected.
 
 ## Windows portability preflight
 
@@ -2728,7 +2735,7 @@ the grid) and D43 (sorted chips, checked against the concept with its chips sort
 D44 needs no mapping: the comparison runs with no Refine filter active, so the button
 reads "Filters" as the concept's does. Nothing else follows the grid: the legacy
 "Current prompt library" link is removed from the shelf; the legacy Library stays at
-`/prompt_manager/admin` by direct URL, linked only from System (#525, D165)
+`/prompt_manager/admin` by direct URL (#525, #620)
 (`tests/browser/workspace.spec.mjs`). `library comparison detects
 mutations` injects `.card-footer { padding: 2px }` and removes `.card-meta .chip.red`.
 
@@ -3236,7 +3243,7 @@ npm run --prefix tools/vendor test:workflows -- history-concept.spec.mjs \
 
 `#/inspect` ("Inspect a file") is a native workspace route; it no longer hands off to
 the legacy metadata page, which stays at its URL
-(`/prompt_manager/gallery.html`) linked only from System (#525, D165). The page is the concept's `#metadata`
+(`/prompt_manager/gallery.html`) at its URL only (#525, #620). The page is the concept's `#metadata`
 (app.js `renderMetadata` a740–748, selection a1715–1729; style.css 709–722, 1180–1194,
 1543–1545, 1559–1564) in the concept's own classes (`.surface`, `.file-drop`,
 `.spaced-20`, `.local-file-preview`, all from the synced `concept.css`), with no
@@ -4658,6 +4665,9 @@ the per-section hand-off panel, was retired by S12 (#329): every section is nati
   concept row's), `skipped tags add, preview, remove, save and reload (D202)`, `skipped
   tags preview checks library tags only …` (workspace-system-tagging.spec) and
   `suggestions omit skipped tags and say how many were hidden` (workspace-tagging.spec).
+- **D205** (Prompt library, #620, beyond the concept): the sort menu appends Recently used, Most used and Name Z–A
+  after Oldest first. These are the old Dashboard's sorts, kept before its removal because the community asked for
+  them. A prompt never run sorts last in both use orders.
 - **D203** (Auto-tagging, #431, beyond the concept): "Saved instructions" replaces the
   concept's "LLM tag template" field (the mock's state 2): a `.setting-block`
   (`data-setting="tag-instructions"`, `data-key="autotag_instructions"`) with the label,
@@ -5898,6 +5908,73 @@ are closed before `os.replace`; renames stay inside one folder; folder identity 
 `(st_dev, st_ino)` and `normcase(realpath)`, so case variants and links of a served
 folder are refused. The browser test server closes its own log handlers before its temp
 root (which now holds the logs) is removed.
+
+### Thumbnail location contract (#320)
+
+Previews live in each source's `thumbnails/` (the default) or in one folder, `<folder>/<source key>/…`. Every reader,
+writer and remover asks `py/api/preview_store.py`; `tests/test_preview_store.py` fails on a `thumbnails` path join
+anywhere else. The setting is `thumbnails.location` in config.json, and only the Move thumbnails job writes it: POST
+`/settings` answers 409 `location-needs-move`.
+
+- **Keys and marker.** A key is a slug plus a hash of the source's identity. The folder's
+  `.promptmanager-thumbnails.json` stores each key with its identity and install. Only a single `<slug>-<hex>` name
+  is ever joined onto the folder, and anything else in a marker is dropped. Every write and delete passes
+  `preview_store.may_write`: below a key folder, with no link, junction or reparse point on the way
+  (`tests/test_preview_store_folder.py`, including tampered markers).
+- **Unavailable.** A folder is unavailable when it is missing, is a link, holds no marker or holds another
+  folder's marker. A probe checks it every 5 s, and a store call that fails or stalls marks it at once. While it is
+  unavailable:
+  - originals are served and nothing is written anywhere;
+  - generate, convert, clear and prune answer 409 `location-unavailable`;
+  - the folder is never made again except by Recreate folder.
+
+  The configured location is in force before any request. A bad value is `invalid`, never a fall-back to the
+  sources.
+- **Move thumbnails.** The job is a `thumbnails` job with `scope.mode` `move` (`tests/test_thumbnail_move.py`). It
+  runs in this order:
+  1. The review answers `POST /images/thumbnails/plan`; not enough space answers 507.
+  2. A token starts the job.
+  3. Automatic previews are held.
+  4. Copies run on the job pool in chunks of 2 or 4 files, each with its size checked and its mtime rounded up to
+     2 s.
+  5. One config commit makes the switch and records the old stores under `cleanup`. The job cannot be cancelled
+     from here.
+  6. The old copies are removed.
+
+  If it fails or is cancelled before the switch, nothing changes. A crash leaves
+  `<data>/data/thumbnail-move.json`, which the next start undoes. Old copies still held open are removed by the
+  next start's "Move thumbnails (finishing)" job. Leaving a folder also removes the previews of this install's
+  sources that are no longer listed (Q320-8).
+- **Remove thumbnails of removed sources** (`scope.mode` `prune`). It is offered in Thumbnail maintenance only in
+  folder mode, and it touches only this install's keys.
+- **Page tests.** `tests/browser/workspace-thumbnail-location.spec.mjs` covers the row, both moves, the in-place
+  refusal, the confirmation, the notice with Recreate and with Use this folder. The legacy gallery runs once in
+  folder mode (`workflows.spec.mjs`). The hooks are `tests/browser/thumbnail_location_fixture.py`.
+
+Beyond the concept, against the approved static mock `docs/egm/post-3.4.1/320-mock`:
+
+- D196: the Thumbnail location row in System › Sources & scans, after Thumbnail generation.
+  - The status line is "Now: inside each source." or "Now: one folder, <path>.". It does not show the mock's
+    "(3 sources, 8,512 thumbnails)" counts, because counting means walking every preview on each view. It says
+    "Using the default folder next to your library." and names old copies that wait to be removed.
+- D197: the Move thumbnails review uses the shared review.
+  - A grid value may be a lead sentence with a list (`[lead, items]`).
+  - Sources no longer listed appear under "Removed after the move", where the mock has a "Not moved" row
+    (maintainer answer to Q320-8: remove).
+  - The Free space line is "<size> free", without naming the disk.
+- D198: Activity's view of `mode: move` and `mode: prune`.
+  - Tiles for a move: Moved, Already there, Left in place, Errors. Tiles for a prune: Removed, Left in place,
+    Errors.
+  - The step line under the bar is `#job-phase`.
+  - Cancel shows only until the switch.
+- D199: the unavailable notice on Overview and Sources & scans.
+  - Recreate folder appears for a missing folder, after a confirmation.
+  - Use this folder appears for another folder's marker.
+  - Change location focuses the row; on Overview it opens Sources & scans.
+- D200: Thumbnail maintenance's "Remove thumbnails of removed sources" scope, with the plan line and a grid of
+  key folders.
+- D201: Move library's review adds "Thumbnails: Stay in <path>. Move them in System › Sources & scans." in folder
+  mode.
 
 ### Backup and restore contract (#249 System S8)
 
@@ -7418,7 +7495,7 @@ Deploying this backend needs a ComfyUI restart (Python and route changes).
 
 `#/tags` ("Tags & categories", page title "Tags") is a native workspace route; it no
 longer hands off to the legacy tag manager. That page stays at
-`/prompt_manager/admin#/tags` linked only from System (#525, D165); tag search and sort, the untagged
+`/prompt_manager/admin#/tags` at its URL only (#525, #620); tag search and sort, the untagged
 entry (D149) and multi-tag OR (the Library's Tag match, D150) moved to the workspace
 (#444); bulk prompt delete stays on the legacy admin page (bulk tags: the Prompt
 library's selection bar, D151). A prompt's category is changed in the Prompt library
@@ -7550,7 +7627,8 @@ The legacy pages (`/prompt_manager/admin`, `admin#/tags`, `gallery`, `gallery.ht
 their URLs, and admin's Metadata and Gallery buttons still open their legacy pages (maintainer
 ruling; pinned by `legacy-system-links.spec.mjs`).
 
-- **D165** (beyond the concept, maintainer ruling 2026-10-30): System's Overview section ends
+- **D165 retired** (#620): the old pages show their removal notice since 3.5.1, so System no longer links them and the load failure below offers a reload and ComfyUI. The original ruling:
+  **D165** (beyond the concept, maintainer ruling 2026-10-30): System's Overview section ends
   with one small line, "Legacy pages: Dashboard · Tags · Gallery · Metadata viewer"
   (`.legacy-pages`, new tabs), outside `.settings-layout`. The concept has no such line;
   `mapOverviewConcept` adds it to the page tree.

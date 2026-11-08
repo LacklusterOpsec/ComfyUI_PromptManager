@@ -47,11 +47,11 @@ import sqlite3
 import time
 import types
 import uuid
-from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .models import BUSY_TIMEOUT_SECONDS, PromptModel
+from .sqlite_uri import readonly_uri
 
 try:
     from ..utils import library_location as ll
@@ -78,6 +78,10 @@ MESSAGES = {
     ),
     "same-folder": "The new folder is the node folder itself.",
     "target-invalid": "The new folder cannot hold the library.",
+    "data-dir-served": (
+        "The new folder is inside Prompt Manager's thumbnail folder. Nothing was "
+        "moved."
+    ),
     "target-has-library": (
         "The new folder already holds a Prompt Manager library. Nothing was moved."
     ),
@@ -318,7 +322,7 @@ def _verify_copy(temp: str, counts, documents) -> None:
             "verify-failed",
             f"{MESSAGES['verify-failed']} {detail}" if detail else None,
         )
-    uri = Path(os.path.abspath(temp)).as_uri() + "?mode=ro"
+    uri = readonly_uri(temp)
     try:
         with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
             copied = _describe(conn)

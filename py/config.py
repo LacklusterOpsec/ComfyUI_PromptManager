@@ -78,27 +78,6 @@ def _canonical_path(path: str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
-def write_private_json(path: str, data: Any) -> None:
-    """Write ``data`` as JSON to ``path`` readable by the current user only.
-
-    config.json can hold an API key (integrations.lora_manager), so it is
-    created with mode 0600 and, on POSIX, an existing more open file is
-    tightened too. Windows has no POSIX modes; there the chmod is a best
-    effort that only affects the read-only bit. Parent directories are
-    created as needed. Raises OSError when the file cannot be written.
-    """
-    import json
-
-    parent_dir = os.path.dirname(path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    if os.name == "posix":
-        os.chmod(path, 0o600)
-
-
 def _lexical_path(path: str) -> str:
     """``path`` normalised for comparison without touching the filesystem.
 
@@ -717,12 +696,6 @@ class AutotagConfig:
     def suggestion_limit(cls) -> int:
         return cls.SUGGESTION_LIMIT
 
-    @staticmethod
-    def valid_suggestion_limit(value: Any) -> bool:
-        return (
-            type(value) is int and 1 <= value <= MAX_SUGGESTION_LIMIT
-        )  # bool, float and str are rejected
-
     @classmethod
     def all_instructions(cls) -> List[Dict[str, str]]:
         """Built-in first, then the saved entries (copies)."""
@@ -940,6 +913,8 @@ class PromptManagerConfig:
     THUMBNAIL_QUALITY = 80
     THUMBNAIL_EDGE = 512
     THUMBNAIL_EDGE_RANGE = (128, 2048)
+    # #320 thumbnail location (config.json ``thumbnails.location``), as read.
+    THUMBNAIL_LOCATION = None
 
     @classmethod
     def max_worker_threads(cls) -> int:
@@ -1001,6 +976,12 @@ class PromptManagerConfig:
                 "format": cls.THUMBNAIL_FORMAT,
                 "quality": cls.THUMBNAIL_QUALITY,
                 "edge": cls.THUMBNAIL_EDGE,
+                # #320: as read; only the Move thumbnails job writes it.
+                **(
+                    {"location": cls.THUMBNAIL_LOCATION}
+                    if cls.THUMBNAIL_LOCATION is not None
+                    else {}
+                ),
             },
             "gallery": GalleryConfig.get_config(),
             "integrations": IntegrationConfig.get_config(),
@@ -1054,35 +1035,6 @@ class PromptManagerConfig:
                 config_logger.error(f"Error loading config from {config_path}: {e}")
         else:
             config_logger.info(f"Config file not found: {config_path}, using defaults")
-
-    @classmethod
-    def save_to_file(cls, config_path: Optional[str] = None):
-        """Save the current configuration to a JSON file.
-
-        Serializes the complete configuration (including gallery settings) to
-        a JSON file. Creates the directory structure if it doesn't exist.
-
-        Args:
-            config_path (str): Path where the JSON configuration file should be saved.
-                            Parent directories will be created if they don't exist.
-                            Defaults to :meth:`get_config_path`.
-
-        Raises:
-            The method handles all exceptions internally and logs errors rather
-            than propagating them.
-
-        Example:
-            PromptManagerConfig.save_to_file('backup_config.json')
-            PromptManagerConfig.save_to_file('/etc/comfyui/prompt_manager.json')
-        """
-        if config_path is None:
-            config_path = cls.get_config_path()
-
-        try:
-            write_private_json(config_path, cls.get_config())
-            config_logger.info(f"Saved configuration to {config_path}")
-        except Exception as e:
-            config_logger.error(f"Error saving config to {config_path}: {e}")
 
     @classmethod
     def update_config(cls, new_config: Dict[str, Any]):
@@ -1175,6 +1127,11 @@ class PromptManagerConfig:
         low, high = cls.THUMBNAIL_EDGE_RANGE
         if type(edge) is int and low <= edge <= high:
             cls.THUMBNAIL_EDGE = edge
+        # #320: kept as read (``preview_location.parse_location`` checks it;
+        # a bad value becomes an unavailable ``invalid`` location, never a
+        # silent fall-back to the sources).
+        if "location" in section:
+            cls.THUMBNAIL_LOCATION = section["location"]
 
 
 # Load configuration on import

@@ -19,8 +19,8 @@ from .jobs import (
 )
 
 from .maintenance import disk_plan
-from .prompts import thumbnail_url_for
-from . import thumbnail_settings
+from .images import listing_thumbnail_url
+from . import preview_store
 from .. import model_gate
 
 try:
@@ -943,16 +943,6 @@ class AutotagRoutesMixin:
             return refusal.response
         return web.json_response({"success": True, "job": job.summary()}, status=202)
 
-    def _gated_runner(self, owner):
-        """Executor calls under the model gate *owner* holds (plain when None)."""
-        if owner is None:
-            return self._run_in_executor
-
-        async def run(func, *args, **kwargs):
-            return await model_gate.run(owner, func, *args, **kwargs)
-
-        return run
-
     def _resolve_allowed_image_path(self, raw_path: str) -> Optional[str]:
         """Return the real path when it is a media file inside an output directory."""
         if Path(str(raw_path)).suffix.lower() not in _MEDIA_EXTENSIONS:
@@ -1421,7 +1411,8 @@ class AutotagRoutesMixin:
                     )
 
                 model_type = service.get_loaded_model_type()
-                service.unload_model()
+                # Off the loop; a dropped request keeps the gate until it ends.
+                await model_gate.run(owner, service.unload_model)
             finally:
                 model_gate.release(owner)
 
@@ -1486,23 +1477,21 @@ class AutotagRoutesMixin:
             files = await self._run_in_executor(
                 self._without_removed, output_path, files
             )
-            has_thumbnails = (output_path / "thumbnails").is_dir()
+            location = preview_store.current()
+            if location.mode == preview_store.FOLDER_MODE:
+                has_thumbnails = location.available  # no store I/O here (#320)
+            else:
+                store = preview_store.store_dir(output_path)
+                has_thumbnails = store is not None and store.is_dir()
 
             images = []
             for image_path in files:
                 rel_path = image_path.relative_to(output_path)
                 thumbnail_url = None
                 if has_thumbnails:
-                    # Any preview the file owns, the current format first (#317)
-                    existing = thumbnail_settings.existing_thumbnail(
-                        output_path, rel_path
-                    )
-                    if existing is not None:
-                        thumb_rel = (
-                            thumbnail_settings.thumbnail_stem_rel(rel_path)
-                            + existing.suffix
-                        )
-                        thumbnail_url = thumbnail_url_for(thumb_rel, existing)
+                    # Any preview the file owns, the current format first
+                    # (#317); in folder mode without store I/O (#320).
+                    thumbnail_url = listing_thumbnail_url(output_path, rel_path)
                 images.append(
                     {
                         "filename": image_path.name,

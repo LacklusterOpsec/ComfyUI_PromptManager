@@ -167,8 +167,6 @@ const IMAGES_COUNT_URL = '/prompt_manager/images/output?mode=workspace&limit=1';
 
 /** The concept's shell and Overview with the recorded deviations applied, given the server's real overview. */
 function mapOverviewConcept(reference, overview, images) {
-    // D165: the discreet legacy-pages line follows the settings layout.
-    reference = { ...reference, tree: [...reference.tree, 'p.legacy-pages.small'] };
     const relabel = { 'Database integrity': 'Not checked', 'Positive prompts': number(overview.library.positive_prompts),
         'Negative variants': number(overview.library.negative_variants), Images: number(images) };
     const rows = {
@@ -265,7 +263,7 @@ const UNMAPPED_PATHS = [
     'columns.surfaces.0.rows.length', 'columns.surfaces.0.tree.4', 'columns.surfaces.0.tree.length',
     'columns.surfaces.1.rows.0.description', 'columns.surfaces.1.rows.1.title', 'columns.surfaces.1.rows.2.description',
     'heading.actions.0', 'heading.actions.length', 'metrics.items.3.value', 'nav.label',
-    'save.button.cursor', 'save.button.opacity', 'save.status.text', 'tree.3', 'tree.length',
+    'save.button.cursor', 'save.button.opacity', 'save.status.text',
 ].sort();
 
 test('system comparison detects mutations', async ({ page, request }) => {
@@ -656,9 +654,10 @@ function mapSourcesConcept(reference, { settings, sources }) {
             // D113: the range ends at the server's core count (the concept's fixed 16) and shows the real worker count.
             return [{ ...row, control: { ...row.control, max: String(settings.cpu_count), value: String(settings.worker_threads) } }];
         }),
-        // D158: the inserted row after the first setting row; D98: "Refresh files" closes the surface.
+        // D158: the inserted row after the first setting row; D196 (#320): the Thumbnail location block after
+        // "Thumbnail generation"; D98: "Refresh files" closes the surface.
         surface: { ...reference.surface, tree: [...reference.surface.tree.slice(0, rowAt + 1), 'div.setting-row',
-            ...reference.surface.tree.slice(rowAt + 1), 'div.operation'] },
+            ...reference.surface.tree.slice(rowAt + 1), 'div.setting-block', 'div.operation'] },
         operations: [...reference.operations, { ...reference.operations[0], title: REFRESH_FILES.title,
             description: REFRESH_FILES.description, actions: [{ ...reference.operations[0].actions[0], text: REFRESH_FILES.label }] }],
     };

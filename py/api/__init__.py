@@ -11,6 +11,7 @@ Split into domain-specific mixins for maintainability:
 - JobRoutesMixin: the session job registry behind Activity (py/api/jobs.py)
 - ImageTagJobsMixin: bulk Add tags / Auto-tag as image-tags jobs
 - ThumbnailJobsMixin: thumbnail plan, thumbnail job and the gallery stream on it
+- ThumbnailLocationMixin: the thumbnail location check and payloads (#320)
 - ThumbnailConvertMixin: Convert outdated thumbnails (#317), a thumbnail job mode
 - AutoThumbnailMixin: previews made on first view, on capture and after a scan
 - ReviewRoutesMixin: the Needs review queue, item detail and decisions
@@ -60,6 +61,11 @@ from .settings_routes import SettingsRoutesMixin
 from .job_routes import JobRoutesMixin
 from .image_tag_jobs import ImageTagJobsMixin
 from .thumbnail_jobs import ThumbnailJobsMixin
+from .thumbnail_location import ThumbnailLocationMixin
+from .thumbnail_move import ThumbnailMoveMixin
+from .thumbnail_move_plan import ThumbnailMovePlanMixin
+from .thumbnail_move_recovery import ThumbnailMoveRecoveryMixin
+from .thumbnail_prune import ThumbnailPruneMixin
 from .thumbnail_convert import ThumbnailConvertMixin
 from .thumbnail_auto import AutoThumbnailMixin
 from .system import SystemRoutesMixin
@@ -83,7 +89,6 @@ from .source_rescope import SourceRescopeMixin
 
 try:
     from ...database.operations import PromptDatabase
-    from ...utils.file_prompt import parse_comfyui_prompt
     from ...utils.logging_config import get_logger
     from ...utils.native_memory import release_free_memory
     from ...utils.png_text import png_text
@@ -95,7 +100,6 @@ except ImportError:
         0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
     from database.operations import PromptDatabase
-    from utils.file_prompt import parse_comfyui_prompt
     from utils.logging_config import get_logger
     from utils.native_memory import release_free_memory
     from utils.png_text import png_text
@@ -248,23 +252,6 @@ async def _read_json_body(request, max_bytes=JSON_BODY_MAX_BYTES):
     return data, None
 
 
-class _LongJobGuard:
-    """Async context manager handed out by ``_acquire_long_job``."""
-
-    def __init__(self, lock):
-        self._lock = lock
-
-    async def __aenter__(self):
-        # The caller checked ``locked()`` on this same loop iteration, so this
-        # acquire never waits.
-        await self._lock.acquire()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self._lock.release()
-        return False
-
-
 # ── Gzip compression middleware ────────────────────────────────────────
 _GZIP_MIN_SIZE = 1024  # Only compress bodies larger than 1 KB
 _GZIP_TYPES = frozenset(
@@ -338,6 +325,11 @@ class PromptManagerAPI(
     JobRoutesMixin,
     ImageTagJobsMixin,
     ThumbnailJobsMixin,
+    ThumbnailLocationMixin,
+    ThumbnailMovePlanMixin,
+    ThumbnailMoveMixin,
+    ThumbnailMoveRecoveryMixin,
+    ThumbnailPruneMixin,
     ThumbnailConvertMixin,
     AutoThumbnailMixin,
     SystemRoutesMixin,
@@ -415,10 +407,6 @@ class PromptManagerAPI(
         self._workspace_card_cache = {}
         # Favorite keys of each root's cached scan (images._favorite_listing).
         self._favorite_listing_cache = {}
-        # Single-flight locks for long jobs, keyed by job family; see
-        # _acquire_long_job(). Created lazily so no lock binds to an event
-        # loop before the server's loop exists.
-        self._long_jobs: dict = {}
         # This session's jobs (py/api/jobs.py): the metadata scan, and later
         # every other long operation the Activity page tracks.
         self._jobs = JobRegistry(self.logger)
@@ -474,26 +462,6 @@ class PromptManagerAPI(
     _public_path = staticmethod(_public_path)
     _public_error = staticmethod(_public_error)
     _read_json_body = staticmethod(_read_json_body)
-
-    def _acquire_long_job(self, name):
-        """Claim the single-flight slot for a long job family, or None when busy.
-
-        Usage in a handler::
-
-            job = self._acquire_long_job("duplicates")
-            if job is None:
-                return self._long_job_busy_response("Duplicate scan")
-            async with job:
-                ...
-
-        Families are free-form strings ("duplicates", "thumbnails",
-        "autotag", ...); the lock is released when the ``async with`` block
-        exits, including on exceptions. Must be called from the event loop.
-        """
-        lock = self._long_jobs.setdefault(name, asyncio.Lock())
-        if lock.locked():
-            return None
-        return _LongJobGuard(lock)
 
     @staticmethod
     def _long_job_busy_response(label):
@@ -716,6 +684,7 @@ class PromptManagerAPI(
         # ── Register domain-specific routes from mixins ───────────────
 
         self._register_pair_routes(routes)
+        self._register_thumbnail_move_routes(routes)
         self._register_library_routes(routes)
         self._register_library_delete_routes(routes)
         self._register_vocabulary_routes(routes)
@@ -852,20 +821,11 @@ class PromptManagerAPI(
                         f"{url_quote(rel_path.as_posix(), safe='/')}"
                     )
 
-                    # Any preview the file owns, the current format first (#317)
-                    from . import thumbnail_settings
-                    from .prompts import thumbnail_url_for
+                    # Any preview the file owns, the current format first
+                    # (#317); no store I/O here in folder mode (#320).
+                    from .images import listing_thumbnail_url
 
-                    existing = thumbnail_settings.existing_thumbnail(
-                        output_path, rel_path
-                    )
-                    thumbnail_url = None
-                    if existing is not None:
-                        thumb_rel = (
-                            thumbnail_settings.thumbnail_stem_rel(rel_path)
-                            + existing.suffix
-                        )
-                        thumbnail_url = thumbnail_url_for(thumb_rel, existing)
+                    thumbnail_url = listing_thumbnail_url(output_path, rel_path)
                     if thumbnail_url:
                         image["thumbnail_url"] = thumbnail_url
                     break  # Found matching root, stop searching
@@ -1076,7 +1036,3 @@ class PromptManagerAPI(
                 f"Unreadable image {os.path.basename(str(image_path))}: {e}"
             )
             return {}
-
-    def _parse_comfyui_prompt(self, metadata):
-        """Parse ComfyUI and A1111 prompt data from metadata."""
-        return parse_comfyui_prompt(metadata)
