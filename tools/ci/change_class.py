@@ -6,10 +6,11 @@ Four classes. Two come from allowlists:
 - ``inert``: every file is one nothing reads at run or test time (the funding
   file, the security policy, the old README's screenshots, issue templates).
   No test job runs, and the pre-push hook skips the suite.
-- ``docs``: every file is inert or a document (the READMEs and their images).
+- ``docs``: every file is inert or a document (the READMEs, the changelog and
+  their images).
   No test job runs in CI (#666). Two Python tests read these files
   (``tests/test_brand_assets.py``, ``tests/test_package_contents.py``), so
-  the pre-push hook still runs the suite for them.
+  the pre-push hook runs those two and not the whole suite (#679).
 - ``release``: ``pyproject.toml`` is the only file, and its ``version`` line
   the only line, that changed. CI runs the package-content check only.
 - ``code``: anything else. A file on no list is code, and so is every case of
@@ -31,7 +32,8 @@ Usage:
 ``change_class.py --unless-inert <command...>``
     The pre-push hook: runs the command unless pre-commit's pushed range
     (``PRE_COMMIT_FROM_REF``..``PRE_COMMIT_TO_REF``) is inert, and exits
-    with the command's code. The command is looked up on ``PATH`` first, so a
+    with the command's code. For a docs range it runs ``DOCS_TESTS`` in place
+    of the command. The command is looked up on ``PATH`` first, so a
     bare ``npm`` finds ``npm.cmd`` on Windows, which ``subprocess`` alone
     does not do.
 """
@@ -45,8 +47,10 @@ from typing import Iterable, Optional
 
 INERT_FILES = frozenset({".github/FUNDING.yml", "SECURITY.md"})
 INERT_FOLDERS = ("images/", ".github/ISSUE_TEMPLATE/")
-DOCS_FILES = frozenset({"README.md", "README-legacy.md"})
+DOCS_FILES = frozenset({"README.md", "README-legacy.md", "CHANGELOG.md"})
 DOCS_FOLDERS = ("assets/readme/", "assets/brand/")
+# The only tests that open a docs file; a docs push runs these alone (#679).
+DOCS_TESTS = ("tests.test_brand_assets", "tests.test_package_contents")
 
 VERSION_FILE = "pyproject.toml"
 VERSION_LINE = re.compile(r'version = "[^"]+"')
@@ -166,6 +170,10 @@ def main(argv: list[str]) -> int:
         if found == "inert":
             print("Skipped: this push only changes inert files (tools/ci).")
             return 0
+        if found == "docs":
+            print("This push only changes docs: running the tests that read them.")
+            command = [sys.executable, "-m", "unittest", *DOCS_TESTS]
+            return subprocess.run(command, check=False).returncode
         return run_command(argv[1:])
     event = os.environ.get("EVENT_NAME", "")
     found = "code"

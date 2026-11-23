@@ -514,9 +514,24 @@ file has no text chunks. Only a value shaped like a record counts (a key, a
 colon, then a JSON object, array or string), so camera EXIF stays out.
 `tests/test_exif_text.py` writes real still and animated WebP files, AVIF (where
 Pillow has it) and JPEG in that layout; `tests/test_metadata_extraction.py` and
-`tests/test_api_core.py` hold the two readers to it. No scan, monitor or
-gallery list collects `.avif` yet, so AVIF files are read correctly but never
-reach the readers; #652 tracks AVIF as a media type.
+`tests/test_api_core.py` hold the two readers to it.
+
+AVIF is a collected media type since #652. Every file-type list names `.avif`
+(scan and deletion, the monitor's default, the gallery and thumbnail walks,
+serving and Inspect, auto-tagging's listing, the capture store, the preview
+source order), but Pillow's floor here is >= 10.1.0 (ComfyUI's) and Pillow
+opens AVIF only from 11.0, and only when built with an AVIF decoder. So the
+collection points ask `utils.media_formats.collectable` and skip an AVIF file
+quietly when `PIL.features.check("avif")` is false, which leaves a Pillow
+without AVIF behaving exactly as it did before. A saved
+`gallery.monitoring.extensions` list that predates #652 gains `.avif` last on
+load, keeping every entry the install chose. `tests/fixtures/media/comfyui_avif.avif`
+is a 1 KB still written by ComfyUI's own `_save_avif` (see
+`tools/make_avif_fixture.py` and `tests/fixtures/README.md`);
+`tests/test_avif_media_type.py` covers both Pillow answers on the gallery
+walk, the monitor, auto-tagging and the capture store, and
+`tests/test_api_admin.py` holds the scan to the same fixture, prompt link
+included.
 
 Image work runs on PromptManager's own threads (#523). glibc keeps each thread's
 malloc arena at its high-water mark, so image buffers spread over the default
@@ -840,7 +855,7 @@ and every other job runs for one class only:
 | Class | Files | What runs |
 | --- | --- | --- |
 | `inert` | Only `.github/FUNDING.yml`, `SECURITY.md`, `images/`, `.github/ISSUE_TEMPLATE/` | `change class` and `gate`: green in seconds. |
-| `docs` | Only `README.md`, `README-legacy.md`, `assets/readme/`, `assets/brand/` (may include inert files) | `change class` and `gate`: green in seconds. |
+| `docs` | Only `README.md`, `README-legacy.md`, `CHANGELOG.md`, `assets/readme/`, `assets/brand/` (may include inert files) | `change class` and `gate`: green in seconds. |
 | `release` | `pyproject.toml` alone, and in it only the `version = "..."` line rewritten | The above and `package contents` (`tests/test_package_contents.py`). |
 | `code` | Anything else | The whole gate. |
 
@@ -860,7 +875,8 @@ else by the next code change's gate. Run
 editing those files.
 
 The pre-push hook uses the same script: it skips the Python suite when the
-pushed commits are `inert` and runs it otherwise.
+pushed commits are `inert`, runs only those two test modules when they are
+`docs` (#679), and runs the whole suite otherwise.
 
 ## Required merge checks
 
@@ -4447,6 +4463,38 @@ the per-section hand-off panel, was retired by S12 (#329): every section is nati
   node runs saved, from their saved pairs. Only empty fields of never-edited prompts."
   `system-maintenance-concept.spec.mjs` maps it (`mapPairRow`) as a copy of Optimize
   database's row.
+- **D210** (Maintenance and Integrations, #618, beyond the concept): Database adds "Tag
+  cleanup" after "Pair category and tags", with the line "Find tags that are whole comma
+  lists or are used nowhere. Review them, then remove only what you tick." and the button
+  "Find tags" with a danger mark (it ends in deleting tags, like Unused prompt
+  components). The button starts the tag search as an Activity job and opens it, as Find
+  duplicates does (`startFind`): kind `tag_cleanup`, pill "Finding tags", toasts "Tag
+  search started." and "Tag search finished · N tags found", one tile and outcome
+  "Found", log "Search log", no Cancel; its rows are tags (records, never opened). A
+  finished search that found tags adds **Review tags** (primary) after Download report.
+  It opens "Review tag cleanup" (`web/js/workspace/tag-cleanup-review.mjs`), drawn from
+  whatever rules the server returns: a `p.small[role=status]` "N tags selected", then per
+  rule with findings a checkbox "<title> (<total>)" that ticks or clears every listed tag
+  (indeterminate while only some are), a `p.small` with its explanation and what applying
+  does, a closed `details` "Show tags" whose checkbox rows "<name> · <detail>" are built
+  when it first opens (names wrap anywhere, CSS under D210), and, when the server's cap
+  of 2,000 cut the list, "Only the first 2,000 are listed. Clean these up, then search
+  again."; then "Nothing is deleted until you review and apply the cleanup. Prompts, pairs
+  and images are kept; only the tag is removed from them." and Cancel / "Review cleanup"
+  (disabled while nothing is ticked). Nothing is ticked when it opens. Review cleanup
+  opens the D100 plan "Tag cleanup" (Scope "Delete N tags (removed from P prompts, Q
+  pairs and R images)", Protected "N tags changed since the search", Backup "Always
+  created and verified first", Media "No files are removed"). A failed Tag cleanup job's
+  Review again goes to Maintenance (its plan needs a search). Integrations' LoRA import
+  review adds the row **Trigger words** after Found, only when a count is above 0: "N
+  become tags · M not made tags (lists or sentences)", or "N become tags" when M is 0.
+  `system-maintenance-concept.spec.mjs` maps the row (`mapTagRow`) as a copy of Unused
+  prompt components' row with the label "Find tags"; `system-integrations-concept.spec.mjs`
+  maps the Trigger words row. Tests: `D210: Tag cleanup finds comma and unused tags,
+  reviews only the ticked rule and deletes only it (#618)`
+  (workspace-system-maintenance.spec, hook `/__test__/system/tag-cleanup`),
+  `workspace-tag-cleanup-review.test.js`, `tests/test_tag_cleanup.py`,
+  `tests/test_api_tag_cleanup.py`.
 - **D102** (Maintenance, S7, Q5, #222): Metadata cache clears only the browser entries
   Prompt Manager owns as a cache (`web/js/cache-ownership.js`). The inventory of every
   storage writer has none (see "Browser cache ownership" below), so the row's line adds
@@ -5110,6 +5158,54 @@ Tests: `tests/test_maintenance_pair_metadata.py`, `tests/test_api_maintenance_pa
 `tests/browser/workspace-system-maintenance.spec.mjs` (hook `/__test__/system/pair-metadata`).
 A Python change: ComfyUI needs a restart.
 
+#### Tag cleanup (#618)
+
+`tag_cleanup` ("Tag cleanup", D210) is in `MAINTENANCE_OPERATIONS` but is never
+previewed alone (`preview_maintenance("tag_cleanup")` raises): it is planned from a tag
+search's findings. `database/tag_cleanup.py` holds a registry of rules (`RULES`, each a
+`TagRule` with `find`, `recheck` and `apply`); registry order is review order and
+ownership: a tag is listed only under the first rule that finds it. Two rules ship:
+
+- `comma`, "Tags containing a comma": a name holding `,` or `，` (U+FF0C), except a name
+  starting with `lora:` (the LoRA import's identity tag, made again by every import;
+  maintainer ruling 2026-11-22). Applying removes the tag from its prompts, pairs and
+  images and deletes it. Removed only: never split.
+- `unused`, "Tags with no links": no `prompt_tags`, `prompt_pair_tags` or
+  `media_image_tags` row (image links count as none when the annotation tables are
+  missing). Deleted. A tag made by hand and not used yet is listed too (the schema does
+  not record who made a tag); nothing is pre-ticked.
+
+`POST /prompt_manager/jobs/tag_cleanup` (body ignored) starts the find: kind
+`tag_cleanup`, "Find tags to clean up", admission `read`, not cancellable, group `found`
+(one row "<name> · <rule title>" per tag). It reads one `mode=ro` snapshot, writes
+nothing, holds the result under the job id (the last 3 finds) and ends "Found N tags to
+clean up" or "No tags need cleaning up"; a failure ends it "The tag search failed." A
+second find while one runs, or beside an exclusive job, is 409 `busy`. `GET
+/prompt_manager/maintenance/tag_cleanup/{job_id}` (`no-store`) answers every rule with
+its findings `{tag_id, name, detail}` (at most 2,000 per rule; `total` exact; `detail`
+"3 prompts · 1 pair", "no links", plus " · in N saved views" when saved views name it);
+404 `not-found`, 409 `job-running`, 409 `no-groups`. The preview's options are exactly
+`{job_id, select:[{rule, tag_ids}]}`: a known rule once each, 1 to 2,000 distinct tag ids,
+each a held finding of that rule, else 400 `invalid-request`; the body has the large cap
+(500 ids are not 413). Each selected finding is read again: one whose `(tag_id, name,
+links)` changed since the search (`links` hashes its prompt ids, pair ids and image
+`(byte_id, position)` rows, so a tag moved between owners is seen) is protected, "N tags
+changed since the search". The plan's backup policy is always `required`: the apply
+takes a safety backup first even when the setting is off (`ALWAYS_BACKED_UP`, with
+`workflow_storage`). The apply job ("Tag cleanup", `maintenance`, `records`) runs in one
+`BEGIN IMMEDIATE` transaction and does not compare the plan's fingerprint: each target's
+rule rechecks it and keeps it with its reason (`already deleted`, `renamed since the
+review`, `it is used now`, `its links changed since the review`, or `kept so the old tag
+migration does not run again` when deleting it would empty `tags` while a prompt still
+holds legacy JSON tags), and the rest still apply; an exception rolls everything back.
+Changed rows read "Deleted tag “<name>” (<rule title>) · removed from 3 prompts",
+Protected rows "Kept tag “<name>”: <reason>" (the review's protected findings first),
+both complete in the report. Saved views, the auto-tag marks, the LoRA trigger cache and
+history are never written. Tests: `tests/test_tag_cleanup.py`,
+`tests/test_api_tag_cleanup.py`, `tests/test_vocabulary.py` (the shared `_delete_tag`),
+`tests/browser/workspace-system-maintenance.spec.mjs`. A Python change: ComfyUI needs a
+restart.
+
 The legacy restore (`POST /prompt_manager/restore`) takes a backup of any size the disks
 have room for, so a real library's safety backup restores: the upload, its staged copy
 and the swap (the upload twice in the temporary folder, once more plus the current
@@ -5342,7 +5438,8 @@ legacy scan refuses it.
 nothing (`test_preview_writes_nothing_and_makes_no_requests`: DB and `-wal` bytes, `-shm`
 size, rows, no cache folder, the downloader never called) and answers the maintenance
 `Plan` shape plus `lora_files`, `with_metadata`, `current_imports`, `blocked_by_pairs`,
-`planned_downloads` and `network`; a blocked plan has no token. `POST
+`planned_downloads`, `trigger_tags`, `trigger_not_tags` and `network`; a blocked plan
+has no token. `POST
 /prompt_manager/lora/import/apply {token}` starts the `lora_import` job (202): title "LoRA
 reference import", admission `records`, cancellable only while it stages, the safety
 backup the policy promises before the replace. Refusals: `plan-changed` (409, the files
@@ -5374,6 +5471,19 @@ refused while a restore runs; the review is a request lease ("LoRA import review
 (409 `busy`) during a restore, and a restore waits for it (`LoraImportRestoreTests`). `POST /lora/enable`
 accepts the optional `expected_revision`. LoraManager detection also searches every
 `custom_nodes` folder ComfyUI registers through `folder_paths` (#144), main folder first.
+
+**Trained words as tags (#618).** A CivitAI `trainedWords` entry becomes a tag only when
+it is one short clean phrase (`lora_utils.is_tag_phrase`, Option A): stripped, it passes
+the tag rule (`validate_tags`: not empty, at most 50 characters, no control character),
+holds no ASCII or fullwidth comma, no `<` or `>` (`<lora:x:0.8>`) and no prompt weight
+(`(masterpiece:1.2)`); plain parentheses stay (`hatsune miku (vocaloid)`), and `ratio
+(16:9)` is a recorded loss. `trigger_word_tags` returns the tags and how many entries were
+not made tags; `build_record` adds `trigger_not_tags`, the preview sums `trigger_tags` and
+`trigger_not_tags`, the review's Trigger words row shows them (D210) and the job logs "M
+trained-words entries were not made tags (lists or sentences)". The trigger-word lookup
+(`get_trigger_words_from_metadata`, the trigger cache) still sees every entry. Tests:
+`TestTriggerWordTags`, `test_build_record_makes_tags_only_from_short_phrases`,
+`test_preview_and_job_say_how_many_entries_were_not_made_tags`.
 
 **Where LoraManager keeps its files (#355).** `py/lora_manager_layout.py` repeats
 LoraManager's rules without importing it (`tests/test_lora_manager_layout.py`). The

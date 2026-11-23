@@ -46,6 +46,7 @@ from py import lora_import, lora_utils
 from py.api.jobs import RESTORE_JOB_KIND
 from py.api.lora_import_routes import LORA_PREVIEW_LEASE
 from py.config import IntegrationConfig, PromptManagerConfig
+from utils import exit_signal
 from utils.hashing import generate_prompt_hash
 
 CATEGORY = "lora-manager"
@@ -535,6 +536,32 @@ class LoraImportRouteTests(LoraImportAPITestCase):
         # The token is single-use.
         resp, body = await self._post(APPLY, {"token": plan["token"]})
         self.assertEqual((resp.status, body["code"]), (409, "plan-used"))
+
+    async def test_preview_and_job_say_how_many_entries_were_not_made_tags(self):
+        # #618: the review and the job log count the trained-words entries
+        # that were lists or sentences.
+        _write_metadata(self.loras, "neon", words=["glow", "a, b, c", "<lora:x:1>"])
+        (self.loras / "neon.png").write_bytes(_png_bytes())
+        resp, plan = await self._post(PREVIEW)
+        self.assertEqual(resp.status, 200, plan)
+        self.assertEqual((plan["trigger_tags"], plan["trigger_not_tags"]), (1, 2))
+
+        resp, body = await self._post(APPLY, {"token": plan["token"]})
+        self.assertEqual(resp.status, 202, body)
+        job = self.api._jobs.get(body["job"]["id"])
+        await job.task
+        self.assertEqual(job.state, "finished", job.log)
+        line = "2 trained-words entries were not made tags (lists or sentences)"
+        self.assertTrue(any(entry.endswith(line) for entry in job.log), job.log)
+        neon = self.api.db.search_prompts(category=CATEGORY)[0]
+        self.assertEqual(sorted(neon["tags"]), ["glow", "lora-manager", "lora:neon"])
+
+    async def test_job_log_is_silent_when_every_entry_is_a_tag(self):
+        self._two_loras()
+        _plan, job = await self._apply_reviewed()
+        await job.task
+        self.assertEqual(job.state, "finished", job.log)
+        self.assertFalse(any("not made tags" in line for line in job.log), job.log)
 
     async def test_a_finished_import_clears_the_layout_cache(self):
         # #362: the import may link files under a folder LoraManager created
@@ -1140,6 +1167,34 @@ class LoraImportRefusalTests(LoraImportAPITestCase):
         self.assertEqual(job.state, "finished", job.log)
         self.assertNotEqual(_snapshot(self.api.db), before)
 
+    async def test_an_exit_after_the_commit_point_still_finishes(self):
+        # #619: ComfyUI exits while the replace runs; the replace is one
+        # transaction and still commits, so the job truthfully ends
+        # "finished" with the import written, not "cancelled".
+        self._two_loras()
+        before = _snapshot(self.api.db)
+        replacing, release = threading.Event(), threading.Event()
+        real_replace = self.api.db.replace_category_prompts
+
+        def held_replace(*args, **kwargs):
+            replacing.set()
+            release.wait(10)
+            return real_replace(*args, **kwargs)
+
+        loop = asyncio.get_running_loop()
+        with patch.object(self.api.db, "replace_category_prompts", held_replace):
+            _plan, job = await self._apply_reviewed()
+            try:
+                self.assertTrue(await loop.run_in_executor(None, replacing.wait, 10))
+                self.assertFalse(job.summary()["cancellable"])
+                self.addCleanup(exit_signal.reset)
+                exit_signal.request()
+            finally:
+                release.set()
+            await job.task
+        self.assertEqual(job.state, "finished", job.log)
+        self.assertNotEqual(_snapshot(self.api.db), before)
+
 
 def plan_title():
     return lora_import.JOB_TITLE
@@ -1417,9 +1472,39 @@ class LoraImportStageTests(unittest.TestCase):
                     "hash": generate_prompt_hash("neon street"),
                     "tags": ["lora-manager", "lora:neon", "glow"],
                     "images": [os.path.realpath(self.loras / "neon.png")],
+                    "trigger_not_tags": 0,
                 }
             ],
         )
+
+    # #618: only one short clean phrase becomes a tag.
+
+    def test_build_record_makes_tags_only_from_short_phrases(self):
+        metadata = {
+            "file_name": "neon.safetensors",
+            "model_name": "neon",
+            "civitai": {"trainedWords": ["neon", "a, b, c", "<lora:x:1>"]},
+        }
+        record = lora_import.build_record(metadata, self.loras / "neon.json", [])
+        self.assertEqual(record["tags"], ["lora-manager", "lora:neon", "neon"])
+        self.assertEqual(record["trigger_not_tags"], 2)
+
+    def test_stage_counts_entries_not_made_tags(self):
+        _write_metadata(self.loras, "one", words=["glow", "a, b", "<lora:x:1>"])
+        _write_metadata(self.loras, "two", words=["long, comma, list"])
+        _write_metadata(self.loras, "three", words=["fine"])
+        staged = lora_import.stage(self.discover(), self.tmp, media_extensions=MEDIA)
+        self.assertEqual(staged.stats["trigger_not_tags"], 3)
+        tags = {r["name"]: r["tags"] for r in staged.records}
+        self.assertEqual(tags["one"], ["lora-manager", "lora:one", "glow"])
+        self.assertEqual(tags["two"], ["lora-manager", "lora:two"])
+
+    def test_preview_sums_trigger_tags_and_not_tags(self):
+        _write_metadata(self.loras, "one", words=["glow", "a, b", "(x:1.2)"])
+        _write_metadata(self.loras, "two", words=["neon", "street"])
+        _write_metadata(self.loras, "none")
+        found = lora_import.preview(str(self.lm), self.tmp / "cache", MEDIA)
+        self.assertEqual((found["trigger_tags"], found["trigger_not_tags"]), (3, 2))
 
     def test_preview_counts_local_media_and_downloads(self):
         _write_metadata(self.loras, "local", images=["https://civitai.com/l.png"])
